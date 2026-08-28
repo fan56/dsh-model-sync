@@ -40,6 +40,8 @@ dsh plugin add @aiwayds/dsh-model-sync
 
 The package ships `cordis.patch.yml` (wired as `dsh.bundle.patch`), which mounts the plugin into the profile's assembly tree under the stable plugin id `dsh-model-sync` and registers the `model-sync` settings namespace.
 
+As of dsh-tui-pi 1.0.2, this plugin is a default dependency of `@aiwayds/dsh-tui-pi` (mounted automatically through its `cordis.patch.yml`) — you normally don't need to install it separately; use `dsh plugin add @aiwayds/dsh-model-sync` only for standalone use.
+
 ## Usage
 
 Configure the plugin under the `model-sync` namespace in `settings.yaml` — every key is optional:
@@ -89,4 +91,4 @@ The repo also carries the reference patches that document the legacy overlay beh
 
 ## License
 
-Not yet licensed.
+MIT.
