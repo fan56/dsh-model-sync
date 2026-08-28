@@ -1,0 +1,97 @@
+[English](./README.md) | 简体中文
+
+# dsh-model-sync
+
+[![npm version](https://img.shields.io/npm/v/@aiwayds/dsh-model-sync)](https://www.npmjs.com/package/@aiwayds/dsh-model-sync) · [GitHub](https://github.com/fan56/dsh-model-sync)
+
+一个 dsh（DeepSeek Harness）Cordis 插件：把 `llm-pi-ai` 各 provider 路由的模型目录与 pi.dev 网关的模型列表保持同步，并通过官方 settings 接缝（`settings.mutate`）写进 dsh 的 `settings.yaml`——对 dsh 内部零补丁。
+
+## 为什么
+
+模型列表会漂移：provider 不断上架新模型、下线旧模型、调整能力字段（`contextWindow`、`input` 模态、`thinkingFormat`、reasoning efforts）。靠手工跟进既枯燥又容易出错，dsh-model-sync 替你做完这一切：
+
+- **只增只改的写入。** pi.dev 上的新模型被合并进来，已有模型按需更新，没有变化的路由完全不动——writer 会先和 settings 里的原始 user 段做比较，无变化即跳过（`writer.ts`、`profilesEqual`、`reason: 'no-change'`）。
+- **不再手工维护模型表。** 对受管路由而言，pi.dev remote catalog 就是唯一事实来源，你的 `settings.yaml` 只是它的投影。
+- **定时刷新。** 启动后不久自动跑一轮，之后按可配置的周期持续刷新，目录无需任何手动操作即可保持最新。
+
+## 特性
+
+- **pi.dev 网关同步。** 从 `https://pi.dev/api/models/providers/<route>` 拉取每条受管路由的模型列表，带 ETag/304 revalidation，并在 `~/.dsh/models-store.json` 维护按 provider 持久化的缓存（`remote-catalog.ts`）。瞬时故障与中断保留上次成功的缓存（last-good）；404/501 视为该路由本轮不存在。
+- **默认路由。** `managedRoutes` 为空时，同步以下 pi.dev 路由：`opencode-go`、`zai-coding-cn`、`minimax-cn`、`xiaomi-token-plan-cn`（`src/index.ts` 的 `DEFAULT_ROUTES`）。
+- **两种写模式**（`writeMode`）：
+  - `settings`——零补丁流水线：fetch → translate → `settings.mutate`。自包含，从不直接改写 `settings.yaml`，只经官方 settings API 落盘。
+  - `overlay`（默认，旧方案）——委托打了补丁的 `dsh-llm-pi-ai` 适配器的 `piAiCatalog.refresh()`，把 pi.dev 条目合并进内存（需要可选补丁）。
+- **定时刷新。** `intervalMinutes` 周期轮（默认 240，即 4 小时）加 `startupDelaySeconds` 启动延迟（默认 5 秒）；每轮自动刷新输出的报告与手动刷新完全相同。`0` 表示关闭周期（仅启动时刷一次）。配置变更时周期会实时重新挂载（`src/index.ts`）。
+- **变更报告 / diff。** 每轮报告新增/移除的模型 id（`diffModelIds`）；`settings` 模式下还会对照当前原始 settings 报告新增/移除/变更的条目（`diffEntries`，`diff.ts`）。被丢弃（dropped）与降级（degraded）的条目连同原因一并报告。
+- **`modelSync` 服务。** 对外暴露 `modelSync` 服务（`syncNow()`），UI 调用它即可强制跑一轮刷新并读取报告。
+- **翻译规则。** pi.dev 条目被翻译成 settings 可写的模型 profile（`translate.ts`）：base-matching 与 base-less 分类、`reasoningEfforts` 推导（S2 gate）、`compat` 门控到 `openai-completions`（S5 gate）、`maxTokens` 处理，以及混合协议路由的丢弃逻辑。
+- **默认安全的开关：**
+  - `keepBuiltinOnly: true`——保留内置目录里有、但 pi.dev 上（还）没有的模型，启用同步不会删掉你正在用的模型。
+  - `dropUnserviceable: true`——丢弃不可服务的条目并继续；设为 `false` 则改为中止整条路由，而不是写入残缺列表。
+  - `forceMaxReasoningEffort`——强制所有 `thinkingFormat` 非空的模型使用 max reasoning effort（确保 `reasoningEfforts` 包含 `max`，并在 `openai-completions` 上强制 `compat.supportsReasoningEffort = true`）。
+- **冲突安全写入。** 写入携带 settings revision，遇 `SETTINGS_CONFLICT` 自动重试一次（`writer.ts`）。
+
+## 安装
+
+需要 Node ≥ 22.19 和一个 dsh profile。作为 dsh 插件安装：
+
+```bash
+npm i @aiwayds/dsh-model-sync
+dsh plugin add @aiwayds/dsh-model-sync
+```
+
+包内附带 `cordis.patch.yml`（经 `dsh.bundle.patch` 接线），它把插件挂载进 profile 的装配树（稳定的插件 id `dsh-model-sync`），并注册 `model-sync` settings 命名空间。
+
+自 dsh-tui-pi 1.0.2 起，本插件是 `@aiwayds/dsh-tui-pi` 的默认依赖（经其 `cordis.patch.yml` 自动挂载）——通常无需单独安装；`dsh plugin add @aiwayds/dsh-model-sync` 仅用于独立使用。
+
+## 用法
+
+在 `settings.yaml` 的 `model-sync` 命名空间下配置本插件——每个键都是可选的：
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `writeMode` | `'overlay'` | `'settings'` 走零补丁流水线；`'overlay'` 走旧的补丁适配器模式 |
+| `intervalMinutes` | `240 (4h)` | 自动刷新间隔（分钟）；`0` = 仅启动时刷新 |
+| `startupDelaySeconds` | `5` | 首次自动刷新前的延迟，等 llm 适配器就绪 |
+| `refreshTimeoutMs` | `120000` | 单轮刷新网络请求的中断预算（最小 `1000`） |
+| `managedRoutes` | `[]` | 要同步的路由；为空 = 默认 pi.dev 路由 |
+| `keepBuiltinOnly` | `true` | 保留 pi.dev 上没有的内置模型（平滑迁移） |
+| `dropUnserviceable` | `true` | 丢弃不可服务的条目；`false` 改为中止整条路由 |
+| `syncNotify` | `false` | 有变更时通知（logger + `/model-sync` 报告） |
+| `forceMaxReasoningEffort` | `false` | 对 `thinkingFormat` 非空的模型强制 max reasoning effort |
+
+示例：
+
+```yaml
+model-sync:
+  writeMode: settings
+  intervalMinutes: 30
+  managedRoutes:
+    - opencode-go
+    - zai-coding-cn
+```
+
+插件写入的是 `llm-pi-ai` 命名空间（`providers.<route>.models`）——与适配器消费的是同一份文档——并且只写它管理的路由。迁移期间，`keepBuiltinOnly` 会保留已安装内置目录中存在、但 pi.dev 上还没有的模型。
+
+## 开发
+
+```bash
+npm run build   # tsc → lib/
+npm run check   # tsc --noEmit 类型检查
+npm test        # node --test（pretest 先构建）：diff / translate / writer / remote-catalog / serviceability
+```
+
+测试使用 `test/fixtures/` 下按路由组织的 pi.dev fixtures，并用临时目录充当 models store——绝不触碰真实的 `~/.dsh`。
+
+`scripts/` 下的工具脚本：
+
+- `generate-builtin-snapshot.mjs`——从已安装的 `@deepseek-ai/dsh-llm-pi-ai` catalog 重新生成 `src/builtin-catalog-snapshot.ts`（`--generate` 用于开发，`--check` 用于 CI）。
+- `verify-no-patch.mjs`——若已安装的 `dsh-llm-pi-ai` 仍带有 overlay 补丁签名（`withRemoteCatalog` / `piAiCatalog`）则非零退出。
+- `backup/backup-patched.mjs`——把打过补丁的 `dsh-llm-pi-ai/lib/index.js` 备份到 `backups/`。
+- `backup/restore-official.mjs`——从 npm 恢复官方未打补丁的 `dsh-llm-pi-ai/lib/index.js`，并对照补丁校验（支持 `--dry-run`）。
+
+仓库还保存了记录旧 overlay 行为的参考补丁：`docs-dsh-llm-pi-ai.patch`（`dsh-llm-pi-ai` 的 pi.dev remote-catalog overlay）与 `docs-dsh-llm-pi-ai-compat.patch`（`supportsDeveloperRole` compat 透传）。
+
+## 许可证
+
+MIT。

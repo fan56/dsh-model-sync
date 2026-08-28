@@ -1,3 +1,5 @@
+[简体中文](./README.zh-CN.md) | English
+
 # dsh-model-sync
 
 [![npm version](https://img.shields.io/npm/v/@aiwayds/dsh-model-sync)](https://www.npmjs.com/package/@aiwayds/dsh-model-sync) · [GitHub](https://github.com/fan56/dsh-model-sync)
@@ -19,7 +21,7 @@ Model lists drift: providers ship new models, retire old ones, and adjust capabi
 - **Two write modes** (`writeMode`):
   - `settings` — the zero-patch pipeline: fetch → translate → `settings.mutate`. Self-contained; never touches `settings.yaml` directly, only via the official settings API.
   - `overlay` (default, legacy) — delegates to the patched `dsh-llm-pi-ai` adapter's `piAiCatalog.refresh()` and merges pi.dev entries in memory (requires the optional patch).
-- **Scheduled refresh.** `intervalMinutes` auto rounds (default 60) plus a `startupDelaySeconds` initial delay (default 5); each round logs the same report a manual refresh produces. `0` disarms the interval (startup-only). The interval re-arms live when the config changes (`src/index.ts`).
+- **Scheduled refresh.** `intervalMinutes` auto rounds (default 240 / 4h) plus a `startupDelaySeconds` initial delay (default 5); each round logs the same report a manual refresh produces. `0` disarms the interval (startup-only). The interval re-arms live when the config changes (`src/index.ts`).
 - **Change reporting / diff.** Every round reports added/removed model ids (`diffModelIds`), and in `settings` mode added/removed/changed entries against the current raw settings (`diffEntries`, `diff.ts`). Dropped and degraded entries are reported with their reasons.
 - **`modelSync` service.** Exposes a `modelSync` service (`syncNow()`) that a UI can call to force one refresh round and read the report.
 - **Translation rules.** pi.dev entries are translated into settings-writable model profiles (`translate.ts`): base-matching vs base-less classification, `reasoningEfforts` derivation (S2 gate), `compat` gating to `openai-completions` (S5 gate), `maxTokens` handling, and drop logic for mixed-protocol routes.
@@ -49,7 +51,7 @@ Configure the plugin under the `model-sync` namespace in `settings.yaml` — eve
 | Key | Default | Description |
 |---|---|---|
 | `writeMode` | `'overlay'` | `'settings'` for the zero-patch pipeline; `'overlay'` for the legacy patched-adapter mode |
-| `intervalMinutes` | `60` | Auto-refresh interval in minutes; `0` = startup-only |
+| `intervalMinutes` | `240 (4h)` | Auto-refresh interval in minutes; `0` = startup-only |
 | `startupDelaySeconds` | `5` | Delay before the first auto refresh, so the llm adapter is ready |
 | `refreshTimeoutMs` | `120000` | Abort budget for one refresh round's network request (min `1000`) |
 | `managedRoutes` | `[]` | Routes to sync; empty = the default pi.dev routes |

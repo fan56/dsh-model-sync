@@ -47,8 +47,8 @@ const OWN_NS = settingsNamespace('model-sync')
 const ModelSyncConfig = z.object({
   /** Write mode: 'overlay' (legacy, requires patch) or 'settings' (Plan C). */
   writeMode: z.union(['overlay', 'settings']).default('overlay'),
-  /** Minutes between auto refreshes; 0 = startup-only. */
-  intervalMinutes: z.number().step(1).min(0).default(60),
+  /** Minutes between auto refreshes (default 240 = 4 hours); 0 = startup-only. */
+  intervalMinutes: z.number().step(1).min(0).default(240),
   /** Delay before the first auto refresh, so the llm adapter is ready. */
   startupDelaySeconds: z.number().step(1).min(0).default(5),
   /** Abort budget for one forced refresh's network round. */
@@ -59,7 +59,7 @@ const ModelSyncConfig = z.object({
   keepBuiltinOnly: z.boolean().default(true),
   /** Drop unserviceable entries (true) or abort the entire route (false). */
   dropUnserviceable: z.boolean().default(true),
-  /** Notify on changes (logger + /models-sync report). */
+  /** Notify on changes (logger + /model-sync report). */
   syncNotify: z.boolean().default(false),
   /**
    * Force all models with a non-empty thinkingFormat to have max reasoning
@@ -315,7 +315,7 @@ export function apply(ctx: Context): void {
     return syncOverlay(config, llm, force)
   }
 
-  /** Auto rounds log the same report the /models-sync command shows. */
+  /** Auto rounds log the same report the /model-sync command shows. */
   const runAuto = (): void => {
     void syncNow(false).then((report) => {
       for (const line of report.split('\n')) ctx.logger.info('model-sync: %s', line)
@@ -338,7 +338,7 @@ export function apply(ctx: Context): void {
 
   const initial = scope.get() as unknown as ModelSyncConfigValue
   startupTimer = setTimeout(runAuto, Math.max(0, initial?.startupDelaySeconds ?? 5) * 1000)
-  armInterval(initial?.intervalMinutes ?? 60)
+  armInterval(initial?.intervalMinutes ?? 240)
   scope.watch((next) => {
     const value = next as unknown as ModelSyncConfigValue
     armInterval(value?.intervalMinutes ?? 0)
@@ -347,7 +347,7 @@ export function apply(ctx: Context): void {
     startupTimer = setTimeout(runAuto, 1000)
   })
 
-  // The /models-sync command (registered by dsh-tui-pi) drives this service.
+  // The /model-sync command (registered by dsh-tui-pi) drives this service.
   ctx.provide('modelSync', { syncNow: () => syncNow(true) } satisfies ModelSyncService)
 }
 
