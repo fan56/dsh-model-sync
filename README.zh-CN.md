@@ -24,6 +24,7 @@
 - **定时刷新。** `intervalMinutes` 周期轮（默认 240，即 4 小时）加 `startupDelaySeconds` 启动延迟（默认 5 秒）；每轮自动刷新输出的报告与手动刷新完全相同。`0` 表示关闭周期（仅启动时刷一次）。配置变更时周期会实时重新挂载（`src/index.ts`）。
 - **变更报告 / diff。** 每轮报告新增/移除的模型 id（`diffModelIds`）；`settings` 模式下还会对照当前原始 settings 报告新增/移除/变更的条目（`diffEntries`，`diff.ts`）。被丢弃（dropped）与降级（degraded）的条目连同原因一并报告。
 - **`modelSync` 服务。** 对外暴露 `modelSync` 服务（`syncNow()`），UI 调用它即可强制跑一轮刷新并读取报告。
+- **`/model-sync` 命令。** 插件自行通过共享的 dsh 命令注册表（`@deepseek-ai/dsh-commands`）注册 `/model-sync` 斜杠命令，所有交互式 UI 自动发现并列出——UI 侧零配合。执行它当场强制跑一轮刷新，输出的报告与定时轮完全相同；同步范围由 `managedRoutes` 决定（参数会被忽略）。命令注册表是可选 peer：没有命令注册服务的宿主照常降级，定时刷新与 `modelSync` 服务不受影响。
 - **翻译规则。** pi.dev 条目被翻译成 settings 可写的模型 profile（`translate.ts`）：base-matching 与 base-less 分类、`reasoningEfforts` 推导（S2 gate）、`compat` 门控到 `openai-completions`（S5 gate）、`maxTokens` 处理，以及混合协议路由的丢弃逻辑。
 - **默认安全的开关：**
   - `keepBuiltinOnly: true`——保留内置目录里有、但 pi.dev 上（还）没有的模型，启用同步不会删掉你正在用的模型。
@@ -73,12 +74,16 @@ model-sync:
 
 插件写入的是 `llm-pi-ai` 命名空间（`providers.<route>.models`）——与适配器消费的是同一份文档——并且只写它管理的路由。迁移期间，`keepBuiltinOnly` 会保留已安装内置目录中存在、但 pi.dev 上还没有的模型。
 
+### 手动刷新：`/model-sync` 命令
+
+在任意交互式 UI 里输入 `/model-sync` 即可当场强制跑一轮同步。命令由插件自己注册进共享命令注册表（`@deepseek-ai/dsh-commands`），UI 自动发现。它返回与定时轮相同的报告；同步范围由 `managedRoutes` 决定，命令后面的参数一律忽略。没有命令注册服务的宿主会平滑降级——定时刷新与 `modelSync` 服务照常工作。
+
 ## 开发
 
 ```bash
 npm run build   # tsc → lib/
 npm run check   # tsc --noEmit 类型检查
-npm test        # node --test（pretest 先构建）：diff / translate / writer / remote-catalog / serviceability
+npm test        # node --test（pretest 先构建）：diff / translate / writer / remote-catalog / serviceability / command
 ```
 
 测试使用 `test/fixtures/` 下按路由组织的 pi.dev fixtures，并用临时目录充当 models store——绝不触碰真实的 `~/.dsh`。

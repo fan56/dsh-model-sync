@@ -30,17 +30,21 @@
     "build": "tsc -p tsconfig.json",
     "check": "tsc --noEmit -p tsconfig.json",
     "pretest": "tsc -p tsconfig.json",
-    "test": "node --test test/diff.test.mjs test/translate.test.mjs test/writer.test.mjs test/remote-catalog.test.mjs test/serviceability.test.mjs"
+    "test": "node --test test/diff.test.mjs test/translate.test.mjs test/writer.test.mjs test/remote-catalog.test.mjs test/serviceability.test.mjs test/command.test.mjs"
   },
   "dependencies": {},
   "peerDependencies": {
     "@deepseek-ai/cordis": "4.0.1",
+    "@deepseek-ai/dsh-commands": "0.1.1-rc.2",
     "@deepseek-ai/dsh-credentials": "0.1.0-rc.6",
     "@deepseek-ai/dsh-settings": "0.1.0-rc.6",
     "@deepseek-ai/schemastery": "3.18.1"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-commands": {
       "optional": true
     },
     "@deepseek-ai/dsh-credentials": {
@@ -56,6 +60,7 @@
   "devDependencies": {
     "@types/node": "^24.0.0",
     "@deepseek-ai/cordis": "4.0.1",
+    "@deepseek-ai/dsh-commands": "0.1.1-rc.2",
     "@deepseek-ai/dsh-credentials": "0.1.0-rc.6",
     "@deepseek-ai/dsh-settings": "0.1.0-rc.6",
     "@deepseek-ai/schemastery": "3.18.1",

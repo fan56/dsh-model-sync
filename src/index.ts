@@ -16,6 +16,9 @@
 import z from '@deepseek-ai/schemastery'
 import type { Context } from '@deepseek-ai/cordis'
 import { settingsNamespace } from '@deepseek-ai/dsh-settings'
+// Types only (erased at emit); dsh-commands is an optional peer, so hosts
+// without it still load this plugin — see the guarded registration below.
+import type { CommandDefinition, CommandResult } from '@deepseek-ai/dsh-commands'
 import { diffModelIds, diffEntries } from './diff.ts'
 import {
   fetchRemoteCatalog,
@@ -347,8 +350,41 @@ export function apply(ctx: Context): void {
     startupTimer = setTimeout(runAuto, 1000)
   })
 
-  // The /model-sync command (registered by dsh-tui-pi) drives this service.
+  // The modelSync service stays exposed for UIs that want direct access. The
+  // /model-sync command itself is registered by this plugin (below) through
+  // the shared command registry, which interactive UIs discover on their own.
   ctx.provide('modelSync', { syncNow: () => syncNow(true) } satisfies ModelSyncService)
+
+  // Register the /model-sync slash command from the plugin itself. The
+  // registry is @deepseek-ai/dsh-commands' CommandRuntime ("Plugin-owned
+  // human-command registry shared by interactive UI adapters") — registration
+  // is global, so every interactive UI lists the command without any UI-side
+  // wiring. The registry is an optional peer: when the host has no commands
+  // service, skip registration and keep every other feature working.
+  const commands = (ctx as {
+    commands?: { register(definition: CommandDefinition): () => void }
+  }).commands
+  if (commands?.register !== undefined) {
+    ctx.effect(() => {
+      const definition: CommandDefinition = {
+        name: 'model-sync',
+        description: 'Force one model-list sync round from the pi.dev gateway into settings (dsh-model-sync)',
+        handler: async (invocation) => {
+          const ignored = invocation.rawInput.trim().length > 0
+            ? 'The sync scope is decided by the model-sync managedRoutes config; the argument is ignored.\n'
+            : ''
+          try {
+            const report = await syncNow(true)
+            return { kind: 'success', text: `${ignored}${report}` } satisfies CommandResult
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            return { kind: 'error', text: `${ignored}model-sync failed: ${message}` } satisfies CommandResult
+          }
+        },
+      }
+      return commands.register(definition)
+    }, 'dsh-model-sync: /model-sync')
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -24,6 +24,7 @@ Model lists drift: providers ship new models, retire old ones, and adjust capabi
 - **Scheduled refresh.** `intervalMinutes` auto rounds (default 240 / 4h) plus a `startupDelaySeconds` initial delay (default 5); each round logs the same report a manual refresh produces. `0` disarms the interval (startup-only). The interval re-arms live when the config changes (`src/index.ts`).
 - **Change reporting / diff.** Every round reports added/removed model ids (`diffModelIds`), and in `settings` mode added/removed/changed entries against the current raw settings (`diffEntries`, `diff.ts`). Dropped and degraded entries are reported with their reasons.
 - **`modelSync` service.** Exposes a `modelSync` service (`syncNow()`) that a UI can call to force one refresh round and read the report.
+- **`/model-sync` command.** The plugin registers a `/model-sync` slash command itself through the shared dsh command registry (`@deepseek-ai/dsh-commands`), so every interactive UI lists it automatically — no UI-side wiring. Running it forces one sync round on the spot and prints the same report the scheduled rounds log; the sync scope is decided by `managedRoutes` (arguments are ignored). The registry is an optional peer: hosts without a command registry still get the scheduled rounds and the `modelSync` service.
 - **Translation rules.** pi.dev entries are translated into settings-writable model profiles (`translate.ts`): base-matching vs base-less classification, `reasoningEfforts` derivation (S2 gate), `compat` gating to `openai-completions` (S5 gate), `maxTokens` handling, and drop logic for mixed-protocol routes.
 - **Safe-by-default options:**
   - `keepBuiltinOnly: true` — keep built-in catalog models that are not (yet) on pi.dev, so adopting the sync doesn't delete models you already use.
@@ -72,12 +73,16 @@ model-sync:
 
 The plugin writes to the `llm-pi-ai` namespace (`providers.<route>.models`) — the same document the adapter consumes — and only for the routes it manages. During migration, `keepBuiltinOnly` preserves models that exist in your installed built-in catalog but aren't on pi.dev yet.
 
+### Manual refresh: the `/model-sync` command
+
+Type `/model-sync` in any interactive UI to force one sync round on the spot. The plugin registers the command in the shared command registry (`@deepseek-ai/dsh-commands`), and UIs discover it automatically. It returns the same report the scheduled rounds log. The sync scope is decided by `managedRoutes`; any arguments typed after the command are ignored. Hosts without a command registry degrade gracefully — the scheduled rounds and the `modelSync` service keep working.
+
 ## Development
 
 ```bash
 npm run build   # tsc → lib/
 npm run check   # tsc --noEmit typecheck
-npm test        # node --test (pretest builds): diff / translate / writer / remote-catalog / serviceability
+npm test        # node --test (pretest builds): diff / translate / writer / remote-catalog / serviceability / command
 ```
 
 Tests use per-route pi.dev fixtures under `test/fixtures/` and temp directories for the models store — they never touch the real `~/.dsh`.
