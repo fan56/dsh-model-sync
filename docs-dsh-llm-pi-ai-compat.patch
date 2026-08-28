@@ -1,0 +1,22 @@
+--- /tmp/dsh-llm-pi-ai.index.js.bak	2026-08-17 12:49:46
++++ /opt/homebrew/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js	2026-08-17 12:49:54
+@@ -1068,7 +1068,8 @@
+ function resolveModelCompat(provider, entry, route, base, api) {
+ 	const thinkingFormat = entry.compat?.thinkingFormat ?? route?.thinkingFormat;
+ 	const supportsReasoningEffort = entry.compat?.supportsReasoningEffort ?? route?.supportsReasoningEffort;
+-	if (thinkingFormat === void 0 && supportsReasoningEffort === void 0) return {};
++	const supportsDeveloperRole = entry.compat?.supportsDeveloperRole ?? route?.supportsDeveloperRole;
++	if (thinkingFormat === void 0 && supportsReasoningEffort === void 0 && supportsDeveloperRole === void 0) return {};
+ 	if (api !== "openai-completions") {
+ 		if (entry.compat?.thinkingFormat !== void 0 || entry.compat?.supportsReasoningEffort !== void 0) invalid(provider, `model "${entry.id}" sets compat reasoning switches, but its api is "${api}"; thinkingFormat and supportsReasoningEffort exist only on openai-completions`);
+ 		return {};
+@@ -1076,7 +1077,8 @@
+ 	return { compat: {
+ 		...base?.api === api ? base.compat : void 0,
+ 		...thinkingFormat === void 0 ? {} : { thinkingFormat },
+-		...supportsReasoningEffort === void 0 ? {} : { supportsReasoningEffort }
++		...supportsReasoningEffort === void 0 ? {} : { supportsReasoningEffort },
++		...supportsDeveloperRole === void 0 ? {} : { supportsDeveloperRole }
+ 	} };
+ }
+ /**

@@ -1,0 +1,237 @@
+--- /tmp/dsh-llm-pi-ai.index.js.bak	2026-08-17 12:49:46
++++ /opt/homebrew/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js	2026-08-17 13:50:58
+@@ -3,12 +3,152 @@
+ import { deepEqualJson, installSettingsSection, settingsNamespace } from "@deepseek-ai/dsh-settings";
+ import { createModels, createProvider, getSupportedThinkingLevels, isContextOverflow } from "@earendil-works/pi-ai";
+ import { MAX_TIMER_DELAY_MS, idleWatchdog, timeoutOf } from "@deepseek-ai/dsh-timeout";
+-import { builtinProviders, getBuiltinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
++import { builtinProviders, getBuiltinModelDataGeneratedAt, getBuiltinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
+ import z from "@deepseek-ai/schemastery";
+ import { credentialRef } from "@deepseek-ai/dsh-credentials";
+ import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
+ import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
+ import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
++import { homedir } from "node:os";
++import { dirname, join } from "node:path";
++import { mkdir, readFile, writeFile } from "node:fs/promises";
++//#region lib/types/remote-catalog.js
++/**
++* pi.dev remote-catalog overlay, ported from pi-coding-agent's
++* `withRemoteCatalog` and adapted to the pi-ai 0.82.1 refresh context
++* (`{ store, allowNetwork, force, signal }`). dsh's adapter builds a fresh
++* `Models` per snapshot with no store and providers without `refreshModels`,
++* so a catalog route here never learns about a model the bundled catalog does
++* not ship. This wrapper gives catalog routes the same overlay pi agent gets:
++* pi.dev is the authoritative listing for the providers pi-ai ships, and the
++* overlay is merged in memory on top of the static catalog, with an
++* ETag/`last-modified` revalidated cache persisted under `~/.dsh`.
++*
++* Nothing is written to settings.yaml: the settings document stays the
++* config's source of truth, and the overlay is a runtime addition that a
++* rebuilt snapshot restores from the persisted store on its next refresh.
++*
++* @module dsh-llm-pi-ai/remote-catalog
++*/
++const REMOTE_CATALOG_BASE = "https://pi.dev";
++const REMOTE_CATALOG_REFRESH_INTERVAL_MS = 4 * 60 * 60 * 1000;
++const LOCAL_CATALOG_GENERATED_AT = getBuiltinModelDataGeneratedAt();
++const MODELS_STORE_PATH = join(homedir(), ".dsh", "models-store.json");
++function mergeModels(baseline, dynamic) {
++	const merged = [...baseline];
++	for (const model of dynamic) {
++		const index = merged.findIndex((entry) => entry.id === model.id);
++		if (index >= 0) merged[index] = model;
++		else merged.push(model);
++	}
++	return merged;
++}
++function parseRemoteCatalog(providerId, value) {
++	const entries = Array.isArray(value)
++		? value
++		: typeof value === "object" && value !== null && "models" in value && Array.isArray(value.models)
++			? value.models
++			: typeof value === "object" && value !== null
++				? Object.values(value)
++				: void 0;
++	if (!entries) throw new Error(`Invalid model catalog for provider "${providerId}"`);
++	return entries
++		.filter((entry) => typeof entry === "object" && entry !== null && "id" in entry)
++		.map((model) => ({ ...model, provider: providerId }));
++}
++function remoteModels(entry, localGeneratedAt) {
++	if (!entry) return [];
++	if (localGeneratedAt !== void 0 && (entry.lastModified === void 0 || entry.lastModified <= localGeneratedAt)) return [];
++	return entry.models;
++}
++/** Persistent per-provider overlay cache at ~/.dsh/models-store.json. */
++function modelsStore() {
++	if (modelsStoreCache !== void 0) return modelsStoreCache;
++	const readDoc = async () => {
++		try {
++			return JSON.parse(await readFile(MODELS_STORE_PATH, "utf8"));
++		} catch {
++			return {};
++		}
++	};
++	const writeDoc = (doc) => mkdir(dirname(MODELS_STORE_PATH), { recursive: true }).then(() => writeFile(MODELS_STORE_PATH, JSON.stringify(doc)));
++	let queue = Promise.resolve();
++	const enqueue = (task) => {
++		const next = queue.then(task, task);
++		queue = next.catch(() => {});
++		return next;
++	};
++	return modelsStoreCache = {
++		read: (providerId) => readDoc().then((doc) => (providerId === void 0 ? void 0 : doc[providerId])),
++		write: (providerId, entry) => enqueue(async () => {
++			const doc = await readDoc();
++			doc[providerId] = entry;
++			await writeDoc(doc);
++		}),
++		delete: (providerId) => enqueue(async () => {
++			const doc = await readDoc();
++			delete doc[providerId];
++			await writeDoc(doc);
++		})
++	};
++}
++let modelsStoreCache;
++/**
++* Wrap a pi-ai catalog provider so its model list overlays pi.dev's remote
++* catalog. The overlay is in-memory (`getModels` merge); the cache is
++* persisted through the models store so a rebuilt snapshot restores it on the
++* next refresh.
++*/
++function withRemoteCatalog(provider, store) {
++	let dynamicModels = [];
++	return {
++		...provider,
++		getModels: () => mergeModels(provider.getModels(), dynamicModels),
++		refreshModels: async (context) => {
++			const stored = await store.read(provider.id);
++			// Restore the cached overlay first, so a rebuilt snapshot comes back
++			// to the same list even when the network is unavailable.
++			dynamicModels = remoteModels(stored, LOCAL_CATALOG_GENERATED_AT).filter((model) => model.provider === provider.id);
++			if (!context.allowNetwork || context.signal?.aborted) return;
++			if (!context.force && stored?.checkedAt !== void 0 && stored.lastModified !== void 0 && Date.now() - stored.checkedAt < REMOTE_CATALOG_REFRESH_INTERVAL_MS) return;
++			const validator = stored?.models?.length ? stored.etag : void 0;
++			const url = new URL(`/api/models/providers/${encodeURIComponent(provider.id)}`, REMOTE_CATALOG_BASE);
++			const response = await fetch(url, {
++				headers: { accept: "application/json", ...(validator ? { "if-none-match": validator } : {}) },
++				signal: context.signal,
++			});
++			if (context.signal?.aborted) return;
++			const checkedAt = Date.now();
++			if (response.status === 304 && stored) {
++				await store.write(provider.id, { ...stored, checkedAt });
++				return;
++			}
++			if (response.status === 404 || response.status === 501) {
++				await store.write(provider.id, { ...(stored ?? { models: [] }), checkedAt, lastModified: 0, etag: void 0 });
++				return;
++			}
++			if (!response.ok) {
++				// Transient failure: the cached body and its validator stay valid,
++				// so keep the etag and let the next refresh revalidate.
++				await store.write(provider.id, { ...(stored ?? { models: [] }), checkedAt });
++				throw new Error(`Model catalog request failed for ${provider.id}: ${response.status}`);
++			}
++			const refreshed = parseRemoteCatalog(provider.id, await response.json());
++			const lastModified = Date.parse(response.headers.get("last-modified") ?? "");
++			if (context.signal?.aborted) return;
++			const entry = {
++				models: refreshed,
++				checkedAt,
++				lastModified: Number.isNaN(lastModified) ? 0 : lastModified,
++				etag: response.headers.get("etag") ?? void 0
++			};
++			const published = remoteModels(entry, LOCAL_CATALOG_GENERATED_AT);
++			await store.write(provider.id, entry);
++			dynamicModels = published;
++		}
++	};
++}
++//#endregion
+ //#region lib/types/replay.js
+ /**
+ * Durable pi-ai replay metadata and assistant-history reconstruction.
+@@ -745,7 +885,7 @@
+ 	current() {
+ 		const profiles = this.config.profiles();
+ 		if (this.snapshot?.profiles === profiles) return this.snapshot;
+-		const models = createModels();
++		const models = createModels({ modelsStore: modelsStore() });
+ 		for (const profile of profiles.values()) models.setProvider(profile.piProvider);
+ 		this.snapshot = {
+ 			profiles,
+@@ -786,6 +926,32 @@
+ 				inputModalities: [...model.input]
+ 			}));
+ 		});
++	}
++	/**
++	* Run every catalog provider's remote-catalog refresh (the pi.dev overlay).
++	* This is the pi-agent equivalent of `Models.refresh()`, driven directly so
++	* the api-key providers dsh uses are not skipped by pi-ai 0.82.1's
++	* credential gate. Errors are collected per provider and returned, never
++	* thrown; a failing provider keeps its last good overlay.
++	*/
++	async refresh(options = {}) {
++		const snapshot = this.current();
++		const store = modelsStore();
++		const errors = new Map();
++		await Promise.all(snapshot.models.getProviders().map(async (provider) => {
++			if (provider.refreshModels === void 0) return;
++			try {
++				await provider.refreshModels({
++					store,
++					allowNetwork: options.allowNetwork ?? true,
++					force: options.force ?? false,
++					signal: options.signal
++				});
++			} catch (error) {
++				errors.set(provider.id, error);
++			}
++		}));
++		return errors;
+ 	}
+ 	resolveModel(provider, model, _signal) {
+ 		return Promise.resolve().then(() => {
+@@ -1068,7 +1234,8 @@
+ function resolveModelCompat(provider, entry, route, base, api) {
+ 	const thinkingFormat = entry.compat?.thinkingFormat ?? route?.thinkingFormat;
+ 	const supportsReasoningEffort = entry.compat?.supportsReasoningEffort ?? route?.supportsReasoningEffort;
+-	if (thinkingFormat === void 0 && supportsReasoningEffort === void 0) return {};
++	const supportsDeveloperRole = entry.compat?.supportsDeveloperRole ?? route?.supportsDeveloperRole;
++	if (thinkingFormat === void 0 && supportsReasoningEffort === void 0 && supportsDeveloperRole === void 0) return {};
+ 	if (api !== "openai-completions") {
+ 		if (entry.compat?.thinkingFormat !== void 0 || entry.compat?.supportsReasoningEffort !== void 0) invalid(provider, `model "${entry.id}" sets compat reasoning switches, but its api is "${api}"; thinkingFormat and supportsReasoningEffort exist only on openai-completions`);
+ 		return {};
+@@ -1076,7 +1243,8 @@
+ 	return { compat: {
+ 		...base?.api === api ? base.compat : void 0,
+ 		...thinkingFormat === void 0 ? {} : { thinkingFormat },
+-		...supportsReasoningEffort === void 0 ? {} : { supportsReasoningEffort }
++		...supportsReasoningEffort === void 0 ? {} : { supportsReasoningEffort },
++		...supportsDeveloperRole === void 0 ? {} : { supportsDeveloperRole }
+ 	} };
+ }
+ /**
+@@ -1278,7 +1446,7 @@
+ */
+ function buildProvider(spec) {
+ 	const catalog = catalogProvider(spec.provider);
+-	if (catalog !== void 0 && spec.api === void 0) return reuseCatalogProvider(catalog, spec);
++	if (catalog !== void 0 && spec.api === void 0) return withRemoteCatalog(reuseCatalogProvider(catalog, spec), modelsStore());
+ 	const factory = spec.api === void 0 ? void 0 : PROTOCOLS[spec.api];
+ 	if (factory === void 0) throw new Error(`llm-pi-ai: provider "${spec.provider}" names api "${spec.api}", which this build cannot serve; supported protocols are ${supportedProtocols().join(", ")}`);
+ 	return createProvider({
+@@ -1803,6 +1971,9 @@
+ 		resolveApiKey,
+ 		resolveAttachments: () => ctx.get("attachments")
+ 	});
++	// Expose the pi.dev catalog overlay refresh to plugins (dsh-model-sync drives
++	// it on startup, on an interval, and through the /models-sync command).
++	ctx.provide("piAiCatalog", { refresh: (options) => adapter.refresh(options) });
+ 	let directory;
+ 	let directoryFacts;
+ 	const ensureDirectory = () => {
