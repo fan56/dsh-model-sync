@@ -1,6 +1,6 @@
 {
   "name": "@aiwayds/dsh-model-sync",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "dsh plugin: keep llm-pi-ai provider routes' model lists in step with the pi.dev gateway, written through the official settings seam",
   "type": "module",
   "main": "lib/index.js",
