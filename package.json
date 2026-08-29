@@ -8,6 +8,7 @@
   "license": "MIT",
   "keywords": [
     "dsh",
+    "dsh-plugin",
     "plugin",
     "model",
     "sync",
