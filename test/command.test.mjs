@@ -52,8 +52,10 @@ const defaultConfig = {
 /**
  * Fake cordis context stubbing everything apply() touches: settings.register,
  * scope.watch, ctx.get/logger/provide, ctx.effect (runs the body eagerly and
- * collects the returned disposer, like cordis), and the optional commands
- * registry.
+ * collects the returned disposer, like cordis), ctx.inject (runs the sub-fiber
+ * body immediately when every injected service exists, never when one is
+ * missing — real cordis would also fire it if a missing service appears
+ * later), and the optional commands registry.
  */
 function createFakeContext({ config = defaultConfig, services = {}, get } = {}) {
   const state = {
@@ -79,6 +81,10 @@ function createFakeContext({ config = defaultConfig, services = {}, get } = {}) 
     },
     provide(name, service) {
       state.provided.push({ name, service })
+    },
+    inject(names, callback) {
+      for (const name of names) if (ctx[name] === undefined) return
+      callback(Object.create(ctx))
     },
     commands: {
       register(definition) {

@@ -359,13 +359,16 @@ export function apply(ctx: Context): void {
   // registry is @deepseek-ai/dsh-commands' CommandRuntime ("Plugin-owned
   // human-command registry shared by interactive UI adapters") — registration
   // is global, so every interactive UI lists the command without any UI-side
-  // wiring. The registry is an optional peer: when the host has no commands
-  // service, skip registration and keep every other feature working.
-  const commands = (ctx as {
-    commands?: { register(definition: CommandDefinition): () => void }
-  }).commands
-  if (commands?.register !== undefined) {
-    ctx.effect(() => {
+  // wiring. The registry is an optional peer: the `ctx.inject` sub-fiber stays
+  // dormant until the host provides the `commands` service, so hosts without
+  // the registry keep every other feature working. A bare `ctx.commands` read
+  // without a declared inject throws in cordis 4.
+  ctx.inject(['commands'], (cmdCtx) => {
+    const commands = (cmdCtx as {
+      commands?: { register(definition: CommandDefinition): () => void }
+    }).commands
+    if (commands?.register === undefined) return
+    cmdCtx.effect(() => {
       const definition: CommandDefinition = {
         name: 'model-sync',
         description: 'Force one model-list sync round from the pi.dev gateway into settings (dsh-model-sync)',
@@ -384,7 +387,7 @@ export function apply(ctx: Context): void {
       }
       return commands.register(definition)
     }, 'dsh-model-sync: /model-sync')
-  }
+  })
 }
 
 // ---------------------------------------------------------------------------
