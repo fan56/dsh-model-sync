@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-08-29
+
+### Added
+
+- npm `keywords`: `dsh-plugin` (joins the existing `dsh`) and GitHub repo topics `dsh`, `dsh-plugin`, for dsh / dsh-plugin discovery.
+
+### Docs
+
+- Embed a 1.5×-speed `/model-sync` session recording in the README (Demos issue #1), English + 简体中文.
+
 ## [0.1.4] - 2026-08-29
 
 ### Fixed
@@ -27,7 +37,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - First tagged release.
 
-[Unreleased]: https://github.com/fan56/dsh-model-sync/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/fan56/dsh-model-sync/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/fan56/dsh-model-sync/releases/tag/v0.1.5
 [0.1.4]: https://github.com/fan56/dsh-model-sync/releases/tag/v0.1.4
 [0.1.3]: https://github.com/fan56/dsh-model-sync/releases/tag/v0.1.3
 [0.1.2]: https://github.com/fan56/dsh-model-sync/releases/tag/v0.1.2
