@@ -4,8 +4,15 @@
  * Write translated model profiles to dsh settings via the settings.mutate API.
  *
  * Key behaviors (design doc §4):
- * - Change-only writes: compare against raw user segment (desc.user), not
- *   resolved values (which have schema defaults applied)
+ * - Change-only writes: compare the merged target (target ⊕ modelOverrides)
+ *   against the raw user segment (desc.user), not resolved values (which have
+ *   schema defaults applied)
+ * - modelOverrides are the user's own per-model channel (think levels,
+ *   narrowed context windows). They are preserved forever: the synced models
+ *   list is written with override fields folded in, and the overrides key is
+ *   never unset or edited. (Earlier versions unset the key to "migrate" the
+ *   values into models, which silently wiped them on the next round once the
+ *   target was regenerated from pi.dev.)
  * - Revision conflict retry: catch SETTINGS_CONFLICT, re-read, re-translate,
  *   re-write once
  * - Never touches ~/.dsh/settings.yaml directly — only through settings.mutate
@@ -140,6 +147,28 @@ function getRawUserModelOverrides(
 }
 
 // ---------------------------------------------------------------------------
+// Override merge
+// ---------------------------------------------------------------------------
+
+/**
+ * Fold the user's modelOverrides into the synced target; the override wins
+ * per field. Overrides whose id is not in the target are user data for other
+ * models — they stay in the overrides key untouched, never folded, never
+ * dropped.
+ */
+function mergeOverrides(
+  target: SettingsModelProfile[],
+  overrides: Record<string, Record<string, unknown>> | undefined,
+): SettingsModelProfile[] {
+  if (overrides === undefined) return target
+  return target.map((entry) => {
+    const override = overrides[entry.id]
+    if (override === undefined) return entry
+    return { ...entry, ...override } as SettingsModelProfile
+  })
+}
+
+// ---------------------------------------------------------------------------
 // syncToSettings (§4)
 // ---------------------------------------------------------------------------
 
@@ -148,9 +177,11 @@ function getRawUserModelOverrides(
  *
  * Implements the full §4 protocol:
  * 1. Get revision from describe()
- * 2. Compare against raw user segment (change-only write)
- * 3. Merge modelOverrides into target when present
- * 4. Call mutate with expectedRevision (set models + unset overrides when needed)
+ * 2. Merge modelOverrides into the target (override wins per field); the
+ *    overrides key itself is never written or deleted
+ * 3. Change-only write: skip when the raw user-segment models already equal
+ *    the merged target
+ * 4. Call mutate with expectedRevision (single set op on the models path)
  * 5. On SETTINGS_CONFLICT: re-read, re-translate (caller's job), re-write once
  *
  * @param settings  The settings service (injected, not imported)
@@ -178,47 +209,26 @@ export async function syncToSettings(
     return { wrote: false, reason: 'skipped' }
   }
 
-  const revision = desc.revision
   const rawModels = getRawUserModels(desc, route)
   const rawOverrides = getRawUserModelOverrides(desc, route)
 
-  // Change-only write (§4.4): skip only when models are equal AND no overrides.
-  // If modelOverrides exist, we must write (merge overrides + unset the key).
-  const modelsEqual = rawModels !== undefined && profilesEqual(rawModels, target)
-  if (modelsEqual && rawOverrides === undefined) {
+  const mergedTarget = mergeOverrides(target, rawOverrides)
+
+  // Change-only write (§4.4): skip when the stored models already reflect
+  // target ⊕ overrides. Because the overrides key is preserved, this stays
+  // stable across rounds: once written, the merged view is re-derived
+  // identically every round until pi.dev actually changes.
+  if (rawModels !== undefined && profilesEqual(rawModels, mergedTarget)) {
     logger.debug('no change for route %s; skip write', route)
     return { wrote: false, reason: 'no-change' }
   }
 
-  // Merge modelOverrides into target when present.
-  // Each override key is a model id; shallow-merge its fields into the matching
-  // target entry. Skip overrides for ids not in target (log a warning).
-  let mergedTarget = target
-  if (rawOverrides !== undefined) {
-    mergedTarget = target.map((entry) => {
-      const override = rawOverrides[entry.id]
-      if (override === undefined) return entry
-      return { ...entry, ...override } as SettingsModelProfile
-    })
-    // Warn about overrides that reference missing target ids
-    const targetIds = new Set(target.map((e) => e.id))
-    for (const overrideId of Object.keys(rawOverrides)) {
-      if (!targetIds.has(overrideId)) {
-        logger.warn('modelOverrides contains id "%s" not in target for route %s; skipping', overrideId, route)
-      }
-    }
-  }
-
-  // Build ops: set models + unset overrides when overrides exist
   const ops: SettingsMutationOp[] = [
     { op: 'set', path: ['providers', route, 'models'], value: mergedTarget },
   ]
-  if (rawOverrides !== undefined) {
-    ops.push({ op: 'unset', path: ['providers', route, 'modelOverrides'] })
-  }
 
   try {
-    await settings.mutate('llm-pi-ai', ops, revision)
+    await settings.mutate('llm-pi-ai', ops, desc.revision)
     return { wrote: true, reason: 'wrote' }
   } catch (err: unknown) {
     // Check for SETTINGS_CONFLICT
@@ -245,23 +255,13 @@ export async function syncToSettings(
       }
 
       const newTarget = await retranslate(newDesc.revision)
-
-      // Rebuild ops for retry (overrides may have changed)
-      const newOverrides = getRawUserModelOverrides(newDesc, route)
-      let retryTarget = newTarget
-      if (newOverrides !== undefined) {
-        retryTarget = newTarget.map((entry) => {
-          const override = newOverrides[entry.id]
-          if (override === undefined) return entry
-          return { ...entry, ...override } as SettingsModelProfile
-        })
-      }
       const retryOps: SettingsMutationOp[] = [
-        { op: 'set', path: ['providers', route, 'models'], value: retryTarget },
+        {
+          op: 'set',
+          path: ['providers', route, 'models'],
+          value: mergeOverrides(newTarget, getRawUserModelOverrides(newDesc, route)),
+        },
       ]
-      if (newOverrides !== undefined) {
-        retryOps.push({ op: 'unset', path: ['providers', route, 'modelOverrides'] })
-      }
 
       await settings.mutate('llm-pi-ai', retryOps, newDesc.revision)
       return { wrote: true, reason: 'conflict-retry-ok' }

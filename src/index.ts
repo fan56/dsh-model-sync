@@ -5,10 +5,10 @@
  * what changed.
  *
  * Supports two write modes:
- * - 'overlay' (default): uses the patched dsh-llm-pi-ai's piAiCatalog.refresh()
- *   to overlay pi.dev entries in memory (existing behavior, requires patch)
- * - 'settings': self-contained fetch → translate → settings.mutate pipeline
- *   that writes directly to settings.yaml (zero patch required)
+ * - 'settings' (default): self-contained fetch → translate → settings.mutate
+ *   pipeline that writes directly to settings.yaml (zero patch required)
+ * - 'overlay' (legacy): uses the patched dsh-llm-pi-ai's piAiCatalog.refresh()
+ *   to overlay pi.dev entries in memory (requires patch)
  *
  * @module dsh-model-sync
  */
@@ -48,8 +48,12 @@ const OWN_NS = settingsNamespace('model-sync')
 
 /** The `model-sync` settings namespace: user-editable in settings.yaml. */
 const ModelSyncConfig = z.object({
-  /** Write mode: 'overlay' (legacy, requires patch) or 'settings' (Plan C). */
-  writeMode: z.union(['overlay', 'settings']).default('overlay'),
+  /**
+   * Write mode: 'settings' (default, zero-patch settings.mutate pipeline) or
+   * 'overlay' (legacy, delegates to the patched adapter's piAiCatalog.refresh
+   * and requires the optional patch).
+   */
+  writeMode: z.union(['settings', 'overlay']).default('settings'),
   /** Minutes between auto refreshes (default 240 = 4 hours); 0 = startup-only. */
   intervalMinutes: z.number().step(1).min(0).default(240),
   /** Delay before the first auto refresh, so the llm adapter is ready. */

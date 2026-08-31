@@ -11,6 +11,14 @@
  * - drop logic for mixed-protocol routes (§3.3 rule 13)
  * - keepBuiltinOnly behavior (§5.2)
  *
+ * Deviation from design doc §3.3 (rules 3/5), added 2026-08-31: capacity
+ * sanity guards. Settings-written capacities override the installed catalog
+ * (`entry.contextWindow ?? base?.contextWindow` in llm-pi-ai's catalog merge)
+ * and a written maxTokens becomes the request-level defaultMaxTokens — so a
+ * garbage listing value (non-integer, or a maxTokens that merely echoes the
+ * context window) would trip the "output token limit" family (#1166). Such
+ * values are now skipped with a degrade warning instead of written.
+ *
  * @module dsh-model-sync/translate
  */
 
@@ -81,6 +89,11 @@ export interface TranslateResult {
 // ---------------------------------------------------------------------------
 // THINKING_LEVELS whitelist (§3.5)
 // ---------------------------------------------------------------------------
+
+/** A positive integer, the only usable shape for a capacity value. */
+function isPositiveInt(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0
+}
 
 /** Allowed thinking level keys and their valid wire-spelling constraints. */
 const THINKING_LEVELS = new Set([
@@ -166,17 +179,54 @@ export function translateEntries(
     // Rule 2: name
     if (entry.name !== undefined) profile.name = entry.name
 
-    // Rule 3: contextWindow
-    if (entry.contextWindow !== undefined) profile.contextWindow = entry.contextWindow
+    // Rule 3: contextWindow — only a positive integer is a usable capacity.
+    // A written value overrides the installed catalog at resolution time, so
+    // garbage from the listing is skipped (installed value / route default
+    // then applies) instead of propagated.
+    if (entry.contextWindow !== undefined) {
+      if (isPositiveInt(entry.contextWindow)) {
+        profile.contextWindow = entry.contextWindow
+      } else {
+        warnings.push({
+          id: entry.id,
+          route,
+          reason: `contextWindow ${entry.contextWindow} from the listing is not a positive integer — skipped; installed value or route default applies`,
+          severity: 'degrade',
+        })
+      }
+    }
 
     // Rule 4: input (modalities)
     if (entry.input !== undefined && entry.input.length > 0) {
       profile.input = [...entry.input]
     }
 
-    // Rule 5: maxTokens — base-matching: strip; base-less: keep
+    // Rule 5: maxTokens — base-matching: strip; base-less: keep only when
+    // sane. base-matching strips because pi-ai falls back to the catalog
+    // value. base-less keeps the value, but only if it is a plausible output
+    // cap: a positive integer strictly below the context window. Listings
+    // sometimes echo the context window into maxTokens (e.g. grok-4.6
+    // 500000/500000); written through, it becomes the request-level
+    // defaultMaxTokens and trips the "output token limit" family — strip it
+    // with a degrade warning instead.
     if (!isBaseMatching && entry.maxTokens !== undefined) {
-      profile.maxTokens = entry.maxTokens
+      if (!isPositiveInt(entry.maxTokens)) {
+        warnings.push({
+          id: entry.id,
+          route,
+          reason: `maxTokens ${entry.maxTokens} from the listing is not a positive integer — skipped; route default applies`,
+          severity: 'degrade',
+        })
+      } else if (profile.contextWindow !== undefined && entry.maxTokens >= profile.contextWindow) {
+        warnings.push({
+          id: entry.id,
+          route,
+          reason: `maxTokens ${entry.maxTokens} >= contextWindow ${profile.contextWindow} — looks like a listing echo, skipped; route default applies`,
+          severity: 'degrade',
+        })
+      } else {
+        profile.maxTokens = entry.maxTokens
+      }
     }
     // base-matching: don't write maxTokens (pi-ai falls back to catalog value)
 

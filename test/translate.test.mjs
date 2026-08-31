@@ -721,6 +721,88 @@ check('forceMax: force=false → behavior unchanged (regression)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Capacity sanity guards (deviation from design doc §3.3 rules 3/5)
+// ---------------------------------------------------------------------------
+const builtinSynthetic = [{ id: 'known-a', api: 'openai-completions', maxTokens: 8192 }]
+const builtinSyntheticIds = new Set(['known-a'])
+
+const baseEntry = {
+  name: 'Echo Model',
+  api: 'openai-completions',
+  provider: 'opencode-go',
+  baseUrl: 'https://example.test/v1',
+  reasoning: false,
+  input: ['text'],
+}
+
+check('capacity guard: base-less maxTokens ≥ contextWindow (listing echo) is stripped with degrade warning', () => {
+  const entries = [{
+    ...baseEntry,
+    id: 'echo-model',
+    contextWindow: 500000,
+    maxTokens: 500000,
+  }]
+  const result = translateEntries(entries, builtinSyntheticIds, builtinSynthetic, 'opencode-go', defaultOpts)
+  const entry = result.entries.find(e => e.id === 'echo-model')
+  assert.ok(entry, 'entry is still written')
+  assert.equal(entry.maxTokens, undefined, 'echoed maxTokens must not be written')
+  assert.equal(entry.contextWindow, 500000)
+  const warn = result.warnings.find(w => w.id === 'echo-model')
+  assert.ok(warn, 'a degrade warning explains the strip')
+  assert.equal(warn.severity, 'degrade')
+  assert.ok(warn.reason.includes('echo'), `warning mentions the echo: ${warn.reason}`)
+})
+
+check('capacity guard: base-less maxTokens < contextWindow is kept', () => {
+  const entries = [{ ...baseEntry, id: 'sane-model', contextWindow: 200000, maxTokens: 32768 }]
+  const result = translateEntries(entries, builtinSyntheticIds, builtinSynthetic, 'opencode-go', defaultOpts)
+  const entry = result.entries.find(e => e.id === 'sane-model')
+  assert.equal(entry.maxTokens, 32768, 'plausible maxTokens survives')
+  assert.equal(result.warnings.length, 0)
+})
+
+check('capacity guard: base-less maxTokens with no contextWindow is kept (nothing to compare)', () => {
+  const entries = [{ ...baseEntry, id: 'ctx-less-model', maxTokens: 16384 }]
+  const result = translateEntries(entries, builtinSyntheticIds, builtinSynthetic, 'opencode-go', defaultOpts)
+  const entry = result.entries.find(e => e.id === 'ctx-less-model')
+  assert.equal(entry.maxTokens, 16384)
+  assert.equal(result.warnings.length, 0)
+})
+
+check('capacity guard: non-integer maxTokens is stripped with degrade warning', () => {
+  const entries = [{ ...baseEntry, id: 'odd-model', contextWindow: 100000, maxTokens: 1.5 }]
+  const result = translateEntries(entries, builtinSyntheticIds, builtinSynthetic, 'opencode-go', defaultOpts)
+  const entry = result.entries.find(e => e.id === 'odd-model')
+  assert.equal(entry.maxTokens, undefined)
+  assert.ok(result.warnings.some(w => w.id === 'odd-model' && w.reason.includes('positive integer')))
+})
+
+check('capacity guard: garbage contextWindow is skipped with degrade warning, entry kept', () => {
+  const entries = [{ ...baseEntry, id: 'bad-ctx-model', contextWindow: -1, maxTokens: 4096 }]
+  const result = translateEntries(entries, builtinSyntheticIds, builtinSynthetic, 'opencode-go', defaultOpts)
+  const entry = result.entries.find(e => e.id === 'bad-ctx-model')
+  assert.ok(entry, 'entry itself is serviceable and stays')
+  assert.equal(entry.contextWindow, undefined, 'garbage contextWindow is not written')
+  // maxTokens: contextWindow unknown after the skip → nothing to compare, keep
+  assert.equal(entry.maxTokens, 4096)
+  assert.ok(result.warnings.some(w => w.id === 'bad-ctx-model' && w.reason.includes('contextWindow')))
+})
+
+check('capacity guard: base-matching entry keeps contextWindow sync, still strips maxTokens', () => {
+  const entries = [{
+    ...baseEntry,
+    id: 'known-a', // base-matching
+    contextWindow: 300000,
+    maxTokens: 9999,
+  }]
+  const result = translateEntries(entries, builtinSyntheticIds, builtinSynthetic, 'opencode-go', defaultOpts)
+  const entry = result.entries.find(e => e.id === 'known-a')
+  assert.equal(entry.contextWindow, 300000, 'fresh contextWindow from the listing is the sync value-prop')
+  assert.equal(entry.maxTokens, undefined, 'base-matching maxTokens still falls back to the installed catalog')
+  assert.equal(result.warnings.length, 0)
+})
+
+// ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
 if (failed > 0) {

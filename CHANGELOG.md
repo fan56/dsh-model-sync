@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-08-31
+
+### Fixed
+
+- **User `modelOverrides` are now durable.** The writer used to fold overrides into the models list and then `unset` the overrides key; the next round regenerated the target from pi.dev, found the stored models different, and silently clobbered the folded fields (think levels, narrowed context windows) after exactly one round. The overrides key is now never written or deleted: each write is target ⊕ overrides, change detection compares against that merged view, and overrides for ids outside the target stay untouched user data instead of being dropped with the key.
+
+### Changed
+
+- `writeMode` now defaults to `settings` (the zero-patch pipeline); `overlay` remains available for the legacy patched-adapter flow.
+- Capacity sanity gate (deviation from design doc §3.3 rules 3/5): settings-written capacities override the installed catalog at resolution, and a written `maxTokens` becomes the request-level `defaultMaxTokens` — so listing garbage would trip the "output token limit" family (upstream #1166). A non-positive-integer `contextWindow`/`maxTokens`, or a `maxTokens` not strictly below the context window (listing echoes, e.g. grok-4.6 at 500000/500000), is now skipped with a `DEGRADED` report line instead of written.
+
+### Docs
+
+- README (EN + zh): standalone-distribution statement (the bundled-in-dsh-tui-pi claim is stale), config table aligned with the new defaults, new "Capacity values are upper limits" section with the `modelOverrides` escape hatch.
+
 ## [0.1.5] - 2026-08-29
 
 ### Added
