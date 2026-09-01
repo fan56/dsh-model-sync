@@ -55,8 +55,13 @@ jobs:
       - name: Install dependencies (frozen lockfile)
         run: pnpm install --frozen-lockfile
 
-      - name: Install dsh CLI (real host for the boot smoke)
-        run: npm install -g @deepseek-ai/dsh@0.1.1-rc.2 --no-audit --no-fund
+      - name: Install dsh CLI (rolling alpha tag, never hand-pinned)
+        run: |
+          echo "alpha @deepseek-ai/dsh: $(npm view @deepseek-ai/dsh@alpha version)"
+          npm install -g @deepseek-ai/dsh@alpha --no-audit --no-fund
+
+      - name: Link the @deepseek-ai/* closure from the installed host
+        run: node scripts/link-dsh-closure.mjs
 
       - name: Build & Check & Test
         # pnpm does not run npm pre/post hooks by default; build explicitly.
