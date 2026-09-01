@@ -40,14 +40,18 @@ function createMockSettings({ revision = 1, userModels = undefined, modelOverrid
   if (modelOverrides !== undefined) routeData.modelOverrides = modelOverrides
   return {
     mutations,
+    // Descriptor shape mirrors the real dsh-settings 0.1.2-alpha.3
+    // describe() entry: { ns, schema, value, revision, base?, user?, applies }.
     describe() {
       return [{
         ns: 'llm-pi-ai',
+        schema: {},
+        value: {},
         revision,
         user: Object.keys(routeData).length > 0
           ? { providers: { 'test-route': routeData } }
           : undefined,
-        value: {},
+        applies: 'live',
       }]
     },
     async mutate(ns, ops, expectedRevision) {
@@ -142,11 +146,13 @@ await checkAsync('syncToSettings: SETTINGS_CONFLICT retry succeeds', async () =>
       callCount++
       return [{
         ns: 'llm-pi-ai',
+        schema: {},
+        value: {},
         revision: callCount === 1 ? 1 : 2,
         user: callCount === 1
           ? { providers: { 'test-route': { models: [{ id: 'model-a' }] } } }
           : { providers: { 'test-route': { models: [{ id: 'model-a', name: 'old' }] } } },
-        value: {},
+        applies: 'live',
       }]
     },
     async mutate(ns, ops, expectedRevision) {
@@ -180,9 +186,11 @@ await checkAsync('syncToSettings: SETTINGS_CONFLICT retry also fails → conflic
     describe() {
       return [{
         ns: 'llm-pi-ai',
+        schema: {},
+        value: {},
         revision: 1,
         user: { providers: { 'test-route': { models: [{ id: 'model-a' }] } } },
-        value: {},
+        applies: 'live',
       }]
     },
     async mutate() {

@@ -127,6 +127,27 @@ await checkAsync('boots with no registry ever appearing (optional peer stays dor
 })
 
 // ---------------------------------------------------------------------------
+// Overlay degradation (dsh 0.1.2-alpha.3): no piAiCatalog service, a working
+// llm seam — syncNow must return the patch-not-applied notice instead of
+// throwing. Load-bearing since alpha.3: the hand patch cannot apply anymore
+// (it shims settingsNamespace/installSettingsSection, both removed from
+// dsh-settings), so every unpatched host takes exactly this path.
+// ---------------------------------------------------------------------------
+await checkAsync('overlay mode degrades with the patch-not-applied notice when piAiCatalog is absent', async () => {
+  const root = makeRoot()
+  root.provide('llm', {
+    listProviders: () => [{ id: 'opencode-go' }],
+    listModels: async () => [{ id: 'x' }],
+  })
+  await root.plugin(plugin)
+  const report = await root.get('modelSync').syncNow()
+  assert.ok(
+    report.includes('remote-catalog patch is not applied'),
+    `expected the degradation notice, got: ${JSON.stringify(report)}`,
+  )
+})
+
+// ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
 if (failed > 0) {
