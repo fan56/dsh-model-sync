@@ -15,7 +15,12 @@
 
 import z from '@deepseek-ai/schemastery'
 import type { Context } from '@deepseek-ai/cordis'
-import { settingsNamespace } from '@deepseek-ai/dsh-settings'
+// Type-only side-effect import: loads dsh-settings' `declare module
+// '@deepseek-ai/cordis'` augmentation, which is what puts `ctx.settings` on
+// the Context type. There is no runtime import — the host provides the
+// settings service; alpha.3 removed the settingsNamespace() helper this file
+// used to import.
+import type {} from '@deepseek-ai/dsh-settings'
 // Types only (erased at emit); dsh-commands is an optional peer, so hosts
 // without it still load this plugin — see the guarded registration below.
 import type { CommandDefinition, CommandResult } from '@deepseek-ai/dsh-commands'
@@ -44,7 +49,11 @@ export const name = 'dsh-model-sync'
 /** The settings seam this plugin consumes (its own config namespace). */
 export const inject = ['settings']
 
-const OWN_NS = settingsNamespace('model-sync')
+// dsh-settings 0.1.2-alpha.3 removed the runtime settingsNamespace() helper:
+// register() now brand-checks the namespace at the type level
+// (SettingsNamespaceInput) and validates the same pattern at runtime. A plain
+// literal is the supported spelling.
+const OWN_NS = 'model-sync'
 
 /** The `model-sync` settings namespace: user-editable in settings.yaml. */
 const ModelSyncConfig = z.object({
@@ -135,6 +144,11 @@ export function apply(ctx: Context): void {
   ): Promise<string> => {
     const catalog = ctx.get('piAiCatalog') as CatalogSeam | undefined
     if (catalog?.refresh === undefined) {
+      // Degradation path (never throws): the overlay needs a hand-patched
+      // dsh-llm-pi-ai exposing piAiCatalog.refresh(). Since dsh 0.1.2-alpha.3
+      // the patch cannot even apply (it shims settingsNamespace and
+      // installSettingsSection, both removed from dsh-settings), so hosts on
+      // the alpha line always land here unless they run the settings mode.
       return 'catalog refresh is unavailable — the dsh-llm-pi-ai remote-catalog patch is not applied; the model list is the static catalog only.'
     }
     let providers: readonly { id: string }[]
