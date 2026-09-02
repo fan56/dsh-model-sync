@@ -173,11 +173,14 @@ check('opencode-go: base-less entries on mixed-protocol route are dropped', () =
     defaultOpts,
   )
 
-  // Mixed-protocol route: base-less entries (glm-5.3, gpt-5.6-luna, qwen3.8-max) are dropped
+  // Mixed-protocol route: base-less entries (the three test-ghost-* fixture
+  // ids, which exist in no pi-ai catalog) are dropped. Ghost ids keep this
+  // test immune to builtin-catalog drift — real ids (glm-5.3, gpt-5.6-luna,
+  // qwen3.8-max) were all catalog-absent once and are base-matching now.
   assert.equal(result.dropped.length, 3, '3 base-less entries should be dropped on mixed-protocol route')
-  assert.ok(result.dropped.some(d => d.id === 'glm-5.3'), 'glm-5.3 should be dropped')
-  assert.ok(result.dropped.some(d => d.id === 'gpt-5.6-luna'), 'gpt-5.6-luna should be dropped')
-  assert.ok(result.dropped.some(d => d.id === 'qwen3.8-max'), 'qwen3.8-max should be dropped')
+  assert.ok(result.dropped.some(d => d.id === 'test-ghost-a'), 'test-ghost-a should be dropped')
+  assert.ok(result.dropped.some(d => d.id === 'test-ghost-b'), 'test-ghost-b should be dropped')
+  assert.ok(result.dropped.some(d => d.id === 'test-ghost-c'), 'test-ghost-c should be dropped')
   assert.ok(result.dropped.every(d => d.reason.includes('mixed-protocol')), 'all drops should be mixed-protocol')
 })
 

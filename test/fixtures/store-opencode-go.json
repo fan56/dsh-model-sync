@@ -189,38 +189,6 @@
       }
     },
     {
-      "id": "grok-4.5",
-      "name": "Grok 4.5",
-      "api": "openai-responses",
-      "provider": "opencode-go",
-      "baseUrl": "https://opencode.ai/zen/go/v1",
-      "reasoning": true,
-      "input": [
-        "text",
-        "image"
-      ],
-      "cost": {
-        "input": 2,
-        "output": 6,
-        "cacheRead": 0.5,
-        "cacheWrite": 0
-      },
-      "compat": {
-        "sessionAffinityFormat": "openai-nosession"
-      },
-      "contextWindow": 500000,
-      "maxTokens": 500000,
-      "thinkingLevelMap": {
-        "off": null,
-        "minimal": null,
-        "low": "low",
-        "medium": "medium",
-        "high": "high",
-        "xhigh": null,
-        "max": null
-      }
-    },
-    {
       "id": "hy3",
       "name": "Hy3",
       "api": "openai-completions",
@@ -537,6 +505,39 @@
       },
       "contextWindow": 1000000,
       "maxTokens": 131072
+    },
+    {
+      "id": "test-ghost-a",
+      "name": "Test Ghost A",
+      "api": "openai-completions",
+      "provider": "opencode-go",
+      "baseUrl": "https://opencode.ai/zen/go/v1",
+      "reasoning": false,
+      "input": [
+        "text"
+      ]
+    },
+    {
+      "id": "test-ghost-b",
+      "name": "Test Ghost B",
+      "api": "openai-completions",
+      "provider": "opencode-go",
+      "baseUrl": "https://opencode.ai/zen/go/v1",
+      "reasoning": false,
+      "input": [
+        "text"
+      ]
+    },
+    {
+      "id": "test-ghost-c",
+      "name": "Test Ghost C",
+      "api": "openai-completions",
+      "provider": "opencode-go",
+      "baseUrl": "https://opencode.ai/zen/go/v1",
+      "reasoning": false,
+      "input": [
+        "text"
+      ]
     }
   ],
   "checkedAt": 1787102937335,

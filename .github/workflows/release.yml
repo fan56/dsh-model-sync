@@ -63,6 +63,11 @@ jobs:
       - name: Link the @deepseek-ai/* closure from the installed host
         run: node scripts/link-dsh-closure.mjs
 
+      # A snapshot drifted from the host live catalog is what emitted the dead
+      # grok-4.5 entry (pi-ai 0.84.4 dropped it) — fail the build instead.
+      - name: Check builtin snapshot freshness against the live host catalog
+        run: node scripts/generate-builtin-snapshot.mjs --check
+
       - name: Build & Check & Test
         # pnpm does not run npm pre/post hooks by default; build explicitly.
         run: pnpm build && pnpm check && pnpm test

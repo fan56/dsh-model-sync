@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **The builtin catalog snapshot can no longer rot against the host.** `keepBuiltinOnly` emitted ids from a build-time snapshot frozen at 2026-08-28; when pi-ai 0.84.4 removed grok-4.5 from its opencode-go catalog, the 09-01 host upgrade turned the stored bare entry into a dead id that the alpha line's strict llm-pi-ai registration rejects — taking every provider route down with it (the "all providers vanished" incident). `getBuiltinCatalogForRoute` now prefers the host's live pi-ai catalog (discovered via `DSH_CLOSURE_DIR` → `which dsh` → `npm root -g`, mirroring the linker scripts) and falls back to the snapshot only per-route when the host cannot be located. The snapshot itself was regenerated against 0.1.2-alpha.4 (grok-4.5 out, grok-4.6 and the 08-31 pi.dev additions in).
+
+### Changed
+
+- CI and release workflows gate on `generate-builtin-snapshot.mjs --check`: a snapshot drifted from the live host catalog now fails the build instead of shipping dead entries.
+- The generator script's hardcoded `~/github/dsh-model-sync` project root and `/opt/homebrew/...` pi-ai path are replaced with the same discovery trio — it had never actually run on this machine.
+
+### Test
+
+- Behavior tests (base-less drop, maxTokens keep, keepBuiltinOnly preservation, api-divergent warning) no longer anchor on snapshot membership: they force the precondition via inline builtin data, so catalog drift cannot flip them. New `live-catalog.test.mjs` covers override priority, per-route fallback, and bogus-override fall-through.
+
 ## [0.1.6] - 2026-08-31
 
 ### Fixed

@@ -178,12 +178,17 @@ check('maxTokens: base-matching entries have maxTokens stripped', () => {
 })
 
 check('maxTokens: base-less entries keep maxTokens', () => {
-  // zai-coding-cn: glm-5.2-highspeed is base-less (not in installed zai catalog)
-  const builtinIds = new Set(zaiBuiltin.map(b => b.id))
+  // glm-5.2-highspeed was base-less when this test was written; the live
+  // catalog may or may not know it today. Force the base-less condition by
+  // handing translateEntries a builtin list without it — the behavior under
+  // test is "a base-less entry keeps its own maxTokens", independent of
+  // catalog drift.
+  const effectiveBuiltin = zaiBuiltin.filter(b => b.id !== 'glm-5.2-highspeed')
+  const builtinIds = new Set(effectiveBuiltin.map(b => b.id))
   const result = translateEntries(
     zaiCn.models,
     builtinIds,
-    zaiBuiltin,
+    effectiveBuiltin,
     'zai-coding-cn',
     defaultOpts,
   )
@@ -196,7 +201,11 @@ check('maxTokens: base-less entries keep maxTokens', () => {
 // ---------------------------------------------------------------------------
 // Drop logic: opencode-go mixed-protocol entries
 // ---------------------------------------------------------------------------
-check('base-less: opencode-go glm-5.3 is dropped (mixed-protocol route)', () => {
+// The three test-ghost-* fixture ids exist in no pi-ai catalog, which makes
+// them permanently base-less on this mixed-protocol route. (Real ids —
+// glm-5.3, gpt-5.6-luna, qwen3.8-max — were catalog-absent once and are
+// base-matching now, so tests must not anchor on them.)
+check('base-less: opencode-go test-ghost-a is dropped (mixed-protocol route)', () => {
   const builtinIds = new Set(opencodeGoBuiltin.map(b => b.id))
   const result = translateEntries(
     opencodeGo.models,
@@ -206,14 +215,14 @@ check('base-less: opencode-go glm-5.3 is dropped (mixed-protocol route)', () => 
     defaultOpts,
   )
 
-  const glm = result.entries.find(e => e.id === 'glm-5.3')
-  assert.equal(glm, undefined, 'glm-5.3 should NOT be in result (dropped)')
-  assert.ok(result.dropped.some(d => d.id === 'glm-5.3'), 'glm-5.3 should be in dropped list')
-  const drop = result.dropped.find(d => d.id === 'glm-5.3')
+  const ghost = result.entries.find(e => e.id === 'test-ghost-a')
+  assert.equal(ghost, undefined, 'test-ghost-a should NOT be in result (dropped)')
+  assert.ok(result.dropped.some(d => d.id === 'test-ghost-a'), 'test-ghost-a should be in dropped list')
+  const drop = result.dropped.find(d => d.id === 'test-ghost-a')
   assert.ok(drop.reason.includes('mixed-protocol'), 'drop reason should mention mixed-protocol')
 })
 
-check('base-less: opencode-go gpt-5.6-luna is dropped (mixed-protocol route)', () => {
+check('base-less: opencode-go test-ghost-b is dropped (mixed-protocol route)', () => {
   const builtinIds = new Set(opencodeGoBuiltin.map(b => b.id))
   const result = translateEntries(
     opencodeGo.models,
@@ -223,14 +232,14 @@ check('base-less: opencode-go gpt-5.6-luna is dropped (mixed-protocol route)', (
     defaultOpts,
   )
 
-  const luna = result.entries.find(e => e.id === 'gpt-5.6-luna')
-  assert.equal(luna, undefined, 'gpt-5.6-luna should NOT be in result (dropped)')
-  assert.ok(result.dropped.some(d => d.id === 'gpt-5.6-luna'), 'gpt-5.6-luna should be in dropped list')
-  const drop = result.dropped.find(d => d.id === 'gpt-5.6-luna')
+  const ghost = result.entries.find(e => e.id === 'test-ghost-b')
+  assert.equal(ghost, undefined, 'test-ghost-b should NOT be in result (dropped)')
+  assert.ok(result.dropped.some(d => d.id === 'test-ghost-b'), 'test-ghost-b should be in dropped list')
+  const drop = result.dropped.find(d => d.id === 'test-ghost-b')
   assert.ok(drop.reason.includes('mixed-protocol'), 'drop reason should mention mixed-protocol')
 })
 
-check('base-less: opencode-go qwen3.8-max is dropped (mixed-protocol route)', () => {
+check('base-less: opencode-go test-ghost-c is dropped (mixed-protocol route)', () => {
   const builtinIds = new Set(opencodeGoBuiltin.map(b => b.id))
   const result = translateEntries(
     opencodeGo.models,
@@ -240,10 +249,10 @@ check('base-less: opencode-go qwen3.8-max is dropped (mixed-protocol route)', ()
     defaultOpts,
   )
 
-  const qwen = result.entries.find(e => e.id === 'qwen3.8-max')
-  assert.equal(qwen, undefined, 'qwen3.8-max should NOT be in result (dropped)')
-  assert.ok(result.dropped.some(d => d.id === 'qwen3.8-max'), 'qwen3.8-max should be in dropped list')
-  const drop = result.dropped.find(d => d.id === 'qwen3.8-max')
+  const ghost = result.entries.find(e => e.id === 'test-ghost-c')
+  assert.equal(ghost, undefined, 'test-ghost-c should NOT be in result (dropped)')
+  assert.ok(result.dropped.some(d => d.id === 'test-ghost-c'), 'test-ghost-c should be in dropped list')
+  const drop = result.dropped.find(d => d.id === 'test-ghost-c')
   assert.ok(drop.reason.includes('mixed-protocol'), 'drop reason should mention mixed-protocol')
 })
 
@@ -336,9 +345,15 @@ check('drop: dropUnserviceable=true returns non-empty entries with aborted=false
 // keepBuiltinOnly
 // ---------------------------------------------------------------------------
 check('keepBuiltinOnly=true: builtin-only models are preserved', () => {
-  // xiaomi-token-plan-cn: mimo-v2-pro is builtin-only (in builtin but not in pi.dev)
-  const builtinIds = new Set(xiaomiBuiltin.map(b => b.id))
-  const builtinOnlyEntries = xiaomiBuiltin
+  // mimo-v2-pro was xiaomi builtin-only when this test was written; pi-ai
+  // 0.84.4 later dropped it from the catalog. Force the builtin-only
+  // condition via a synthetic builtin list — the behavior under test is
+  // keepBuiltinOnly's preservation, not the catalog's current membership.
+  const xiaomiBuiltinWithMimo = xiaomiBuiltin.some(b => b.id === 'mimo-v2-pro')
+    ? xiaomiBuiltin
+    : [...xiaomiBuiltin, { id: 'mimo-v2-pro', api: 'anthropic-messages' }]
+  const builtinIds = new Set(xiaomiBuiltinWithMimo.map(b => b.id))
+  const builtinOnlyEntries = xiaomiBuiltinWithMimo
     .filter(b => !xiaomiCn.models.some(e => e.id === b.id))
     .map(b => ({
       id: b.id,
@@ -354,7 +369,7 @@ check('keepBuiltinOnly=true: builtin-only models are preserved', () => {
   const result = translateEntries(
     xiaomiCn.models,
     builtinIds,
-    xiaomiBuiltin,
+    xiaomiBuiltinWithMimo,
     'xiaomi-token-plan-cn',
     { ...defaultOpts, keepBuiltinOnly: true },
     builtinOnlyEntries,
@@ -554,17 +569,24 @@ check('output is sorted by id', () => {
 // ---------------------------------------------------------------------------
 // api-divergent entries are written with degrade warning
 // ---------------------------------------------------------------------------
-check('api-divergent entries (qwen3.7-max/plus) are written with degrade warning', () => {
-  const builtinIds = new Set(opencodeGoBuiltin.map(b => b.id))
+check('api-divergent entries are written with degrade warning', () => {
+  // qwen3.7-max/plus: pi.dev says openai-completions; the builtin catalog
+  // used to say anthropic-messages (pi-ai 0.84.4 aligned them). Force the
+  // divergence via a synthetic builtin — the behavior under test is the
+  // degrade warning on api mismatch, not the catalog's current opinion.
+  const divergentBuiltin = opencodeGoBuiltin.map(b =>
+    b.id === 'qwen3.7-max' || b.id === 'qwen3.7-plus' ? { ...b, api: 'anthropic-messages' } : b,
+  )
+  const builtinIds = new Set(divergentBuiltin.map(b => b.id))
   const result = translateEntries(
     opencodeGo.models,
     builtinIds,
-    opencodeGoBuiltin,
+    divergentBuiltin,
     'opencode-go',
     defaultOpts,
   )
 
-  // qwen3.7-max and qwen3.7-plus: pi.dev api=openai-completions, builtin api=anthropic-messages
+  // pi.dev api=openai-completions, forced builtin api=anthropic-messages
   const qwen37max = result.entries.find(e => e.id === 'qwen3.7-max')
   const qwen37plus = result.entries.find(e => e.id === 'qwen3.7-plus')
   assert.ok(qwen37max, 'qwen3.7-max should be in result (not dropped)')

@@ -14,11 +14,12 @@
  */
 
 import { readFile, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
-import { homedir } from 'node:os'
-import { createRequire } from 'node:module'
+import { existsSync, realpathSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { execFileSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 
-const PROJECT_ROOT = join(homedir(), 'github/dsh-model-sync')
+const PROJECT_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const SNAPSHOT_PATH = join(PROJECT_ROOT, 'src/builtin-catalog-snapshot.ts')
 
 const isCheckMode = process.argv.includes('--check')
@@ -32,12 +33,57 @@ if (!isCheckMode && !isGenerateMode) {
 }
 
 /**
+ * Locate @earendil-works/pi-ai inside the installed host closure — same
+ * discovery trio as src/live-catalog.ts and the linker scripts:
+ *   1. DSH_CLOSURE_DIR (points at the @deepseek-ai scope; pi-ai is a sibling
+ *      scope of the same node_modules)
+ *   2. `which dsh` realpath — the CLI's own node_modules
+ *   3. `npm root -g` — dsh's nested node_modules, then the flat layout
+ * Exits non-zero when nothing resolves: --check must fail loudly in CI, and
+ * --generate has nothing to generate from.
+ */
+function findPiAiDataDir() {
+  const dataRel = join('dist', 'providers', 'data')
+  const candidates = []
+  const override = process.env.DSH_CLOSURE_DIR
+  if (override) {
+    try {
+      candidates.push(join(dirname(realpathSync(override)), '@earendil-works', 'pi-ai'))
+    } catch { /* bad override path */ }
+  }
+  try {
+    const bin = execFileSync('which', ['dsh'], { encoding: 'utf8' }).trim()
+    if (bin !== '') {
+      const real = realpathSync(bin)
+      candidates.push(join(dirname(dirname(real)), 'node_modules', '@earendil-works', 'pi-ai'))
+    }
+  } catch { /* dsh not on PATH */ }
+  try {
+    const root = execFileSync('npm', ['root', '-g'], { encoding: 'utf8' }).trim()
+    if (root !== '') {
+      candidates.push(join(root, '@deepseek-ai', 'dsh', 'node_modules', '@earendil-works', 'pi-ai'))
+      candidates.push(join(root, '@earendil-works', 'pi-ai'))
+    }
+  } catch { /* npm unavailable */ }
+  for (const candidate of candidates) {
+    try {
+      const dir = realpathSync(candidate)
+      if (existsSync(join(dir, dataRel))) return join(dir, dataRel)
+    } catch { /* candidate missing — try next */ }
+  }
+  console.error('ERROR: cannot locate @earendil-works/pi-ai in the host closure.')
+  console.error('Install the dsh CLI (or set DSH_CLOSURE_DIR to the @deepseek-ai closure dir).')
+  process.exit(1)
+}
+
+/**
  * Load builtin catalog data from the installed pi-ai package.
  * Reads the JSON data files directly since they contain the raw model definitions.
  */
 async function loadInstalledCatalog() {
-  // The data files are at: @earendil-works/pi-ai/dist/providers/data/*.json
-  const piAiBase = '/opt/homebrew/lib/node_modules/@deepseek-ai/dsh/node_modules/@earendil-works/pi-ai/dist/providers/data'
+  const piAiBase = findPiAiDataDir()
+  console.log(`pi-ai data dir: ${piAiBase}`)
+
 
   // Routes we care about (matching DEFAULT_ROUTES in index.ts)
   const routes = ['opencode-go', 'zai-coding-cn', 'minimax-cn', 'xiaomi-token-plan-cn']

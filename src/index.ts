@@ -43,6 +43,7 @@ import {
   type Logger,
 } from './writer.ts'
 import { BUILTIN_CATALOG_SNAPSHOT } from './builtin-catalog-snapshot.ts'
+import { refreshLiveCatalog, getLiveBuiltinCatalogForRoute } from './live-catalog.ts'
 
 export const name = 'dsh-model-sync'
 
@@ -324,6 +325,11 @@ export function apply(ctx: Context): void {
   const syncNow = async (force: boolean): Promise<string> => {
     const config = scope.get() as unknown as ModelSyncConfigValue
 
+    // Prefer the host's live pi-ai catalog for this round; the frozen
+    // snapshot is only the no-host fallback. Without this, keepBuiltinOnly
+    // re-emits ids the host's catalog has already dropped.
+    refreshLiveCatalog(config.managedRoutes.length > 0 ? config.managedRoutes : DEFAULT_ROUTES)
+
     if (config.writeMode === 'settings') {
       return syncSettings(config, force)
     }
@@ -413,11 +419,15 @@ export function apply(ctx: Context): void {
 // ---------------------------------------------------------------------------
 
 /**
- * Get builtin catalog data for a route from the shared snapshot module.
- * Design doc §3.6: "构建期把 installed catalog 快照成常量"
+ * Get builtin catalog data for a route: the host's live pi-ai catalog when it
+ * can be located, the frozen build-time snapshot otherwise. Live-first is the
+ * point — the snapshot rots when the host's bundled pi-ai drops models
+ * (grok-4.5 was removed in pi-ai 0.84.4), and a stale keepBuiltinOnly entry
+ * gets the whole llm-pi-ai namespace rejected by the alpha line's strict
+ * registration.
  */
 function getBuiltinCatalogForRoute(route: string): Array<{ id: string; api: string; maxTokens?: number }> {
-  return BUILTIN_CATALOG_SNAPSHOT[route] ?? []
+  return getLiveBuiltinCatalogForRoute(route) ?? BUILTIN_CATALOG_SNAPSHOT[route] ?? []
 }
 
 /**
