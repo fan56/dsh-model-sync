@@ -13,7 +13,7 @@
 
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 
 // ---------------------------------------------------------------------------
 // Constants (ported from docs-dsh-llm-pi-ai.patch:35-36)
@@ -155,14 +155,37 @@ export function loadModelsStore(storePath?: string): ModelsStoreAccessor {
   const readDoc = async (): Promise<ModelsStore> => {
     try {
       return JSON.parse(await readFile(effectivePath, 'utf8')) as ModelsStore
-    } catch {
-      return {}
+    } catch (err: unknown) {
+      // ENOENT is a normal first run — the store has never been written.
+      // Anything else (SyntaxError on a corrupted file, EACCES on a
+      // permission-denied read, EIO on storage failure) bubbles up so the
+      // writer fails closed: treating an unreadable store as empty would
+      // let a later replay write the raw pi.dev target into settings and
+      // clobber user-folded values (the v0.1.5 data-loss shape). The
+      // failure propagates to the writer which skips the round and keeps
+      // settings.models — the authoritative, already-landed source —
+      // untouched.
+      if (err instanceof Error && (err as NodeJS.ErrnoException).code === 'ENOENT') {
+        return {}
+      }
+      throw err
     }
   }
 
   const writeDoc = async (doc: ModelsStore): Promise<void> => {
     await mkdir(dirname(effectivePath), { recursive: true })
-    await writeFile(effectivePath, JSON.stringify(doc))
+    // Atomic write: stage to a sibling temp file then rename(2) into place.
+    // rename(2) is atomic on POSIX, so a concurrent reader either sees the
+    // pre-rename doc or the post-rename doc — never a half-written file.
+    // JSON.stringify without spaces keeps the existing wire format (the
+    // reader is strict on the parse side; legacy stores carry no
+    // whitespace). A fresh write also *heals* a previously-corrupt store:
+    // the first successful write after corruption replaces the bad file
+    // atomically with a well-formed doc, so subsequent reads see the
+    // expected shape.
+    const tmpPath = `${effectivePath}.${process.pid}.tmp`
+    await writeFile(tmpPath, JSON.stringify(doc))
+    await rename(tmpPath, effectivePath)
   }
 
   let queue: Promise<void> = Promise.resolve()
@@ -179,13 +202,31 @@ export function loadModelsStore(storePath?: string): ModelsStoreAccessor {
     },
     write: (providerId: string, entry: ModelsStoreEntry): Promise<void> =>
       enqueue(async () => {
-        const doc = await readDoc()
+        // The read-modify-write pattern preserves concurrent routes'
+        // entries; if the file is corrupt or unreadable, treat the doc as
+        // empty and overwrite — the atomic writeDoc below replaces the
+        // bad file with a fresh, well-formed doc carrying this route's
+        // entry (and any other routes the caller writes later will
+        // re-stamp theirs). The store reads path stays strict (readDoc
+        // still throws) so the writer's fail-closed logic can react to
+        // the actual error instead of seeing a fake empty doc.
+        let doc: ModelsStore
+        try {
+          doc = await readDoc()
+        } catch {
+          doc = {}
+        }
         doc[providerId] = entry
         await writeDoc(doc)
       }),
     delete: (providerId: string): Promise<void> =>
       enqueue(async () => {
-        const doc = await readDoc()
+        let doc: ModelsStore
+        try {
+          doc = await readDoc()
+        } catch {
+          doc = {}
+        }
         delete doc[providerId]
         await writeDoc(doc)
       }),

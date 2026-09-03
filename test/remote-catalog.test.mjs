@@ -6,7 +6,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -358,6 +358,112 @@ await checkAsync('fetchRemoteCatalog preserves stored overrides across refresh w
       await rm(dir, { recursive: true, force: true })
       resetModelsStoreCache()
     }
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Fail-closed read: readDoc distinguishes ENOENT (a normal first run) from
+// every other failure (corrupt JSON, EACCES, …). The latter propagate so the
+// writer can fail closed (settings.models is the authoritative fallback)
+// instead of silently clobbering user-folded values on the next replay.
+// ---------------------------------------------------------------------------
+
+// ENOENT first run: file does not exist → read returns undefined for any
+// route. The accessor does NOT auto-create the file (write is explicit).
+await checkAsync('loadModelsStore: ENOENT first run → read returns undefined, no file is auto-created', async () => {
+  const { dir, storePath } = await createTmpStorePath()
+  try {
+    resetModelsStoreCache()
+    const store = loadModelsStore(storePath)
+    const result = await store.read('any-route')
+    assert.equal(result, undefined, 'ENOENT → empty doc → undefined for the route')
+    // The accessor must not have materialized the file on read.
+    const files = await readdir(dir)
+    assert.equal(files.length, 0, 'no file is created by a read')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+    resetModelsStoreCache()
+  }
+})
+
+// Corrupt JSON: garbage in the file → read rejects with the parse error.
+// The previous behavior swallowed every error and returned {}, which let
+// the writer's replay overwrite settings.models with raw pi.dev values.
+await checkAsync('loadModelsStore: corrupt JSON → read rejects with the SyntaxError', async () => {
+  const { dir, storePath } = await createTmpStorePath()
+  try {
+    resetModelsStoreCache()
+    await writeFile(storePath, '{not valid json', 'utf8')
+    const store = loadModelsStore(storePath)
+    await assert.rejects(
+      () => store.read('any-route'),
+      (err) => err instanceof SyntaxError,
+      'corrupt store must surface the parse error so the writer can fail closed',
+    )
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+    resetModelsStoreCache()
+  }
+})
+
+// Atomic write (tmp + rename): the staging temp file must not linger after
+// a successful write. A concurrent reader either sees the pre-rename doc
+// or the post-rename doc — never a half-written file.
+await checkAsync('loadModelsStore: atomic write — no tmp file lingers after a successful write', async () => {
+  const { dir, storePath } = await createTmpStorePath()
+  try {
+    resetModelsStoreCache()
+    const store = loadModelsStore(storePath)
+    await store.write('test-route', {
+      models: [{ id: 'm', name: 'M', api: 'openai-completions' }],
+      checkedAt: 1,
+      lastModified: 1,
+      etag: '"e"',
+    })
+    const files = (await readdir(dir)).sort()
+    assert.deepEqual(files, ['models-store.json'], `no tmp staging file: got ${JSON.stringify(files)}`)
+    const content = await readFile(storePath, 'utf8')
+    assert.equal(content, JSON.stringify({
+      'test-route': {
+        models: [{ id: 'm', name: 'M', api: 'openai-completions' }],
+        checkedAt: 1,
+        lastModified: 1,
+        etag: '"e"',
+      },
+    }))
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+    resetModelsStoreCache()
+  }
+})
+
+// Atomic write heals a corrupt file: a well-formed write replaces the bad
+// JSON atomically via rename(2), so the next read returns the new entry
+// (and no longer rejects with SyntaxError). This is the auto-heal path for
+// the v0.1.5 data-loss shape: settings-wins lands a fresh entry with the
+// overrides, and the next refresh is clean.
+await checkAsync('loadModelsStore: atomic write heals a corrupt file (next read returns the fresh entry)', async () => {
+  const { dir, storePath } = await createTmpStorePath()
+  try {
+    resetModelsStoreCache()
+    await writeFile(storePath, 'this is not json {', 'utf8')
+    const corruptStore = loadModelsStore(storePath)
+    await assert.rejects(() => corruptStore.read('any-route'))
+
+    const healStore = loadModelsStore(storePath)
+    const freshEntry = {
+      models: [{ id: 'healed', name: 'Healed', api: 'openai-completions' }],
+      checkedAt: 2,
+      lastModified: 2,
+      etag: '"healed-etag"',
+      overrides: { 'healed': { contextWindow: 8192 } },
+    }
+    await healStore.write('test-route', freshEntry)
+    const readBack = await healStore.read('test-route')
+    assert.deepEqual(readBack, freshEntry, 'atomic rename replaced the corrupt file with a well-formed entry')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+    resetModelsStoreCache()
   }
 })
 

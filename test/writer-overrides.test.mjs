@@ -692,6 +692,195 @@ await checkAsync('e2e: settings mode round reports the fold+unset, persists the 
 })
 
 // ---------------------------------------------------------------------------
+// Fail-closed read: corrupt / permission-denied store + no settings key →
+// skip + zero clobber (settings.models stays the authoritative source).
+// ---------------------------------------------------------------------------
+await checkAsync('store read fails + settings has no overrides → skip (store-unavailable), settings untouched', async () => {
+  // Settings has the round-1-done shape (folded models, no modelOverrides
+  // key). The store is unreadable (corrupt JSON): writing the raw pi.dev
+  // target now would clobber the folded values in settings.models — the
+  // v0.1.5 data-loss shape. The writer must skip the round.
+  const folded = { 'model-a': { contextWindow: 8192 } }
+  const settings = createStatefulSettings({
+    models: [{ id: 'model-a', name: 'Model A', contextWindow: 8192 }],
+    // no modelOverrides key — the round-1 settle.
+  })
+  const failingStore = {
+    async read() { throw new SyntaxError('Unexpected token in JSON at position 5') },
+    async write() { throw new Error('write should not be called: the round must skip') },
+    async delete() {},
+  }
+  const target = [{ id: 'model-a', name: 'Model A', contextWindow: 1000000 }]
+
+  const result = await syncToSettings(settings, 'test-route', target, silentLogger, undefined, failingStore)
+
+  assert.equal(result.wrote, false)
+  assert.equal(result.reason, 'store-unavailable', 'read failure with no settings key → skip + fail closed')
+  assert.equal(settings.state.mutations.length, 0, 'mutate must not run when the store is unreadable')
+  assert.deepEqual(settings.state.routeData.models, [{ id: 'model-a', name: 'Model A', contextWindow: 8192 }],
+    'settings.models untouched: the folded values are the authoritative fallback')
+  assert.equal(settings.state.routeData.modelOverrides, undefined, 'no settings key was ever present')
+
+  // Sanity: the same round WITHOUT a store (the legacy call shape) still
+  // runs and overwrites settings.models — proving the fail-closed branch
+  // is gated on the store-read failure, not on the call shape.
+  const storeless = createStatefulSettings({
+    models: [{ id: 'model-a', name: 'Model A', contextWindow: 8192 }],
+  })
+  const storelessOutcome = await syncToSettings(storeless, 'test-route', target, silentLogger)
+  assert.equal(storelessOutcome.wrote, true, 'without a store, the writer proceeds as it always did')
+  assert.deepEqual(storeless.state.routeData.models[0], { id: 'model-a', name: 'Model A', contextWindow: 1000000 })
+  void folded
+})
+
+// ---------------------------------------------------------------------------
+// Fail-closed read: corrupt store + settings has the overrides key →
+// settings-wins folds, persist tolerates the read failure and the atomic
+// writeDoc heals the store, mutate lands, settings key cleared.
+// ---------------------------------------------------------------------------
+await checkAsync('store read fails + settings has overrides → settings-wins folds, mutate heals the store', async () => {
+  const overrides = { 'model-a': { contextWindow: 8192 } }
+  const settings = createStatefulSettings({
+    models: [{ id: 'model-a', name: 'Model A' }],
+    overrides,
+  })
+  // The store reads always throw — simulates a corrupt file. Writes go
+  // through so we can verify the heal (the atomic writeDoc replaces the
+  // bad file with a well-formed entry carrying the persisted overrides).
+  const healedData = {}
+  const failingButWritableStore = {
+    async read() { throw new SyntaxError('Unexpected token in JSON at position 5') },
+    async write(route, entry) { healedData[route] = entry },
+    async delete(route) { delete healedData[route] },
+  }
+  const target = [{ id: 'model-a', name: 'Model A', contextWindow: 1000000 }]
+
+  const result = await syncToSettings(settings, 'test-route', target, silentLogger, undefined, failingButWritableStore)
+
+  assert.equal(result.wrote, true, 'settings-wins: the round must run; the atomic write heals the store')
+  assert.equal(result.reason, 'wrote')
+  assert.equal(result.overridesSource, 'settings')
+
+  // Mutate landed with set + unset; the folded value is in settings.models.
+  assert.equal(settings.state.mutations.length, 1)
+  const ops = settings.state.mutations[0].ops
+  assert.equal(ops.length, 2, 'set + unset atomically')
+  assert.equal(ops[1].op, 'unset')
+  assert.equal(ops[0].value[0].contextWindow, 8192, 'settings value wins over the (unreadable) store')
+  assert.deepEqual(settings.state.routeData.modelOverrides, undefined, 'key cleared by the unset')
+  assert.deepEqual(settings.state.routeData.models[0].contextWindow, 8192)
+
+  // The persist's atomic write healed the store — the only way a read-
+  // throwing file becomes valid JSON is for a successful write to
+  // overwrite it. The persisted entry carries the overrides verbatim.
+  assert.deepEqual(healedData['test-route']?.overrides, overrides, 'heal: persisted entry carries the overrides')
+  assert.equal(typeof healedData['test-route']?.checkedAt, 'number', 'heal: entry has a checkedAt timestamp')
+})
+
+// ---------------------------------------------------------------------------
+// ENOENT first run: unchanged behavior. readDoc returns {} on ENOENT, the
+// writer sees no stored overrides, falls through to the regular change-only
+// / no-change write path. This test pins the regression.
+// ---------------------------------------------------------------------------
+await checkAsync('store ENOENT (first run) → read returns {}, no overrides from store, regular write path', async () => {
+  // ENOENT = no file at all. The accessor returns undefined for any route;
+  // resolveOverrides gets no stored overrides; the writer behaves like the
+  // pre-S1 bare-call shape (regression lock for first-run / clean install).
+  const settings = createStatefulSettings({
+    models: [{ id: 'model-a', name: 'Model A' }],
+  })
+  const enoentStore = {
+    async read(route) { return undefined }, // simulate ENOENT → empty doc
+    async write(route, entry) { enoentStore._written = enoentStore._written ?? {}; enoentStore._written[route] = entry },
+    async delete(route) {},
+  }
+  const target = [{ id: 'model-a', name: 'Model A Updated' }]
+
+  const result = await syncToSettings(settings, 'test-route', target, silentLogger, undefined, enoentStore)
+
+  assert.equal(result.wrote, true)
+  assert.equal(result.reason, 'wrote')
+  assert.equal(result.overridesSource, undefined, 'ENOENT is a normal first run — no overridesSource')
+  assert.deepEqual(settings.state.mutations[0].ops, [
+    { op: 'set', path: ['providers', 'test-route', 'models'], value: target },
+  ], 'single-set legacy op shape, unchanged')
+  assert.equal(enoentStore._written, undefined, 'no persist call: there were no overrides to stage')
+
+  // And the change-only short-circuit still applies.
+  const settled = createStatefulSettings({
+    models: [{ id: 'model-a', name: 'Model A Updated' }],
+  })
+  const noChange = await syncToSettings(settled, 'test-route', target, silentLogger, undefined, enoentStore)
+  assert.equal(noChange.reason, 'no-change')
+  assert.equal(settled.state.mutations.length, 0)
+})
+
+// ---------------------------------------------------------------------------
+// Retry path also fails closed on store-read failure when settings has no
+// key between the two attempts (the rare race where the user removed the
+// overrides key during the SETTINGS_CONFLICT retry).
+// ---------------------------------------------------------------------------
+await checkAsync('store read fails on retry + key removed between attempts → skip (store-unavailable)', async () => {
+  // First attempt: settings has the overrides key — settings-wins, the
+  // store read is never called, the mutate runs and throws SETTINGS_CONFLICT.
+  // Retry: the user removed the overrides key between attempts; the retry's
+  // resolveOverrides falls through to the store read, which now throws,
+  // and the retry's try/catch in syncToSettings must fail closed (no
+  // second mutate, no clobber — the rejected mutate didn't apply, so the
+  // key is still there and the round is reported honestly).
+  const overrides = { 'model-a': { contextWindow: 8192 } }
+  const failingStore = {
+    async read() { throw new SyntaxError('corrupt store on retry') },
+    async write() {},
+    async delete() {},
+  }
+  const settings = createStatefulSettings({
+    models: [{ id: 'model-a', name: 'Model A' }],
+    overrides,
+    conflictFirst: true,
+  })
+  let describes = 0
+  const origDescribe = settings.describe.bind(settings)
+  settings.describe = () => {
+    describes += 1
+    const desc = origDescribe()
+    // On the retry's describe (second call), the user dropped the key in
+    // the live settings — surface the change in the returned descriptor
+    // without mutating the underlying mock state (the rejected first
+    // attempt must still see the key in the original state).
+    if (describes === 2) {
+      const [d] = desc
+      const userProviders = d.user?.providers
+      if (userProviders !== undefined) {
+        const testRoute = { ...userProviders['test-route'] }
+        delete testRoute.modelOverrides
+        const newProviders = { ...userProviders, 'test-route': testRoute }
+        return [{ ...d, user: { providers: newProviders } }]
+      }
+    }
+    return desc
+  }
+  const target = [{ id: 'model-a', name: 'Model A Updated' }]
+
+  const result = await syncToSettings(
+    settings, 'test-route', target, silentLogger,
+    async () => target,
+    failingStore,
+  )
+
+  assert.equal(result.wrote, false)
+  assert.equal(result.reason, 'store-unavailable',
+    'retry path: store read failed with no settings key → fail closed')
+  assert.equal(settings.state.mutations.length, 1,
+    'only the first-attempt mutate is on the log (and it was rejected)')
+  // The original state still has the overrides (the rejected mutate never
+  // applied, and the describe override rebuilds the descriptor without
+  // mutating state).
+  assert.deepEqual(settings.state.routeData.modelOverrides, overrides,
+    'original settings key untouched: the rejected mutate never applied')
+})
+
+// ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
 if (failed > 0) {

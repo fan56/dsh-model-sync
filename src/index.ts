@@ -328,7 +328,10 @@ export function apply(ctx: Context): void {
       } else if (syncResult.reason === 'mutate-rejected') {
         lines.push(`${route}: rejected by settings validation (see log)`)
       } else if (syncResult.reason === 'store-unavailable') {
-        lines.push(`${route}: skipped (models-store write failed; settings untouched)`)
+        // The store failed (corrupt/permission on read, or filesystem on
+        // write); settings.models was the authoritative source and stays
+        // untouched either way — the user's folded values are preserved.
+        lines.push(`${route}: skipped (models-store unavailable; settings untouched)`)
       } else {
         lines.push(`${route}: ${syncResult.reason} (${translated.entries.length} models)`)
       }

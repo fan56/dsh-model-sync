@@ -32,12 +32,19 @@
  * - Revision conflict retry: catch SETTINGS_CONFLICT, re-read, re-translate,
  *   re-write once
  * - Never touches ~/.dsh/settings.yaml directly — only through settings.mutate
+ * - Store read failure: when the models-store read fails (corrupt JSON,
+ *   EACCES, …) AND settings carries no overrides key, skip the round with
+ *   reason 'store-unavailable' and leave settings.models untouched — the
+ *   already-landed folded values are the authoritative fallback. A write
+ *   triggered from a settings-side key is unaffected: settings-wins, and the
+ *   atomic writeDoc replaces it on disk (heals the corruption as a side
+ *   effect).
  *
  * @module dsh-model-sync/writer
  */
 
 import type { SettingsModelProfile } from './translate.ts'
-import type { ModelsStoreAccessor } from './remote-catalog.ts'
+import type { ModelsStoreAccessor, ModelsStoreEntry } from './remote-catalog.ts'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -243,6 +250,14 @@ async function resolveOverrides(
     return { overrides: raw, source: 'settings' }
   }
   if (store !== undefined) {
+    // The store read may now throw on corruption / permission failures
+    // (remote-catalog readDoc propagates anything other than ENOENT). We
+    // bubble it up: with no settings overrides to fall back on, the caller
+    // must skip the round rather than fold an unreplayed target into
+    // settings and clobber the folded values. With a settings key in play
+    // (the earlier branch above) this code path is never reached, so a
+    // settings-side write always proceeds and the atomic writeDoc heals the
+    // corruption on its next write.
     const stored = await store.read(route)
     if (stored?.overrides !== undefined && Object.keys(stored.overrides).length > 0) {
       return { overrides: stored.overrides, source: 'store' }
@@ -260,6 +275,13 @@ async function resolveOverrides(
  * store (resolveOverrides order); the stored copy is only ever replayed
  * once the key is gone. Callers must treat a throw from here as "skip the
  * mutate": unsetting without a staged copy is the v0.1.5 data loss.
+ *
+ * The store read may now fail on corruption / permission errors (readDoc
+ * propagates everything except ENOENT). Swallowing it here is intentional:
+ * the settings key carries the only authoritative copy of the overrides, the
+ * atomic writeDoc below replaces the (possibly corrupt) file with a fresh
+ * entry that carries the overrides — which is what heals the store. The
+ * fetch side will re-populate models/checkedAt/etag on its next round.
  * (A storeless call — store undefined — cannot stage anything and keeps the
  * legacy unset-without-copy behavior; production wiring in index.ts always
  * passes a store.)
@@ -270,7 +292,17 @@ async function persistOverridesToStore(
   overrides: Record<string, Record<string, unknown>>,
 ): Promise<void> {
   if (store === undefined) return
-  const stored = await store.read(route)
+  let stored: ModelsStoreEntry | undefined
+  try {
+    stored = await store.read(route)
+  } catch (readErr: unknown) {
+    // Cache lost — fall through with no cached metadata. The atomic
+    // writeDoc below replaces the bad file with a fresh entry carrying
+    // only the overrides. The fetch side re-populates the rest on its
+    // next round. The settings key remains the authoritative source of
+    // truth in the meantime.
+    void readErr
+  }
   await store.write(route, {
     models: stored?.models ?? [],
     checkedAt: stored?.checkedAt ?? Date.now(),
@@ -335,8 +367,28 @@ export async function syncToSettings(
   }
 
   const rawModels = getRawUserModels(desc, route)
-  const { overrides: effectiveOverrides, source: overridesSource } =
-    await resolveOverrides(desc, route, store)
+  let effectiveOverrides: Record<string, Record<string, unknown>> | undefined
+  let overridesSource: 'settings' | 'store' | undefined
+  try {
+    ({ overrides: effectiveOverrides, source: overridesSource } =
+      await resolveOverrides(desc, route, store))
+  } catch (readErr: unknown) {
+    // The store is unreadable (corrupted JSON, EACCES, …) and settings
+    // carries no overrides key — there is no authoritative source for the
+    // user's folded values other than the existing settings.models. Skip
+    // the round with reason 'store-unavailable': writing the raw pi.dev
+    // target now would overwrite settings.models with unreplayed values
+    // and silently clobber the user's fold (the same data-loss shape
+    // v0.1.5 hit, just via a different path). The next refresh attempts
+    // the same round again; a manual re-add of the key (or a fresh
+    // successful settings-side write that heals the file) unblocks it.
+    logger.warn(
+      'models-store read failed for route %s: %s',
+      route,
+      readErr instanceof Error ? readErr.message : String(readErr),
+    )
+    return { wrote: false, reason: 'store-unavailable' }
+  }
   const hasSettingsOverrides = overridesSource === 'settings'
 
   const mergedTarget = mergeOverrides(target, effectiveOverrides)
@@ -406,7 +458,24 @@ export async function syncToSettings(
       }
 
       const newTarget = await retranslate(newDesc.revision)
-      const retry = await resolveOverrides(newDesc, route, store)
+      let retry: {
+        overrides: Record<string, Record<string, unknown>> | undefined
+        source: 'settings' | 'store' | undefined
+      }
+      try {
+        retry = await resolveOverrides(newDesc, route, store)
+      } catch (readErr: unknown) {
+        // Same fail-closed contract as the main path: with the settings key
+        // gone between the two attempts, the store replay is the only way
+        // to recover the fold; an unreadable store leaves the user values
+        // stranded in settings.models. Skip the retry, report honestly.
+        logger.warn(
+          'models-store read failed for route %s on retry: %s',
+          route,
+          readErr instanceof Error ? readErr.message : String(readErr),
+        )
+        return { wrote: false, reason: 'store-unavailable' }
+      }
       const retryHasSettingsOverrides = retry.source === 'settings'
       const retryMerged = mergeOverrides(newTarget, retry.overrides)
       const retryDropped = droppedOverrideIds(retry.overrides, retryMerged)
