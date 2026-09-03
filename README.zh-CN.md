@@ -30,7 +30,7 @@ https://github.com/user-attachments/assets/c3f9c8b1-ea5e-470c-b8a8-60a81fc5c20a
 - **`modelSync` 服务。** 对外暴露 `modelSync` 服务（`syncNow()`），UI 调用它即可强制跑一轮刷新并读取报告。
 - **`/model-sync` 命令。** 插件自行通过共享的 dsh 命令注册表（`@deepseek-ai/dsh-commands`）注册 `/model-sync` 斜杠命令，所有交互式 UI 自动发现并列出——UI 侧零配合。执行它当场强制跑一轮刷新，输出的报告与定时轮完全相同；同步范围由 `managedRoutes` 决定（参数会被忽略）。命令注册表是可选 peer：没有命令注册服务的宿主照常降级，定时刷新与 `modelSync` 服务不受影响。
 - **翻译规则。** pi.dev 条目被翻译成 settings 可写的模型 profile（`translate.ts`）：base-matching 与 base-less 分类、`reasoningEfforts` 推导（S2 gate）、`compat` 门控到 `openai-completions`（S5 gate）、`maxTokens` 处理，以及混合协议路由的丢弃逻辑。容量值另有卫生门：非正整数的 `contextWindow`，或不是「严格小于 contextWindow 的正整数」的 `maxTokens`（有的列表会把 context window 回声填进 maxTokens），一律跳过不写，并在报告中以降级警告说明。
-- **你的覆盖不会被吃掉。** `modelOverrides` 是你自己的按模型调整通道（think level、收窄 context window 等）；同步永不消费或删除它。覆盖字段按模型逐字段压过同步值，且此后每一轮都保持生效。
+- **你的覆盖不会被吃掉。** `modelOverrides` 是你自己的按模型调整通道（think level、收窄 context window 等）。dsh 拒绝 models 列表与非空 modelOverrides 并存，因此同步会把覆盖字段折叠进写入的 models、在同一次写入中清掉该键，并把原值存进 `~/.dsh/models-store.json` 逐轮回放——只要路由仍被托管，覆盖就持续压过同步值。
 - **默认安全的开关：**
   - `keepBuiltinOnly: true`——保留内置目录里有、但 pi.dev 上（还）没有的模型，启用同步不会删掉你正在用的模型。
   - `dropUnserviceable: true`——丢弃不可服务的条目并继续；设为 `false` 则改为中止整条路由，而不是写入残缺列表。
@@ -83,7 +83,7 @@ model-sync:
 
 同步进来的 `contextWindow` / `maxTokens` 描述的是**模型**在网关列表里宣称的上限，不是你的部署实际配置的值。dsh 解析时 settings 写入的值会压过内置目录，且写入的 `maxTokens` 会成为请求级默认值。如果某条路由实际指向一个上下文更小的本地/代理端点（vLLM / Ollama 之类），却带着目录级的容量值，正是 "Output token limit reached" 一族故障的常见配方（参见上游 #1166）。
 
-需要某个模型在更小的预算下运行时，把它写进同路由的 `modelOverrides`——覆盖字段按模型压过同步值，且同步会跨轮保留你的覆盖：
+需要某个模型在更小的预算下运行时，把它写进同路由的 `modelOverrides`——同步会把字段折叠进同步列表，并从本地 store 逐轮回放：
 
 ```yaml
 providers:

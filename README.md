@@ -30,7 +30,7 @@ Model lists drift: providers ship new models, retire old ones, and adjust capabi
 - **`modelSync` service.** Exposes a `modelSync` service (`syncNow()`) that a UI can call to force one refresh round and read the report.
 - **`/model-sync` command.** The plugin registers a `/model-sync` slash command itself through the shared dsh command registry (`@deepseek-ai/dsh-commands`), so every interactive UI lists it automatically — no UI-side wiring. Running it forces one sync round on the spot and prints the same report the scheduled rounds log; the sync scope is decided by `managedRoutes` (arguments are ignored). The registry is an optional peer: hosts without a command registry still get the scheduled rounds and the `modelSync` service.
 - **Translation rules.** pi.dev entries are translated into settings-writable model profiles (`translate.ts`): base-matching vs base-less classification, `reasoningEfforts` derivation (S2 gate), `compat` gating to `openai-completions` (S5 gate), `maxTokens` handling, and drop logic for mixed-protocol routes. Capacity values get a sanity gate: a `contextWindow` that is not a positive integer, or a `maxTokens` that is not a positive integer strictly below the context window (listings sometimes echo the context window into `maxTokens`), is skipped with a degrade warning instead of written.
-- **Your overrides are durable.** `modelOverrides` is your own per-model channel (think levels, narrowed context windows); the sync never consumes or deletes it. Override fields win over the synced values per model and keep winning on every future round.
+- **Your overrides are durable.** `modelOverrides` is your own per-model channel (think levels, narrowed context windows). dsh refuses a models list beside non-empty overrides, so the sync folds your fields into the written models, clears the key in the same write, and re-applies the values from its store (`~/.dsh/models-store.json`) on every round — they keep winning over the synced values for as long as the route is managed.
 - **Safe-by-default options:**
   - `keepBuiltinOnly: true` — keep built-in catalog models that are not (yet) on pi.dev, so adopting the sync doesn't delete models you already use.
   - `dropUnserviceable: true` — drop unserviceable entries and continue; set to `false` to abort the whole route instead of writing a partial list.
@@ -83,7 +83,7 @@ The plugin writes to the `llm-pi-ai` namespace (`providers.<route>.models`) — 
 
 Synced `contextWindow` / `maxTokens` describe what the **model** accepts at most, as advertised by the gateway listing — not what your deployment is configured for. dsh resolves the settings-written value over the installed catalog, and a written `maxTokens` becomes the request-level default. Pointing a route at a local or proxied endpoint that serves a smaller context (vLLM / Ollama and friends) while carrying catalog-sized capacities is a known recipe for the "output token limit reached" family of failures.
 
-If you need a model to run under a smaller budget, set it in `modelOverrides` under the same route — override fields win over the synced values, and the sync preserves your overrides across rounds:
+If you need a model to run under a smaller budget, set it in `modelOverrides` under the same route — the sync folds the fields into the synced list and re-applies them from its store every round:
 
 ```yaml
 providers:
