@@ -364,6 +364,12 @@ await checkAsync('syncToSettings: two-round simulation — user override survive
   const store = {
     async read(route) { return storeData[route] },
     async write(route, entry) { storeData[route] = entry },
+    async update(route, patch) {
+      storeData[route] = { ...(storeData[route] ?? {}), ...patch }
+    },
+    async updateOverrides(route, overrides) {
+      storeData[route] = { ...(storeData[route] ?? {}), overrides }
+    },
     async delete(route) { delete storeData[route] },
   }
   const settings = {

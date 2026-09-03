@@ -130,6 +130,16 @@ function createMemoryStore(seed = {}) {
     written,
     async read(route) { return data[route] },
     async write(route, entry) { written.push(route); data[route] = entry },
+    async update(route, patch) {
+      written.push(route)
+      const current = data[route] ?? {}
+      data[route] = { ...current, ...patch }
+    },
+    async updateOverrides(route, overrides) {
+      written.push(route)
+      const current = data[route] ?? {}
+      data[route] = { ...current, overrides }
+    },
     async delete(route) { delete data[route] },
   }
 }
@@ -413,17 +423,19 @@ await checkAsync('SETTINGS_CONFLICT retry → set+unset on both attempts, every 
     conflictFirst: true,
   })
   // Interleave store writes and mutates into one event log so the ordering
-  // contract is checkable without locking the exact staging count.
+  // contract is checkable without locking the exact staging count. C1 fix:
+  // the writer now stages via `updateOverrides` (queue-internal RMW), so
+  // hook that — the legacy `store.write` hook saw nothing after the refactor.
   const events = []
   const origMutate = settings.mutate.bind(settings)
   settings.mutate = async (...args) => {
     events.push('mutate')
     return origMutate(...args)
   }
-  const origWrite = store.write.bind(store)
-  store.write = async (...args) => {
+  const origUpdateOverrides = store.updateOverrides.bind(store)
+  store.updateOverrides = async (...args) => {
     events.push('persist')
-    return origWrite(...args)
+    return origUpdateOverrides(...args)
   }
   const target = [{ id: 'model-a', name: 'Model A Updated' }]
 
@@ -751,6 +763,20 @@ await checkAsync('store read fails + settings has overrides → settings-wins fo
   const failingButWritableStore = {
     async read() { throw new SyntaxError('Unexpected token in JSON at position 5') },
     async write(route, entry) { healedData[route] = entry },
+    // B1: the real updateOverrides() uses a field-level seed, so the
+    // mock must match — every entry carries models ([]), checkedAt (a
+    // timestamp), lastModified (0), etag (undefined), and overrides. The
+    // previous `{ overrides }`-only mock was simulating the bug itself:
+    // an entry shape the next round's fetch couldn't consume.
+    async updateOverrides(route, overrides) {
+      healedData[route] = {
+        models: [],
+        checkedAt: Date.now(),
+        lastModified: 0,
+        etag: undefined,
+        overrides,
+      }
+    },
     async delete(route) { delete healedData[route] },
   }
   const target = [{ id: 'model-a', name: 'Model A', contextWindow: 1000000 }]
@@ -772,9 +798,17 @@ await checkAsync('store read fails + settings has overrides → settings-wins fo
 
   // The persist's atomic write healed the store — the only way a read-
   // throwing file becomes valid JSON is for a successful write to
-  // overwrite it. The persisted entry carries the overrides verbatim.
+  // overwrite it. C1 + B1: the writer's persist path uses updateOverrides
+  // (queue-internal RMW with field-level seed), so the healed entry has
+  // the full shape — models seeded to [], checkedAt to a timestamp,
+  // lastModified to 0, etag to undefined, plus the overrides. The fetch
+  // side re-populates models/checkedAt/lastModified/etag on its next
+  // round. The invariants that matter are: the entry exists, it carries
+  // the overrides verbatim, and the next read no longer throws.
   assert.deepEqual(healedData['test-route']?.overrides, overrides, 'heal: persisted entry carries the overrides')
-  assert.equal(typeof healedData['test-route']?.checkedAt, 'number', 'heal: entry has a checkedAt timestamp')
+  assert.equal(typeof healedData['test-route']?.checkedAt, 'number', 'heal: entry has a checkedAt timestamp (B1 entry-shape invariant)')
+  assert.deepEqual(healedData['test-route']?.models, [], 'heal: entry has a models field seeded to [] (B1 entry-shape invariant)')
+  assert.ok(healedData['test-route'], 'heal: persisted entry exists')
 })
 
 // ---------------------------------------------------------------------------
@@ -792,6 +826,14 @@ await checkAsync('store ENOENT (first run) → read returns {}, no overrides fro
   const enoentStore = {
     async read(route) { return undefined }, // simulate ENOENT → empty doc
     async write(route, entry) { enoentStore._written = enoentStore._written ?? {}; enoentStore._written[route] = entry },
+    async update(route, patch) {
+      enoentStore._written = enoentStore._written ?? {}
+      enoentStore._written[route] = { ...(enoentStore._written[route] ?? {}), ...patch }
+    },
+    async updateOverrides(route, overrides) {
+      enoentStore._written = enoentStore._written ?? {}
+      enoentStore._written[route] = { ...(enoentStore._written[route] ?? {}), overrides }
+    },
     async delete(route) {},
   }
   const target = [{ id: 'model-a', name: 'Model A Updated' }]
@@ -832,6 +874,10 @@ await checkAsync('store read fails on retry + key removed between attempts → s
   const failingStore = {
     async read() { throw new SyntaxError('corrupt store on retry') },
     async write() {},
+    // C1: the writer's first-attempt persist now goes through updateOverrides
+    // (queue-internal RMW). For the settings-wins path the read error is
+    // swallowed and the write still lands, so the mock tolerates it.
+    async updateOverrides() {},
     async delete() {},
   }
   const settings = createStatefulSettings({
