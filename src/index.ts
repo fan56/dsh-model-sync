@@ -288,7 +288,8 @@ export function apply(ctx: Context): void {
         }
       }
 
-      // Write to settings (change-only, with conflict retry)
+      // Write to settings (change-only, with conflict retry); the store
+      // carries the modelOverrides replay/persist (mutual-exclusion fix)
       const syncResult = await syncToSettings(
         settings,
         route,
@@ -301,16 +302,33 @@ export function apply(ctx: Context): void {
           void newRevision // revision is used by the caller
           return translated.entries
         },
+        store,
       )
 
       if (syncResult.wrote) {
-        lines.push(`${route}: wrote ${translated.entries.length} models (${syncResult.reason})`)
+        // Detail suffix for the override flows; routes without overrides keep
+        // the classic "(wrote)" line byte-for-byte.
+        const reason = syncResult.reason === 'wrote' ? '' : `${syncResult.reason}; `
+        let detail: string | undefined
+        if (syncResult.overridesSource === 'settings') {
+          detail = `${reason}folded user modelOverrides, unset the key`
+        } else if (syncResult.overridesSource === 'store') {
+          detail = `${reason}applied stored modelOverrides`
+        }
+        if (detail !== undefined && syncResult.droppedOverrideIds !== undefined && syncResult.droppedOverrideIds.length > 0) {
+          detail += `; override ids not in target kept in models-store: ${syncResult.droppedOverrideIds.join(', ')}`
+        }
+        lines.push(detail !== undefined
+          ? `${route}: wrote ${translated.entries.length} models (${detail})`
+          : `${route}: wrote ${translated.entries.length} models (${syncResult.reason})`)
       } else if (syncResult.reason === 'no-change') {
         lines.push(`${route}: up to date (${translated.entries.length} models)`)
       } else if (syncResult.reason === 'skipped') {
         lines.push(`${route}: skipped — settings service unavailable or llm-pi-ai namespace not registered`)
       } else if (syncResult.reason === 'mutate-rejected') {
         lines.push(`${route}: rejected by settings validation (see log)`)
+      } else if (syncResult.reason === 'store-unavailable') {
+        lines.push(`${route}: skipped (models-store write failed; settings untouched)`)
       } else {
         lines.push(`${route}: ${syncResult.reason} (${translated.entries.length} models)`)
       }
