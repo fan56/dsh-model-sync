@@ -305,6 +305,63 @@ await checkAsync('fetchRemoteCatalog: I-4e — 501 returns empty entries', async
 })
 
 // ---------------------------------------------------------------------------
+// modelOverrides preservation: the catalog refresh must carry the route's
+// stored `overrides` through every write path, like the ETag — otherwise the
+// writer's fold+unset+persist would be wiped on the next refresh and the
+// v0.1.5 data-loss bug would return.
+// ---------------------------------------------------------------------------
+await checkAsync('fetchRemoteCatalog preserves stored overrides across refresh writes (200/304/404/501/503)', async () => {
+  const overrides = { 'model-a': { contextWindow: 8192 } }
+  const cachedModels = [{ id: 'cached', name: 'Cached', api: 'openai-completions', provider: 'r', baseUrl: '', reasoning: false, input: ['text'] }]
+
+  for (const status of [200, 304, 404, 501, 503]) {
+    const { dir, storePath } = await createTmpStorePath()
+    try {
+      resetModelsStoreCache()
+      const store = loadModelsStore(storePath)
+      // Old checkedAt so the 4h throttle never short-circuits the fetch.
+      await store.write('test-route', {
+        models: cachedModels,
+        checkedAt: Date.now() - 5 * 60 * 60 * 1000,
+        lastModified: Date.now(),
+        etag: '"etag-cached"',
+        overrides,
+      })
+
+      const origFetch = globalThis.fetch
+      globalThis.fetch = async () => status === 200
+        ? new Response(JSON.stringify([{ id: 'fresh', name: 'Fresh', api: 'openai-completions' }]), {
+            status: 200,
+            headers: { 'content-type': 'application/json', etag: '"etag-fresh"' },
+          })
+        : new Response(null, { status })
+      try {
+        const result = await fetchRemoteCatalog('test-route', 5000, store)
+        const stored = await store.read('test-route')
+        assert.deepEqual(stored.overrides, overrides, `status ${status}: overrides must survive the refresh write`)
+        if (status === 200) {
+          assert.equal(stored.models[0].id, 'fresh', 'status 200: fresh models stored')
+          assert.equal(stored.etag, '"etag-fresh"')
+        } else if (status === 304) {
+          assert.equal(result.fromCache, true, 'status 304: cached entries served')
+          assert.equal(stored.models[0].id, 'cached')
+        } else if (status === 404 || status === 501) {
+          assert.equal(result.entries.length, 0, `status ${status}: empty overlay returned`)
+        } else {
+          assert.ok(result.error, 'status 503: transient failure reported')
+          assert.equal(stored.models[0].id, 'cached', 'status 503: cached entries kept')
+        }
+      } finally {
+        globalThis.fetch = origFetch
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+      resetModelsStoreCache()
+    }
+  }
+})
+
+// ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
 if (failed > 0) {

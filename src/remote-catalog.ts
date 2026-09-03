@@ -65,6 +65,14 @@ export interface ModelsStoreEntry {
   checkedAt: number
   lastModified: number
   etag?: string
+  /**
+   * User `modelOverrides` folded out of settings and unset there (the dsh
+   * llm-pi-ai validation refuses a models list beside non-empty
+   * modelOverrides). Replayed into the translated target on every later
+   * round so the user's values survive — the catalog refresh must carry this
+   * field through untouched, exactly like the ETag.
+   */
+  overrides?: Record<string, Record<string, unknown>>
 }
 
 /** Top-level shape of ~/.dsh/models-store.json. */
@@ -264,6 +272,7 @@ export async function fetchRemoteCatalog(
         checkedAt,
         lastModified: 0,
         etag: undefined,
+        overrides: stored?.overrides,
       }
       await effectiveStore.write(route, entry)
       return { entries: [], fromCache: false }
@@ -276,6 +285,7 @@ export async function fetchRemoteCatalog(
         checkedAt,
         lastModified: stored?.lastModified ?? 0,
         etag: stored?.etag,
+        overrides: stored?.overrides,
       }
       await effectiveStore.write(route, entry)
       return {
@@ -295,6 +305,7 @@ export async function fetchRemoteCatalog(
       checkedAt,
       lastModified: Number.isNaN(lastModified) ? 0 : lastModified,
       etag,
+      overrides: stored?.overrides,
     }
     await effectiveStore.write(route, storeEntry)
 
