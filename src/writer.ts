@@ -44,7 +44,7 @@
  */
 
 import type { SettingsModelProfile } from './translate.ts'
-import type { ModelsStoreAccessor, ModelsStoreEntry } from './remote-catalog.ts'
+import type { ModelsStoreAccessor } from './remote-catalog.ts'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -268,22 +268,32 @@ async function resolveOverrides(
 
 /**
  * Stage overrides in the models-store BEFORE the mutate that unsets them
- * from settings (store-first). The read runs outside the store's serialized
- * write queue — only the merged entry write goes through the queue — so the
- * route's models/checkedAt/etag, written by the fetch earlier in this round,
- * stay intact. While the settings key is present it always wins over the
- * store (resolveOverrides order); the stored copy is only ever replayed
- * once the key is gone. Callers must treat a throw from here as "skip the
- * mutate": unsetting without a staged copy is the v0.1.5 data loss.
+ * from settings (store-first). The RMW runs inside the accessor's
+ * serialized write queue via `updateOverrides` — the previous read-then-
+ * write pattern read OUTSIDE the queue, which let the fetch side's
+ * `store.write` clobber any staged overrides that landed in the window
+ * between this read and the eventual write. The queue-internal field-
+ * level seed (B1) merges the stage with whatever the route currently
+ * holds: `overrides` is replaced by the new value, every other field
+ * (`models` / `checkedAt` / `lastModified` / `etag`) is preserved
+ * verbatim when present, otherwise seeded with a sensible default.
+ * A concurrent fetch write (the C1 race surface) can no longer wipe
+ * the stage: the fetch-side patch only names fetch-owned fields, so
+ * the seed leaves `overrides` alone. While the settings key is present
+ * it always wins over the store (resolveOverrides order); the stored
+ * copy is only ever replayed once the key is gone. Callers must treat
+ * a throw from here as "skip the mutate": unsetting without a staged
+ * copy is the v0.1.5 data loss.
  *
- * The store read may now fail on corruption / permission errors (readDoc
- * propagates everything except ENOENT). Swallowing it here is intentional:
- * the settings key carries the only authoritative copy of the overrides, the
- * atomic writeDoc below replaces the (possibly corrupt) file with a fresh
- * entry that carries the overrides — which is what heals the store. The
- * fetch side will re-populate models/checkedAt/etag on its next round.
- * (A storeless call — store undefined — cannot stage anything and keeps the
- * legacy unset-without-copy behavior; production wiring in index.ts always
+ * The store read may fail on corruption / permission errors (the
+ * queue's internal read tolerates them by treating the doc as empty,
+ * then the atomic writeDoc replaces the bad file with a fresh,
+ * well-formed entry — the self-heal). The field-level seed keeps the
+ * resulting entry well-formed (models: [], checkedAt: Date.now(),
+ * lastModified: 0, etag: undefined, overrides: <stage>), so the fetch
+ * side can consume it on its next round. (A storeless call — store
+ * undefined — cannot stage anything and keeps the legacy
+ * unset-without-copy behavior; production wiring in index.ts always
  * passes a store.)
  */
 async function persistOverridesToStore(
@@ -292,24 +302,7 @@ async function persistOverridesToStore(
   overrides: Record<string, Record<string, unknown>>,
 ): Promise<void> {
   if (store === undefined) return
-  let stored: ModelsStoreEntry | undefined
-  try {
-    stored = await store.read(route)
-  } catch (readErr: unknown) {
-    // Cache lost — fall through with no cached metadata. The atomic
-    // writeDoc below replaces the bad file with a fresh entry carrying
-    // only the overrides. The fetch side re-populates the rest on its
-    // next round. The settings key remains the authoritative source of
-    // truth in the meantime.
-    void readErr
-  }
-  await store.write(route, {
-    models: stored?.models ?? [],
-    checkedAt: stored?.checkedAt ?? Date.now(),
-    lastModified: stored?.lastModified ?? 0,
-    etag: stored?.etag,
-    overrides,
-  })
+  await store.updateOverrides(route, overrides)
 }
 
 // ---------------------------------------------------------------------------
