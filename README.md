@@ -6,6 +6,8 @@
 
 A dsh (DeepSeek Harness) Cordis plugin that keeps the model catalog of your `llm-pi-ai` provider routes in step with the pi.dev gateway's model listing — written into dsh `settings.yaml` through the official settings seam (`settings.mutate`), with zero patches to dsh internals.
 
+**Requires dsh >= 0.1.2-rc.1** — this plugin targets the dsh RC/stable line only (CI and releases resolve the newest of the `latest`/`next` dist-tags at runtime). **The alpha line is no longer supported.**
+
 https://github.com/user-attachments/assets/c3f9c8b1-ea5e-470c-b8a8-60a81fc5c20a
 
 *A live recording of a dsh session running `/model-sync` (MP4, 1.5× speed) — drop reasons, per-route sync statuses and the change report in action. More demos in the [Demos issue](https://github.com/fan56/dsh-model-sync/issues/1).*

@@ -6,6 +6,8 @@
 
 一个 dsh（DeepSeek Harness）Cordis 插件：把 `llm-pi-ai` 各 provider 路由的模型目录与 pi.dev 网关的模型列表保持同步，并通过官方 settings 接缝（`settings.mutate`）写进 dsh 的 `settings.yaml`——对 dsh 内部零补丁。
 
+**要求 dsh >= 0.1.2-rc.1** — 本插件只跟随 dsh RC/stable 线（CI 与发版在运行时解析 latest/next 中更新的 dist-tag）。**不再支持 alpha 线。**
+
 https://github.com/user-attachments/assets/c3f9c8b1-ea5e-470c-b8a8-60a81fc5c20a
 
 *一段 dsh 会话里运行 `/model-sync` 的实录（MP4，1.5× 速度）——丢弃原因、各路由同步状态与变更报告一览。更多 demo 见 [Demos issue](https://github.com/fan56/dsh-model-sync/issues/1)。*

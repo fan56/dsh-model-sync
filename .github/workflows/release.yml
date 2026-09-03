@@ -55,10 +55,20 @@ jobs:
       - name: Install dependencies (frozen lockfile)
         run: pnpm install --frozen-lockfile
 
-      - name: Install dsh CLI (rolling alpha tag, never hand-pinned)
+      - name: Install dsh CLI (rolling rc/stable line — newest of latest/next, never alpha)
         run: |
-          echo "alpha @deepseek-ai/dsh: $(npm view @deepseek-ai/dsh@alpha version)"
-          npm install -g @deepseek-ai/dsh@alpha --no-audit --no-fund
+          # Policy (2026-09-03): the alpha line is retired for CI. Resolve the
+          # newest of the `latest` (stable) and `next` (rc) dist-tags at
+          # runtime, never hand-pinned — when a stable 0.1.2+ lands on
+          # `latest` it wins over the rc by plain semver compare.
+          STABLE="$(npm view @deepseek-ai/dsh@latest version)"
+          RC="$(npm view @deepseek-ai/dsh@next version 2>/dev/null || true)"
+          DSH_VERSION="$STABLE"
+          if [ -n "$RC" ] && [ "$(printf '%s\n' "$STABLE" "$RC" | sort -V | tail -1)" = "$RC" ]; then
+            DSH_VERSION="$RC"
+          fi
+          echo "dsh closure: ${DSH_VERSION}"
+          npm install -g "@deepseek-ai/dsh@${DSH_VERSION}" --no-audit --no-fund
 
       - name: Link the @deepseek-ai/* closure from the installed host
         run: node scripts/link-dsh-closure.mjs

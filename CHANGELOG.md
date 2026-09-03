@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-09-03
 
 ### Fixed
 
@@ -21,12 +21,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- **The plugin rides the dsh RC/stable line; the alpha line is retired.** CI and release workflows install the dsh CLI by resolving the newest of the `latest` (stable) and `next` (rc) dist-tags at runtime — never `@alpha`, never hand-pinned. When a stable 0.1.2+ lands on `latest` it wins over the rc by plain semver compare.
+- **dsh host floor `>= 0.1.2-rc.1`.** All peer-dependency floors move from `>=0.1.2-alpha.4` to `>=0.1.2-rc.1`, and the dev closure is pinned exactly at 0.1.2-rc.1.
 - CI and release workflows gate on `generate-builtin-snapshot.mjs --check`: a snapshot drifted from the live host catalog now fails the build instead of shipping dead entries.
 - The generator script's hardcoded `~/github/dsh-model-sync` project root and `/opt/homebrew/...` pi-ai path are replaced with the same discovery trio — it had never actually run on this machine.
 
 ### Test
 
 - Behavior tests (base-less drop, maxTokens keep, keepBuiltinOnly preservation, api-divergent warning) no longer anchor on snapshot membership: they force the precondition via inline builtin data, so catalog drift cannot flip them. New `live-catalog.test.mjs` covers override priority, per-route fallback, and bogus-override fall-through.
+
+### Docs
+
+- README (EN + zh-CN): the support statement now reads "Requires dsh >= 0.1.2-rc.1 — this plugin targets the dsh RC/stable line only (CI and releases resolve the newest of the `latest`/`next` dist-tags at runtime). The alpha line is no longer supported."
 
 ## [0.1.6] - 2026-08-31
 
@@ -74,7 +80,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - First tagged release.
 
-[Unreleased]: https://github.com/fan56/dsh-model-sync/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/fan56/dsh-model-sync/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/fan56/dsh-model-sync/releases/tag/v0.3.0
 [0.1.5]: https://github.com/fan56/dsh-model-sync/releases/tag/v0.1.5
 [0.1.4]: https://github.com/fan56/dsh-model-sync/releases/tag/v0.1.4
 [0.1.3]: https://github.com/fan56/dsh-model-sync/releases/tag/v0.1.3
