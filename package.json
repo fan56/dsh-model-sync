@@ -31,7 +31,7 @@
     "build": "tsc -p tsconfig.json",
     "check": "tsc --noEmit -p tsconfig.json",
     "pretest": "tsc -p tsconfig.json",
-    "test": "node --test test/live-catalog.test.mjs test/diff.test.mjs test/translate.test.mjs test/writer.test.mjs test/remote-catalog.test.mjs test/serviceability.test.mjs test/command.test.mjs test/real-cordis.test.mjs"
+    "test": "node --test test/live-catalog.test.mjs test/diff.test.mjs test/translate.test.mjs test/writer.test.mjs test/writer-overrides.test.mjs test/remote-catalog.test.mjs test/serviceability.test.mjs test/command.test.mjs test/real-cordis.test.mjs"
   },
   "dependencies": {},
   "peerDependencies": {

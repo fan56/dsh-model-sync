@@ -236,9 +236,11 @@ await checkAsync('syncToSettings: missing llm-pi-ai namespace → skipped', asyn
 })
 
 // ---------------------------------------------------------------------------
-// syncToSettings: modelOverrides → single set op with merged fields, key kept
+// syncToSettings: modelOverrides → set + unset in one mutate, key cleared
+// (revised for the dsh mutual-exclusion validation: a models list beside
+// non-empty modelOverrides is refused, so the key must go in the same mutate)
 // ---------------------------------------------------------------------------
-await checkAsync('syncToSettings: modelOverrides → single set op, merged fields, overrides key untouched', async () => {
+await checkAsync('syncToSettings: modelOverrides → set + unset ops, merged fields, key cleared atomically', async () => {
   const current = [{ id: 'model-a', name: 'Model A' }]
   const overrides = { 'model-a': { reasoningEfforts: { low: 'low', high: 'high' } } }
   const target = [{ id: 'model-a', name: 'Model A Updated' }]
@@ -247,15 +249,19 @@ await checkAsync('syncToSettings: modelOverrides → single set op, merged field
   const result = await syncToSettings(settings, 'test-route', target, silentLogger)
   assert.equal(result.wrote, true)
   assert.equal(result.reason, 'wrote')
+  assert.equal(result.overridesSource, 'settings')
   assert.equal(settings.mutations.length, 1)
   const ops = settings.mutations[0].ops
-  assert.equal(ops.length, 1, 'should have 1 op (set only — overrides are never unset)')
+  assert.equal(ops.length, 2, 'set + unset, atomic in one mutate')
   assert.equal(ops[0].op, 'set')
   assert.deepEqual(ops[0].path, ['providers', 'test-route', 'models'])
   assert.equal(ops[0].value.length, 1)
   assert.equal(ops[0].value[0].id, 'model-a')
   assert.equal(ops[0].value[0].name, 'Model A Updated')
   assert.deepEqual(ops[0].value[0].reasoningEfforts, { low: 'low', high: 'high' }, 'override fields should be merged')
+  assert.equal(ops[1].op, 'unset', 'overrides key is unset beside the models write')
+  assert.deepEqual(ops[1].path, ['providers', 'test-route', 'modelOverrides'])
+  assert.equal(ops[1].value, undefined, 'unset carries no value')
 })
 
 // ---------------------------------------------------------------------------
@@ -275,9 +281,10 @@ await checkAsync('syncToSettings: no modelOverrides → single op (regression)',
 })
 
 // ---------------------------------------------------------------------------
-// syncToSettings: overrides for ids not in target stay untouched (user data)
+// syncToSettings: overrides for ids not in target stay user data — never
+// folded, reported, and (with the unset) preserved via the models-store
 // ---------------------------------------------------------------------------
-await checkAsync('syncToSettings: overrides for ids not in target → untouched, no warning', async () => {
+await checkAsync('syncToSettings: overrides for ids not in target → not folded, reported, key still cleared', async () => {
   const current = [{ id: 'model-a', name: 'Model A' }]
   const overrides = { 'model-a': { name: 'Overridden' }, 'ghost-model': { name: 'Ghost' } }
   const target = [{ id: 'model-a', name: 'Model A Updated' }]
@@ -292,13 +299,15 @@ await checkAsync('syncToSettings: overrides for ids not in target → untouched,
   const result = await syncToSettings(settings, 'test-route', target, logger)
   assert.equal(result.wrote, true)
   assert.equal(warnings.length, 0, 'ghost overrides are user data, not a warning')
+  assert.deepEqual(result.droppedOverrideIds, ['ghost-model'], 'ids with no target entry are reported')
   const ops = settings.mutations[0].ops
-  assert.equal(ops.length, 1, 'no op may touch the overrides key')
+  assert.equal(ops.length, 2, 'set + unset')
+  assert.equal(ops[0].value.length, 1, 'ghost id is not folded into the models list')
   assert.equal(ops[0].value[0].name, 'Overridden', 'override should take precedence')
 })
 
 // ---------------------------------------------------------------------------
-// syncToSettings: models not yet folded + overrides exist → writes merged
+// syncToSettings: models not yet folded + overrides exist → writes merged view
 // ---------------------------------------------------------------------------
 await checkAsync('syncToSettings: models not yet folded + overrides exist → writes merged view', async () => {
   const current = [{ id: 'model-a', name: 'Model A' }]
@@ -310,38 +319,52 @@ await checkAsync('syncToSettings: models not yet folded + overrides exist → wr
   assert.equal(result.wrote, true, 'stored models lack the folded field, so write once')
   assert.equal(result.reason, 'wrote')
   const ops = settings.mutations[0].ops
-  assert.equal(ops.length, 1, 'should have 1 op (set only)')
+  assert.equal(ops.length, 2, 'set + unset')
   assert.deepEqual(ops[0].value[0].reasoningEfforts, { low: 'low' }, 'override should be merged')
 })
 
 // ---------------------------------------------------------------------------
-// syncToSettings: durability — folded models + overrides → stable no-change
+// syncToSettings: folded models + overrides present → still writes to clear
+// the refused models+overrides combo (change-only does not apply while the
+// settings key is present)
 // ---------------------------------------------------------------------------
-await checkAsync('syncToSettings: folded models + overrides → second round is no-change (override durability)', async () => {
+await checkAsync('syncToSettings: folded models + overrides present → writes set+unset even without a model diff', async () => {
   const target = [{ id: 'model-a', name: 'Model A', contextWindow: 1000000 }]
   // Stored state after a previous round folded the override into models; the
-  // overrides key is still present because it is never unset.
+  // overrides key is still present, which the dsh validation refuses beside a
+  // models list — the combo must be cleared even though the merged view
+  // already matches.
   const overrides = { 'model-a': { contextWindow: 8192 } }
   const storedModels = [{ id: 'model-a', name: 'Model A', contextWindow: 8192 }]
   const settings = createMockSettings({ userModels: storedModels, modelOverrides: overrides })
 
   const result = await syncToSettings(settings, 'test-route', target, silentLogger)
-  assert.equal(result.wrote, false, 'merged view must be re-derived identically — no write')
-  assert.equal(result.reason, 'no-change')
-  assert.equal(settings.mutations.length, 0)
-  assert.deepEqual(storedModels[0].contextWindow, 8192, 'user override value must survive')
+  assert.equal(result.wrote, true, 'the refused combo must be cleared with a set+unset mutate')
+  assert.equal(result.reason, 'wrote')
+  const ops = settings.mutations[0].ops
+  assert.equal(ops.length, 2)
+  assert.deepEqual(ops[0].value[0].contextWindow, 8192, 'written models keep the override value')
+  assert.equal(ops[1].op, 'unset')
 })
 
 // ---------------------------------------------------------------------------
 // syncToSettings: end-to-end two-round simulation — override survives round 2
 // ---------------------------------------------------------------------------
 await checkAsync('syncToSettings: two-round simulation — user override survives, pi.dev value never clobbers', async () => {
+  const overrides = { 'model-a': { contextWindow: 8192 } }
   const state = {
     revision: 1,
     routeData: {
       models: [{ id: 'model-a', contextWindow: 200000 }],
-      modelOverrides: { 'model-a': { contextWindow: 8192 } },
+      modelOverrides: { ...overrides },
     },
+  }
+  // In-memory models-store: round 1 persists the unset overrides here.
+  const storeData = {}
+  const store = {
+    async read(route) { return storeData[route] },
+    async write(route, entry) { storeData[route] = entry },
+    async delete(route) { delete storeData[route] },
   }
   const settings = {
     mutations: [],
@@ -364,13 +387,14 @@ await checkAsync('syncToSettings: two-round simulation — user override survive
   }
   const piDevTarget = [{ id: 'model-a', contextWindow: 1000000 }] // unchanged across rounds
 
-  const round1 = await syncToSettings(settings, 'test-route', piDevTarget, silentLogger)
+  const round1 = await syncToSettings(settings, 'test-route', piDevTarget, silentLogger, undefined, store)
   assert.equal(round1.wrote, true)
   assert.deepEqual(state.routeData.models[0].contextWindow, 8192, 'round 1 folds the override')
-  assert.ok(state.routeData.modelOverrides, 'round 1 keeps the overrides key')
+  assert.equal(state.routeData.modelOverrides, undefined, 'round 1 unsets the key')
+  assert.deepEqual(storeData['test-route'].overrides, overrides, 'round 1 persists the raw overrides to the store')
 
-  const round2 = await syncToSettings(settings, 'test-route', piDevTarget, silentLogger)
-  assert.equal(round2.wrote, false, 'round 2 must be a no-change, not a clobber')
+  const round2 = await syncToSettings(settings, 'test-route', piDevTarget, silentLogger, undefined, store)
+  assert.equal(round2.wrote, false, 'round 2 must be a no-change via the store replay, not a clobber')
   assert.deepEqual(state.routeData.models[0].contextWindow, 8192, 'override value survives round 2')
 })
 
