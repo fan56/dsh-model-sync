@@ -52,6 +52,18 @@ dsh plugin add @aiwayds/dsh-model-sync
 
 本插件独立分发——需要时用 `dsh plugin add @aiwayds/dsh-model-sync` 显式安装即可。
 
+## 卸载
+
+```bash
+dsh plugin remove @aiwayds/dsh-model-sync
+```
+
+宿主会自动清理：bundles 条目会从 profile 中摘除，插件自带的 patch 层随包一起消失，同步轮次与 `/model-sync` 命令就此停止。有三样东西会刻意留在磁盘上：
+
+1. **`~/.dsh/models-store.json`——清除前请先备份这个文件。** 它保存目录缓存**以及**你的 `modelOverrides`：在 store-first 不变式下，插件把覆盖值折叠进写入的 models 并清掉 settings 里的键，因此对受管路由而言 store 可能是覆盖值的**唯一**副本。删掉文件就等于删掉它们。
+2. **`~/.dsh/settings.yaml` 里已同步的模型列表。** 插件经官方 settings 接缝把它们写进了宿主持有的 `llm-pi-ai` 命名空间（`providers.<route>.models`）。卸载后它们会保留，并且仍是合法的宿主配置——dsh 会照常消费，就像你手写的一样。不想要就手动删除对应条目。
+3. **极少数情况下的残留暂存文件。** store 的写入走临时文件 + rename；若进程在写入中途死掉，可能留下 `~/.dsh/models-store.json.<pid>.tmp`。直接删除是安全的。
+
 ## 用法
 
 在 `settings.yaml` 的 `model-sync` 命名空间下配置本插件——每个键都是可选的：

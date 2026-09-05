@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-09-05
+
+### Changed
+
+- **Clean-uninstall story, documented and tested.** README (EN + zh-CN) gains an Uninstall section spelling out what removal leaves behind: `~/.dsh/models-store.json` (catalog cache plus the user's `modelOverrides`, whose only copy may live there under the store-first invariant — back the file up before purging), the synced model lists the plugin wrote into the host-owned `llm-pi-ai` namespace in `settings.yaml` (valid host config that persists; remove by hand if unwanted), and the rare stale `.tmp` staging file a mid-write death can leave (safe to delete). The boot smoke gains an uninstall leg: after the boot proof it runs `dsh plugin --profile smoke remove @aiwayds/dsh-model-sync` against the scratch profile and asserts the second `--dump-config` no longer contains the plugin entry — removal must reconcile the composed tree back to stock. `package.json` also grows the missing `smoke` script key (`node scripts/smoke-boot.mjs`) so `npm run smoke` works like in the sibling plugins.
+
 ## [0.3.0] - 2026-09-03
 
 ### Fixed
@@ -80,7 +86,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - First tagged release.
 
-[Unreleased]: https://github.com/fan56/dsh-model-sync/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/fan56/dsh-model-sync/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/fan56/dsh-model-sync/releases/tag/v0.3.1
 [0.3.0]: https://github.com/fan56/dsh-model-sync/releases/tag/v0.3.0
 [0.1.5]: https://github.com/fan56/dsh-model-sync/releases/tag/v0.1.5
 [0.1.4]: https://github.com/fan56/dsh-model-sync/releases/tag/v0.1.4

@@ -52,6 +52,18 @@ The package ships `cordis.patch.yml` (wired as `dsh.bundle.patch`), which mounts
 
 This plugin ships standalone — install it explicitly with `dsh plugin add @aiwayds/dsh-model-sync` when you want it.
 
+## Uninstall
+
+```bash
+dsh plugin remove @aiwayds/dsh-model-sync
+```
+
+The host auto-cleans: the bundles entry is spliced out of the profile and the plugin's patch layer drops with the package, so the sync rounds and the `/model-sync` command simply stop. Three things intentionally stay on disk:
+
+1. **`~/.dsh/models-store.json` — back this file up before purging it.** It holds the catalog cache *plus* your `modelOverrides`: under the store-first invariant the plugin folds overrides into the written models and unsets the settings key, so for a managed route the store can be the **only** copy of your override values. Deleting the file deletes them.
+2. **Synced model lists in `~/.dsh/settings.yaml`.** The plugin wrote them into the host-owned `llm-pi-ai` namespace (`providers.<route>.models`) through the official settings seam. They persist after removal and remain valid host config — dsh consumes them exactly as if you had written them by hand. Remove those entries by hand if you don't want them.
+3. **A stale staging file, rarely.** The store's writes go through a temp-file + rename; if a process died mid-write a `~/.dsh/models-store.json.<pid>.tmp` file can remain. It is safe to delete.
+
 ## Usage
 
 Configure the plugin under the `model-sync` namespace in `settings.yaml` — every key is optional:
