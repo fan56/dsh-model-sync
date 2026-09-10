@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **dsh closure moved to 0.1.5-rc.1** (dev pins, locks) and the builtin catalog snapshot was regenerated against pi-ai 0.85.1: opencode-go gains `muse-spark-1.3-contributor` and `omen-alpha`; `opencode-go/hy3` maxTokens 64000 → 128000.
+
+
 ## [0.3.1] - 2026-09-05
 
 ### Changed
