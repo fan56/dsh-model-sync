@@ -4,10 +4,12 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - 2026-09-11
 
 ### Changed
-- **dsh closure moved to 0.1.5-rc.2** (dev pins, locks) and the builtin catalog snapshot was regenerated against pi-ai 0.85.1: opencode-go gains `muse-spark-1.3-contributor` and `omen-alpha`; `opencode-go/hy3` maxTokens 64000 → 128000.
+- **dsh support floor raised to `>= 0.1.5-rc.2`** (peer floors on `dsh-commands` / `dsh-settings`; READMEs updated) and the dsh closure moved to 0.1.5-rc.2 (dev pins, locks).
+- The builtin catalog snapshot was regenerated against pi-ai 0.85.1: opencode-go gains `muse-spark-1.3-contributor` and `omen-alpha`; `opencode-go/hy3` maxTokens 64000 → 128000.
+- Release: the publish-verify loop polls `npm view` for ~2 min instead of 30s — packument propagation measured ~50s on dsh-dcp v0.11.0 outran the old window and falsely failed a landed publish.
 
 
 ## [0.3.1] - 2026-09-05
