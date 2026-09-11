@@ -7,7 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 ### Changed
-- **dsh closure moved to 0.1.5-rc.1** (dev pins, locks) and the builtin catalog snapshot was regenerated against pi-ai 0.85.1: opencode-go gains `muse-spark-1.3-contributor` and `omen-alpha`; `opencode-go/hy3` maxTokens 64000 → 128000.
+- **dsh closure moved to 0.1.5-rc.2** (dev pins, locks) and the builtin catalog snapshot was regenerated against pi-ai 0.85.1: opencode-go gains `muse-spark-1.3-contributor` and `omen-alpha`; `opencode-go/hy3` maxTokens 64000 → 128000.
 
 
 ## [0.3.1] - 2026-09-05
