@@ -17,13 +17,28 @@
 //      a sibling scope of the same node_modules.
 //   2. `which dsh` realpath — the installed CLI's own node_modules.
 //   3. `npm root -g` — dsh's nested node_modules, then the flat layout.
+//
+// The probes run lazily in that order, and asynchronously: the first probe
+// with a working candidate wins, so the common `which dsh` hit never pays the
+// (much slower) `npm root -g` spawn, and no probe blocks the host's event
+// loop. Both properties are load-bearing — this runs on the host's loop 5s
+// after every boot and on every interval round, where the old synchronous
+// `execFileSync` pair froze every surface for ~0.2s per round (measured
+// 2026-09-15; ~0.6s under CPU load).
 
-import { execFileSync } from 'node:child_process'
+import { execFile as execFileCb } from 'node:child_process'
 import { existsSync, readFileSync, realpathSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { BuiltinModelData } from './translate.ts'
 
 const DATA_REL = join('dist', 'providers', 'data')
+
+/**
+ * Subprocess budget for one probe: a hung `which`/`npm` (broken PATH, npm
+ * self-update stall) degrades to the next candidate instead of pinning the
+ * refresh round forever — the probe is async, so that wait stays off the loop.
+ */
+const PROBE_TIMEOUT_MS = 10_000
 
 interface CatalogCache {
   dir: string
@@ -32,33 +47,74 @@ interface CatalogCache {
 
 let cache: CatalogCache | undefined
 
-function findPiAiPackageDir(): string | undefined {
-  const candidates: string[] = []
-  const override = process.env.DSH_CLOSURE_DIR
-  if (override !== undefined && override !== '') {
-    try {
-      candidates.push(join(dirname(realpathSync(override)), '@earendil-works', 'pi-ai'))
-    } catch { /* bad override path — fall through to auto-discovery */ }
+/** Run one probe command; resolves its stdout, rejects on spawn failure / non-zero exit / timeout. */
+function runProbe(file: string, args: readonly string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFileCb(file, args, { encoding: 'utf8', timeout: PROBE_TIMEOUT_MS }, (error, stdout) => {
+      if (error !== null) reject(error)
+      else resolve(stdout)
+    })
+  })
+}
+
+/** The real pi-ai install dir when `candidate` holds one (DATA_REL present), else undefined. */
+function resolvePiAiDir(candidate: string): string | undefined {
+  try {
+    const dir = realpathSync(candidate)
+    return existsSync(join(dir, DATA_REL)) ? dir : undefined
+  } catch {
+    return undefined
   }
+}
+
+/** Probe 1: DSH_CLOSURE_DIR override — no subprocess. */
+function closureOverrideCandidates(): string[] {
+  const override = process.env.DSH_CLOSURE_DIR
+  if (override === undefined || override === '') return []
   try {
-    const bin = execFileSync('which', ['dsh'], { encoding: 'utf8' }).trim()
-    if (bin !== '') {
-      const real = realpathSync(bin)
-      candidates.push(join(dirname(dirname(real)), 'node_modules', '@earendil-works', 'pi-ai'))
-    }
-  } catch { /* dsh not on PATH */ }
+    return [join(dirname(realpathSync(override)), '@earendil-works', 'pi-ai')]
+  } catch {
+    return [] // bad override path — fall through to auto-discovery
+  }
+}
+
+/** Probe 2: the installed CLI's own node_modules (`which dsh` realpath). */
+async function whichDshCandidates(): Promise<string[]> {
   try {
-    const root = execFileSync('npm', ['root', '-g'], { encoding: 'utf8' }).trim()
-    if (root !== '') {
-      candidates.push(join(root, '@deepseek-ai', 'dsh', 'node_modules', '@earendil-works', 'pi-ai'))
-      candidates.push(join(root, '@earendil-works', 'pi-ai'))
+    const bin = (await runProbe('which', ['dsh'])).trim()
+    if (bin === '') return []
+    return [join(dirname(dirname(realpathSync(bin))), 'node_modules', '@earendil-works', 'pi-ai')]
+  } catch {
+    return [] // dsh not on PATH, or the probe failed
+  }
+}
+
+/** Probe 3: `npm root -g` — dsh's nested node_modules, then the flat layout. */
+async function npmRootCandidates(): Promise<string[]> {
+  try {
+    const root = (await runProbe('npm', ['root', '-g'])).trim()
+    if (root === '') return []
+    return [
+      join(root, '@deepseek-ai', 'dsh', 'node_modules', '@earendil-works', 'pi-ai'),
+      join(root, '@earendil-works', 'pi-ai'),
+    ]
+  } catch {
+    return [] // npm unavailable
+  }
+}
+
+/** Locate the host's @earendil-works/pi-ai install: ordered probes, first working candidate wins. */
+async function findPiAiPackageDir(): Promise<string | undefined> {
+  const probes: ReadonlyArray<() => string[] | Promise<string[]>> = [
+    closureOverrideCandidates,
+    whichDshCandidates,
+    npmRootCandidates,
+  ]
+  for (const probe of probes) {
+    for (const candidate of await probe()) {
+      const dir = resolvePiAiDir(candidate)
+      if (dir !== undefined) return dir
     }
-  } catch { /* npm unavailable */ }
-  for (const candidate of candidates) {
-    try {
-      const dir = realpathSync(candidate)
-      if (existsSync(join(dir, DATA_REL))) return dir
-    } catch { /* candidate missing — try next */ }
   }
   return undefined
 }
@@ -86,9 +142,12 @@ function loadRoute(dir: string, route: string): BuiltinModelData[] {
  * file is unreadable are simply absent from the cache — callers fall back to
  * the frozen snapshot for those. When no host install is found at all the
  * cache is cleared and every route falls back.
+ *
+ * Async on purpose: the host install lookup spawns `which`/`npm`, and this
+ * runs on the host's event loop (see the module note). Callers await it.
  */
-export function refreshLiveCatalog(routes: readonly string[]): void {
-  const dir = findPiAiPackageDir()
+export async function refreshLiveCatalog(routes: readonly string[]): Promise<void> {
+  const dir = await findPiAiPackageDir()
   if (dir === undefined) {
     cache = undefined
     return

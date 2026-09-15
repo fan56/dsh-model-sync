@@ -348,8 +348,10 @@ export function apply(ctx: Context): void {
 
     // Prefer the host's live pi-ai catalog for this round; the frozen
     // snapshot is only the no-host fallback. Without this, keepBuiltinOnly
-    // re-emits ids the host's catalog has already dropped.
-    refreshLiveCatalog(config.managedRoutes.length > 0 ? config.managedRoutes : DEFAULT_ROUTES)
+    // re-emits ids the host's catalog has already dropped. Awaiting keeps the
+    // `which`/`npm` probes off the host's event loop (they used to block every
+    // surface for ~0.2s per round).
+    await refreshLiveCatalog(config.managedRoutes.length > 0 ? config.managedRoutes : DEFAULT_ROUTES)
 
     if (config.writeMode === 'settings') {
       return syncSettings(config, force)
@@ -365,9 +367,18 @@ export function apply(ctx: Context): void {
 
   /** Auto rounds log the same report the /model-sync command shows. */
   const runAuto = (): void => {
-    void syncNow(false).then((report) => {
-      for (const line of report.split('\n')) ctx.logger.info('model-sync: %s', line)
-    })
+    // A rejected round (service lookups mid-dispose, a refused mutate) must
+    // settle here: an unhandled rejection from a timer-driven round would
+    // terminate the whole host process, and the auto path has no caller to
+    // hand the error to.
+    void syncNow(false).then(
+      (report) => {
+        for (const line of report.split('\n')) ctx.logger.info('model-sync: %s', line)
+      },
+      (error: unknown) => {
+        ctx.logger.warn('model-sync: auto refresh failed: %o', error)
+      },
+    )
   }
 
   /** (Re)arm the auto-refresh interval; 0 disarms. */

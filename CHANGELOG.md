@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Live-catalog discovery no longer blocks the host event loop.** `findPiAiPackageDir` located the host's `@earendil-works/pi-ai` with two synchronous `execFileSync` calls (`which dsh`, `npm root -g`), and `refreshLiveCatalog` runs on the host's loop — 5s after every boot and on every interval round. Measured on a loaded machine, that froze every dsh surface for ~0.2s per round (~0.6s when `npm root -g` was slow), right around the moment the user starts typing after a boot. The probes are now async (`execFile` + a 10s per-probe budget, so a hung `npm` degrades to the next candidate instead of pinning the round) **and lazy**: they run in the documented order and stop at the first working candidate, so the common `which dsh` hit never spawns `npm` at all. `refreshLiveCatalog` is now `async` — callers await it. Two regression tests cover both properties with PATH shims: a working `which dsh` hit must not invoke `npm`, and discovery must leave timers running while its probes are in flight.
+- **A rejected auto-refresh round can no longer take the host process down.** The timer-driven `runAuto` fired `void syncNow(false).then(...)` with no rejection handler, so any failed round (a service lookup throwing mid-dispose, a refused mutate) surfaced as an unhandled rejection — fatal under Node's default policy — while the `/model-sync` command path already settled the same rejection as `kind: error`. It now logs `model-sync: auto refresh failed: …` and leaves the process alive; the failing round is retried by the next interval.
+
 ## [0.4.0] - 2026-09-11
 
 ### Changed
@@ -94,7 +101,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - First tagged release.
 
-[Unreleased]: https://github.com/fan56/dsh-model-sync/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/fan56/dsh-model-sync/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/fan56/dsh-model-sync/releases/tag/v0.4.0
 [0.3.1]: https://github.com/fan56/dsh-model-sync/releases/tag/v0.3.1
 [0.3.0]: https://github.com/fan56/dsh-model-sync/releases/tag/v0.3.0
 [0.1.5]: https://github.com/fan56/dsh-model-sync/releases/tag/v0.1.5
