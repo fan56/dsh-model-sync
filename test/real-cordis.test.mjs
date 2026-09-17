@@ -190,7 +190,7 @@ await checkAsync('overlay mode degrades with the patch-not-applied notice when p
 // Login-gate (credential seam absence / configured=false). The gate must:
 //   - tolerate the seam being absent (seam is an optional peer)
 //   - report `skipped — credential <REF> not configured` for every managed
-//     route when the seam says `configured=false`, AND call settings.mustestate
+//     route when the seam says `configured=false`, AND call settings.mutate
 //     zero times (no fetch, no translate, no mutate)
 //   - still pass the boot — the plugin itself does not register `credentials`
 //     in `inject`, so its absence must not break plugin loading
@@ -198,22 +198,36 @@ await checkAsync('overlay mode degrades with the patch-not-applied notice when p
 //
 // The settings-mode flow runs in `syncSettings` which reads the configured
 // `managedRoutes`. The default config has `managedRoutes: []` → DEFAULT_ROUTES
-// (all pi.dev routes). The settings-mode pipeline then immediately calls
-// `fetchRemoteCatalog` which would hit the network, so we cap the timeout to
-// 1ms and rely on the gate short-circuiting first: the gate runs BEFORE the
-// fetch, so on a "configured=false" host the fetch never fires.
+// (all pi.dev routes). Keep the normal 120000ms timeout: the gate must skip
+// fetch entirely, rather than depend on a short network timeout.
 
-await checkAsync('seam absent → plugin still loads, inject still == ["settings"], syncNow runs without crashing', async () => {
-  const root = makeRoot()
-  await root.plugin(plugin)
-  // Sanity: inject must NOT be widened by adding `credentials` to it (the
-  // handoff requires this assertion to keep working).
-  assert.deepEqual([...plugin.inject].sort(), ['settings'])
-  // Provide no `credentials` and no `launchEnvironment` — the gate must fall
-  // through to the launch-env path; the helper there has no way to find the
-  // ref, so every DEFAULT_ROUTES entry emits a skipped line. No crash.
-  const report = await root.get('modelSync').syncNow()
-  assert.equal(typeof report, 'string', 'syncNow returned a string report')
+await checkAsync('seams absent → settings mode skips every route with zero mutations', async () => {
+  const root = new Context()
+  const settingsSpy = makeSpySettingsService({ writeMode: 'settings', startupDelaySeconds: 3600 })
+  root.provide('settings', settingsSpy)
+  // With both services absent, the gate reads process.env. Isolate the
+  // managed references and restore them after disposing the startup timer.
+  const refs = DEFAULT_ROUTES_LIST.map((route) => `${route.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}_API_KEY`)
+  const previous = refs.map((ref) => process.env[ref])
+  const fiber = root.plugin(plugin)
+  try {
+    for (const ref of refs) delete process.env[ref]
+    await fiber
+    assert.deepEqual([...plugin.inject].sort(), ['settings'])
+    assert.equal(root.get('credentials'), undefined)
+    assert.equal(root.get('launchEnvironment'), undefined)
+    const report = await root.get('modelSync').syncNow()
+    assert.deepEqual(report.split('\n'), DEFAULT_ROUTES_LIST.map((route, i) =>
+      `${route}: skipped — credential ${refs[i]} not configured`))
+    assert.equal(settingsSpy.mutations, 0)
+    assert.equal(settingsSpy.describeCalls, 1, 'read the gate descriptor once per round')
+  } finally {
+    await fiber.dispose()
+    refs.forEach((ref, i) => {
+      if (previous[i] === undefined) delete process.env[ref]
+      else process.env[ref] = previous[i]
+    })
+  }
 })
 
 await checkAsync('seam says configured=false → skipped report for every route, settings.mutate was NOT called', async () => {
@@ -221,7 +235,7 @@ await checkAsync('seam says configured=false → skipped report for every route,
   // are resolved at plugin mount, and `provide('settings', spy)` after mount
   // would not affect the plugin's captured reference.
   const root = new Context()
-  const settingsSpy = makeSpySettingsService({ writeMode: 'settings' })
+  const settingsSpy = makeSpySettingsService({ writeMode: 'settings', startupDelaySeconds: 3600 })
   root.provide('settings', settingsSpy)
   // Plant a credentials seam that says EVERY reference is unconfigured.
   // Mirrors llm-pi-ai's surface exactly (just the `describe` half the gate
@@ -231,16 +245,27 @@ await checkAsync('seam says configured=false → skipped report for every route,
       return { configured: false }
     },
   })
-  await root.plugin(plugin)
-  const report = await root.get('modelSync').syncNow()
-  // Every DEFAULT_ROUTES entry should appear in the report, marked skipped.
-  for (const route of DEFAULT_ROUTES_LIST) {
-    assert.ok(
-      report.includes(`${route}: skipped — credential`),
-      `expected skipped line for ${route}, got: ${JSON.stringify(report)}`,
-    )
+  // An explicit empty snapshot isolates this test from shell exports.
+  root.provide('launchEnvironment', { get: () => undefined })
+  const originalFetch = globalThis.fetch
+  let fetchCalls = 0
+  globalThis.fetch = async () => {
+    fetchCalls += 1
+    throw new Error('unexpected fetch in a skipped round')
   }
-  assert.equal(settingsSpy.mutations, 0, 'gate short-circuit → zero settings.mutate calls')
+  const fiber = root.plugin(plugin)
+  try {
+    await fiber
+    const report = await root.get('modelSync').syncNow()
+    assert.deepEqual(report.split('\n'), DEFAULT_ROUTES_LIST.map((route) =>
+      `${route}: skipped — credential ${route.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}_API_KEY not configured`))
+    assert.equal(fetchCalls, 0, 'gate short-circuit → zero fetch calls')
+    assert.equal(settingsSpy.mutations, 0, 'gate short-circuit → zero settings.mutate calls')
+    assert.equal(settingsSpy.describeCalls, 1, 'read the gate descriptor once per round')
+  } finally {
+    await fiber.dispose()
+    globalThis.fetch = originalFetch
+  }
 })
 
 // ---------------------------------------------------------------------------

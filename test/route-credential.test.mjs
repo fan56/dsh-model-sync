@@ -1,22 +1,7 @@
-// Login-gate tests for the per-route credential check that protects
-// syncSettings: a logged-out route must not be silently synced into
-// `settings.models`. The two sources the gate consults (credentials seam +
-// launch-environment snapshot) mirror the order llm-pi-ai's own
-// `resolveApiKey` consults them.
-//
-// Two test layers here:
-//   1. deriveKeyRef / getRawUserApiKeyEnv / checkRouteCredential — pure logic,
-//      hand-built seam doubles. The full decision matrix lives here.
-//   2. syncSettings-level flow — a real cordis context with spies on
-//      `fetchRemoteCatalog` (so we can count invocations) and `settings.mutate`
-//      (so we can count mutations). When the gate says `ok=false`, neither
-//      must run; the report line must name the missing ref. When the gate
-//      says `ok=true`, the rest of the pipeline runs end-to-end.
-//
-// The spy-based assertions live in test/real-cordis.test.mjs (which already
-// mounts the real plugin under a real cordis context). Here we mock only the
-// `fetchRemoteCatalog` import through a tiny stub module so we don't depend
-// on any real cordis / network at the sample site.
+// Per-route gate decision matrix with hand-built credential/environment seams.
+// Layer 1 follows llm-pi-ai's resolveApiKey (seam first); layer 2 follows
+// authContextFrom(ctx).env() (launch snapshot or process.env).
+// Real plugin wiring and fetch/mutate spies live in real-cordis.test.mjs.
 
 import assert from 'node:assert/strict'
 import {
@@ -184,7 +169,7 @@ check('getRawUserApiKeyEnv: empty / whitespace string returns undefined', () => 
 //
 // Plus the "seam throws" branch (must NOT crash the round — falls through).
 
-check('checkRouteCredential: profile missing → deriveKeyRef fallback → env hit → pass', async () => {
+await checkAsync('checkRouteCredential: profile missing → deriveKeyRef fallback → credentials hit → pass', async () => {
   const credentials = makeCredentialsSpy({ configuredMap: { OPENCODE_GO_API_KEY: true } })
   const launchEnv = makeLaunchEnv()
   const ctx = makeCtx({ credentials, launchEnvironment: launchEnv })
@@ -277,64 +262,57 @@ await checkAsync('checkRouteCredential: malformed ref (not POSIX) skips it, only
   assert.equal(credentials.calls.length, 0, 'malformed ref is NOT passed to the seam')
 })
 
-await checkAsync('checkRouteCredential: ctx.get throwing on launchEnvironment is tolerated', async () => {
-  const credentials = makeCredentialsSpy({ configuredMap: {} })
-  const ctx = {
-    get(name) {
-      if (name === 'credentials') return credentials
-      throw new Error('cordis: launchEnvironment without inject')
-    },
+await checkAsync('checkRouteCredential: absent services → process.env fallback (non-empty / empty / unset)', async () => {
+  const ref = 'DSH_MODEL_SYNC_TEST_API_KEY'
+  const previous = process.env[ref]
+  const ctx = makeCtx({})
+  const desc = { user: { providers: { test: { apiKeyEnv: ref } } } }
+  try {
+    process.env[ref] = 'test-only'
+    assert.deepEqual(await checkRouteCredential(ctx, desc, 'test'), { ok: true, ref, via: 'env' })
+    process.env[ref] = ''
+    assert.deepEqual(await checkRouteCredential(ctx, desc, 'test'), { ok: false, ref })
+    delete process.env[ref]
+    assert.deepEqual(await checkRouteCredential(ctx, desc, 'test'), { ok: false, ref })
+  } finally {
+    if (previous === undefined) delete process.env[ref]
+    else process.env[ref] = previous
   }
-  const result = await checkRouteCredential(ctx, undefined, 'opencode-go')
-  assert.equal(result.ok, false, 'no crash; falls through to a clean miss')
+})
+
+await checkAsync('checkRouteCredential: provided launch snapshot overrides process.env even on a miss', async () => {
+  const ref = 'DSH_MODEL_SYNC_TEST_API_KEY'
+  const previous = process.env[ref]
+  try {
+    process.env[ref] = 'test-only'
+    const ctx = makeCtx({ launchEnvironment: makeLaunchEnv() })
+    const desc = { user: { providers: { test: { apiKeyEnv: ref } } } }
+    assert.deepEqual(await checkRouteCredential(ctx, desc, 'test'), { ok: false, ref })
+  } finally {
+    if (previous === undefined) delete process.env[ref]
+    else process.env[ref] = previous
+  }
+})
+
+await checkAsync('checkRouteCredential: apiKeyEnv empty string → deriveKeyRef → env hit', async () => {
+  const credentials = makeCredentialsSpy()
+  const ctx = makeCtx({ credentials, launchEnvironment: makeLaunchEnv({ OPENCODE_GO_API_KEY: 'test-only' }) })
+  const desc = { user: { providers: { 'opencode-go': { apiKeyEnv: '' } } } }
+  assert.deepEqual(await checkRouteCredential(ctx, desc, 'opencode-go'), {
+    ok: true, ref: 'OPENCODE_GO_API_KEY', via: 'env',
+  })
+  assert.deepEqual(credentials.calls, ['OPENCODE_GO_API_KEY'])
 })
 
 // ---------------------------------------------------------------------------
-// syncSettings-level flow: spy on `fetchRemoteCatalog` and on
-// `settings.mutate`. The fetch spy is set up by stubbing the module loader
-// for `../lib/remote-catalog.js` BEFORE we import the plugin. This is a
-// minimal local scheme — full coverage of the real plugin runs in
-// test/real-cordis.test.mjs.
+// Gate result contract; real-cordis.test.mjs verifies the actual sync report
+// and the absence of fetch/mutate calls through the real plugin.
 // ---------------------------------------------------------------------------
 
-// We deliberately avoid importing the real plugin here. The gate's behaviour
-// under `syncSettings` is observable through the report string (the
-// `syncNow` return) and through the spies we plant in the seam/launchEnv.
-// The full end-to-end wiring (real plugin + real cordis + real settings) is
-// test/real-cordis.test.mjs's job.
-
-function makeSpySettingsService() {
-  const mutations = []
-  return {
-    mutations,
-    describeCalls: 0,
-    describe() {
-      this.describeCalls += 1
-      return [{
-        ns: 'llm-pi-ai',
-        schema: {},
-        value: {},
-        revision: 1,
-        user: undefined,
-        applies: 'live',
-      }]
-    },
-    async mutate() {
-      mutations.push({ args: Array.from(arguments) })
-    },
-  }
-}
-
-await checkAsync('syncSettings flow (stub): gate skip → fetch spy 0 calls, mutate spy 0 calls, report line names ref', async () => {
-  // We can NOT easily spy on fetchRemoteCatalog without monkey-patching the
-  // module, so this test is structured to drive `checkRouteCredential` with
-  // the same shape of args that syncSettings passes. That is the contract
-  // the gate enforces; an integration-level spy is left to
-  // test/real-cordis.test.mjs (which already mounts the real plugin).
-  const settings = makeSpySettingsService()
+await checkAsync('gate result: skip names the missing ref for report formatting', async () => {
   const credentials = makeCredentialsSpy({ configuredMap: {} }) // always unconfigured
   const launchEnv = makeLaunchEnv()
-  const ctx = makeCtx({ credentials, launchEnvironment: launchEnv, settings })
+  const ctx = makeCtx({ credentials, launchEnvironment: launchEnv })
   const result = await checkRouteCredential(ctx, undefined, 'opencode-go')
   assert.equal(result.ok, false)
   assert.equal(result.ref, 'OPENCODE_GO_API_KEY')
@@ -344,7 +322,7 @@ await checkAsync('syncSettings flow (stub): gate skip → fetch spy 0 calls, mut
   assert.equal(reportLine, 'opencode-go: skipped — credential OPENCODE_GO_API_KEY not configured')
 })
 
-await checkAsync('syncSettings flow (stub): gate pass → seam consulted, via=credentials', async () => {
+await checkAsync('gate result: pass → seam consulted, via=credentials', async () => {
   const credentials = makeCredentialsSpy({ configuredMap: { MINIMAX_CN_API_KEY: true } })
   const launchEnv = makeLaunchEnv() // env empty
   const ctx = makeCtx({ credentials, launchEnvironment: launchEnv })
