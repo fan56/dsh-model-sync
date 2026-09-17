@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Logged-out routes no longer sync models into settings.yaml.** Auto-sync used to write `settings.models` for every route the auto-refresh timer picked up, so when the host's `/logout` removed a stored credential and then the timer (or the next interval) ran, the round would happily re-write the freshly-unconfigured provider's `models` field — pulling a stale model list back into `settings.yaml` and effectively reviving the profile the user just logged out of. The settings-mode sync now runs a per-route login gate before any fetch: it mirrors llm-pi-ai's own `resolveApiKey` (and the dsh web Models page at `packages/client/ui-settings-models/src/client/store.ts:111-113`) to derive the conventional credential reference for the route — `profile.apiKeyEnv ?? deriveKeyRef(route)` — and consults two layers: the credentials seam's `describe(ref).configured` (user-stored values from `/login`) first, then the launch-environment snapshot's `get(ref).value` (`.env` / inherited process env) as a fallback for shell users who `export OPENCODE_API_KEY=…` without going through the UI. A hit on either layer is enough to mark the route logged in; only when both miss do we skip fetch, translate, and `settings.mutate` entirely, and emit one report line naming the missing reference (`<route>: skipped — credential <REF> not configured`). The new gate introduces two optional peers (`@deepseek-ai/dsh-credentials`, `@deepseek-ai/dsh-launch-environment`) — both `peerDependencies` with `optional: true`, and both dev-pinned to the current 0.1.5-rc.2 closure; hosts that do not expose either still fall through to a clean miss instead of crashing the round.
+
 ## [0.4.1] - 2026-09-15
 
 ### Fixed
