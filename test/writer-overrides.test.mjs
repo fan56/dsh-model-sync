@@ -608,11 +608,25 @@ await checkAsync('e2e: settings mode round reports the fold+unset, persists the 
         },
       },
     })
+    // Login gate: provide a credentials seam that always reports the test
+    // routes as configured, so the gate in syncSettings passes and the
+    // settings-mode pipeline runs end-to-end. The real dsh host fills this
+    // from /login + launch-environment; here we only need the gate to admit
+    // the test routes. Mirrors route-credential.ts's CredentialsSeam surface.
+    const credentialsService = {
+      async describe() {
+        return { configured: true }
+      },
+    }
     const state = { provided: [], effectDisposers: [] }
     const scope = { get: () => config, watch: () => {} }
     const ctx = {
       settings: { register: () => scope },
-      get: (name) => (name === 'settings' ? settingsService : undefined),
+      get: (name) => {
+        if (name === 'settings') return settingsService
+        if (name === 'credentials') return credentialsService
+        return undefined
+      },
       logger: { info() {}, warn() {}, debug() {} },
       effect(fn) {
         const disposer = fn()
