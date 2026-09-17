@@ -2,11 +2,12 @@
 // reference is not configured, so a logged-out profile never silently gets
 // its `models` rewritten by the sync.
 //
-// The two checks (credentials seam `describe()` vs launch-environment `get`)
-// mirror the order llm-pi-ai's own `resolveApiKey` consults them — the seam
-// first (which holds user-stored values from `/login`), the launcher snapshot
-// second (which holds `.env` and inherited process env). A hit on either
-// means the route is logged in; only when BOTH miss do we skip the route.
+// Layer 1 follows llm-pi-ai's `resolveApiKey`: prefer the credentials seam.
+// Layer 2 follows the same package's `authContextFrom(ctx).env()` semantics:
+// consult the launch environment, or process.env when that service is absent.
+// A hit on either allows sync; only when BOTH miss do we skip the route.
+// Known gap: after credential removal, a same-name shell export still allows
+// writes, but requests with the seam present still fail with MISSING_CREDENTIAL.
 //
 // deriveKeyRef replicates the dsh web UI's same helper at
 // packages/client/ui-settings-models/src/client/store.ts:111-113 (uppercase +
@@ -39,8 +40,8 @@ export interface CredentialsSeam {
 
 /**
  * The launch-environment snapshot surface (`@deepseek-ai/dsh-launch-environment`).
- * Hosts that did not boot through the dsh launcher still expose a snapshot —
- * the helper falls back to `process.env` internally.
+ * Cordis `ctx.get` returns undefined for an unregistered service; it does not
+ * synthesize a snapshot. This module supplies the `process.env` fallback.
  */
 export interface LaunchEnvironmentSnapshot {
   get(name: string): { value: string } | undefined
@@ -131,17 +132,17 @@ export function getRawUserApiKeyEnv(
  * Run the per-route credential gate. Returns `{ ok, ref, via? }` where `ok`
  * is true iff either source confirms the route is configured.
  *
- * Resolution order (mirrors llm-pi-ai's `resolveApiKey`):
+ * Resolution layers (not an exact request-time credential resolver):
  * 1. `credentials.describe(ref).configured === true` when the seam is
  *    provided AND the ref is a valid `CredentialRef` (POSIX identifier).
  *    The strict pattern check matters: a profile removed during logout leaves
  *    no `apiKeyEnv`, so we always derive; and a stray ref that does not match
  *    the brand grammar (e.g. the seam `resolve` would throw) must read as
  *    "not configured" rather than crash the round.
- * 2. `launchEnvironment.get(ref).value` returns a non-empty string. The
- *    launch-environment helper synthesizes a `process.env` snapshot when no
- *    seam is provided, so this works on every host that exports the variable
- *    in its shell — even without `dsh-credentials` and without a launcher.
+ * 2. `launchEnvironment.get(ref).value` returns a non-empty string, following
+ *    llm-pi-ai's `authContextFrom(ctx).env()` semantics. Like
+ *    `launchEnvironmentOf`, we synthesize a `process.env` snapshot when the
+ *    launch-environment service is absent, even without a launcher.
  *
  * Both misses → `ok: false`. The gate then skips fetch / translate /
  * `settings.mutate` for the route and emits a report line naming the ref.
@@ -171,7 +172,7 @@ export async function checkRouteCredential(
   //    @deepseek-ai/dsh-credentials keeps the gate quiet on malformed input.
   const REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
   if (REF_PATTERN.test(ref)) {
-    const credentials = ctx.get('credentials') as CredentialsSeam | undefined
+    const credentials = ctx.get('credentials')
     if (credentials !== undefined) {
       try {
         const info = await credentials.describe(ref)
@@ -185,23 +186,19 @@ export async function checkRouteCredential(
     }
   }
 
-  // 3. Launch-environment fallback. The helper never returns undefined for
-  //    the seam itself — `launchEnvironmentOf` synthesizes a process-env
-  //    snapshot when the host did not provide one — so we can rely on a
-  //    plain `ctx.get('launchEnvironment')` lookup with the same fall-through
-  //    semantics. An entry whose value is empty (the launcher treats empty
-  //    strings as absent for its own consumers) does NOT count as configured.
-  let snapshot: LaunchEnvironmentSnapshot | undefined
-  try {
-    snapshot = ctx.get('launchEnvironment') as LaunchEnvironmentSnapshot | undefined
-  } catch {
-    snapshot = undefined
+  // 3. Cordis `ctx.get` returns undefined for absent services, without throwing
+  //    or falling through to process.env. Reproduce `launchEnvironmentOf`'s
+  //    fallback locally, without importing the optional peer. A provided
+  //    snapshot remains authoritative; empty values do not count as configured.
+  const snapshot = ctx.get('launchEnvironment') ?? {
+    get(name: string) {
+      const value = process.env[name]
+      return value !== undefined && value !== '' ? { value, source: 'process' } : undefined
+    },
   }
-  if (snapshot !== undefined) {
-    const entry = snapshot.get(ref)
-    if (entry !== undefined && typeof entry.value === 'string' && entry.value.length > 0) {
-      return { ok: true, ref, via: 'env' }
-    }
+  const entry = snapshot.get(ref)
+  if (entry !== undefined && typeof entry.value === 'string' && entry.value.length > 0) {
+    return { ok: true, ref, via: 'env' }
   }
 
   return { ok: false, ref }

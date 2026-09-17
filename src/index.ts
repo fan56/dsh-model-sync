@@ -44,7 +44,7 @@ import {
 } from './writer.ts'
 import { BUILTIN_CATALOG_SNAPSHOT } from './builtin-catalog-snapshot.ts'
 import { refreshLiveCatalog, getLiveBuiltinCatalogForRoute } from './live-catalog.ts'
-import { checkRouteCredential } from './route-credential.ts'
+import { checkRouteCredential, type RouteCredentialContext } from './route-credential.ts'
 
 export const name = 'dsh-model-sync'
 
@@ -223,27 +223,17 @@ export function apply(ctx: Context): void {
       ? config.managedRoutes
       : DEFAULT_ROUTES
 
+    const gateDesc = settings?.describe().find((d) => d.ns === 'llm-pi-ai')
+    const gateCtx = ctx as RouteCredentialContext
     for (const route of routes) {
-      // Login gate: a logged-out route must not be silently synced into
-      // settings.models. Mirrors llm-pi-ai's own resolveApiKey — the
-      // credentials seam (user-stored values from /login) wins; the launch
-      // environment (process env / .env) is the fallback for shell users
-      // who `export OPENCODE_API_KEY=…` without going through the UI. Both
-      // miss → skip the route entirely: no fetch, no translate, no
-      // settings.mutate, just one report line naming the missing ref.
-      // The deriveKeyRef fallback (see route-credential.ts) replicates the
-      // web UI's same helper, so a value the UI wrote resolves through the
-      // same name here.
-      let gateDesc: SettingsDescriptor | undefined
-      if (settings !== undefined) {
-        const descs = settings.describe()
-        gateDesc = descs.find((d) => d.ns === 'llm-pi-ai')
-      }
-      const gate = await checkRouteCredential(
-        ctx as unknown as Parameters<typeof checkRouteCredential>[0],
-        gateDesc,
-        route,
-      )
+      // Layer 1 follows llm-pi-ai's resolveApiKey: prefer the credentials seam.
+      // Layer 2 follows its authContextFrom(ctx).env(): launch environment,
+      // or process.env when the service is absent. Both miss → skip fetch,
+      // translate and settings.mutate, naming the missing ref in the report.
+      // deriveKeyRef replicates the web UI's conventional reference name.
+      // Known gap: after credential removal, a same-name shell export allows
+      // writes, but requests with the seam present still get MISSING_CREDENTIAL.
+      const gate = await checkRouteCredential(gateCtx, gateDesc, route)
       if (!gate.ok) {
         lines.push(`${route}: skipped — credential ${gate.ref} not configured`)
         continue
