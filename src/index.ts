@@ -44,6 +44,7 @@ import {
 } from './writer.ts'
 import { BUILTIN_CATALOG_SNAPSHOT } from './builtin-catalog-snapshot.ts'
 import { refreshLiveCatalog, getLiveBuiltinCatalogForRoute } from './live-catalog.ts'
+import { checkRouteCredential } from './route-credential.ts'
 
 export const name = 'dsh-model-sync'
 
@@ -132,6 +133,11 @@ const DEFAULT_ROUTES = [
   'xiaomi-token-plan-cn',
 ]
 
+/** Default route list — exported for tests that need to iterate the same set
+ *  the plugin syncs when `managedRoutes` is empty. Not part of the public
+ *  runtime surface; subject to change without notice. */
+export const DEFAULT_ROUTES_LIST = DEFAULT_ROUTES
+
 export function apply(ctx: Context): void {
   const scope = ctx.settings.register(OWN_NS, ModelSyncConfig)
 
@@ -218,6 +224,31 @@ export function apply(ctx: Context): void {
       : DEFAULT_ROUTES
 
     for (const route of routes) {
+      // Login gate: a logged-out route must not be silently synced into
+      // settings.models. Mirrors llm-pi-ai's own resolveApiKey — the
+      // credentials seam (user-stored values from /login) wins; the launch
+      // environment (process env / .env) is the fallback for shell users
+      // who `export OPENCODE_API_KEY=…` without going through the UI. Both
+      // miss → skip the route entirely: no fetch, no translate, no
+      // settings.mutate, just one report line naming the missing ref.
+      // The deriveKeyRef fallback (see route-credential.ts) replicates the
+      // web UI's same helper, so a value the UI wrote resolves through the
+      // same name here.
+      let gateDesc: SettingsDescriptor | undefined
+      if (settings !== undefined) {
+        const descs = settings.describe()
+        gateDesc = descs.find((d) => d.ns === 'llm-pi-ai')
+      }
+      const gate = await checkRouteCredential(
+        ctx as unknown as Parameters<typeof checkRouteCredential>[0],
+        gateDesc,
+        route,
+      )
+      if (!gate.ok) {
+        lines.push(`${route}: skipped — credential ${gate.ref} not configured`)
+        continue
+      }
+
       // Fetch from pi.dev — pass force to bypass revalidation throttle (I-5)
       const result = await fetchRemoteCatalog(route, config.refreshTimeoutMs, store, { force })
 
