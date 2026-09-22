@@ -17,10 +17,14 @@
 // tripwire that fails if cordis ever stops enforcing the gate.
 
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import commandsPlugin from '@deepseek-ai/dsh-commands'
 import * as plugin from '../lib/index.js'
 import { DEFAULT_ROUTES_LIST } from '../lib/index.js'
+import { resetModelsStoreCache } from '../lib/remote-catalog.js'
 
 let failed = 0
 let passed = 0
@@ -265,6 +269,145 @@ await checkAsync('seam says configured=false → skipped report for every route,
   } finally {
     await fiber.dispose()
     globalThis.fetch = originalFetch
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Settings mode, provider-native union: a mapped route with a resolvable
+// credential folds its first-party /models listing into the write — additions
+// only, and the native endpoint sees the resolved key. The models store is
+// isolated under a throwaway HOME (fetchRemoteCatalog persists through the
+// default-path singleton; a real HOME would be polluted).
+// ---------------------------------------------------------------------------
+
+/** The round's fetch double: pi.dev serves 2 glm entries, the first-party
+ *  listing 3 ids (one pi.dev does not know). */
+function makeUnionRoundFetch(log) {
+  return async (url, init) => {
+    const u = String(url)
+    log.push({ url: u, headers: init?.headers ?? {} })
+    if (u === 'https://pi.dev/api/models/providers/zai-coding-cn') {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        json: async () => [
+          { id: 'glm-5.3', name: 'GLM 5.3', api: 'openai-completions', provider: 'zai-coding-cn', baseUrl: 'https://open.bigmodel.cn/api/coding/paas/v4', reasoning: true, input: ['text'] },
+          { id: 'glm-5.2', name: 'GLM 5.2', api: 'openai-completions', provider: 'zai-coding-cn', baseUrl: 'https://open.bigmodel.cn/api/coding/paas/v4', reasoning: true, input: ['text'] },
+        ],
+      }
+    }
+    if (u === 'https://open.bigmodel.cn/api/coding/paas/v4/models') {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        json: async () => ({ object: 'list', data: [{ id: 'glm-5.3' }, { id: 'glm-5.2' }, { id: 'glm-5.3-flashx' }] }),
+      }
+    }
+    throw new Error(`unexpected fetch ${u}`)
+  }
+}
+
+await checkAsync('settings mode: provider-native union adds the first-party listing (default on)', async () => {
+  const root = new Context()
+  const settingsSpy = makeSpySettingsService({
+    writeMode: 'settings',
+    startupDelaySeconds: 3600,
+    managedRoutes: ['zai-coding-cn'],
+    keepBuiltinOnly: false,
+    providerNativeFetch: true,
+  })
+  settingsSpy.mutate = async function (ns, ops) {
+    this.mutations += 1
+    this.lastOps = ops
+  }
+  root.provide('settings', settingsSpy)
+  root.provide('credentials', {
+    async describe() {
+      return { configured: true }
+    },
+    async resolve(ref) {
+      return ref === 'ZAI_CODING_CN_API_KEY' ? { value: 'native-key' } : undefined
+    },
+  })
+  root.provide('launchEnvironment', { get: () => undefined })
+
+  const originalFetch = globalThis.fetch
+  const fetchLog = []
+  globalThis.fetch = makeUnionRoundFetch(fetchLog)
+  const realHome = process.env.HOME
+  const scratchHome = mkdtempSync(join(tmpdir(), 'model-sync-native-'))
+  process.env.HOME = scratchHome
+  resetModelsStoreCache()
+  const fiber = root.plugin(plugin)
+  try {
+    await fiber
+    const report = await root.get('modelSync').syncNow()
+    assert.match(report, /provider-native added glm-5\.3-flashx/, `report: ${report}`)
+    assert.equal(settingsSpy.mutations, 1, 'one write for the round')
+    const ops = JSON.stringify(settingsSpy.lastOps)
+    assert.match(ops, /glm-5\.3-flashx/, 'the native-only id reaches the write')
+    assert.match(ops, /glm-5\.2/, 'the pi.dev id survives the union')
+    const nativeCall = fetchLog.find((c) => c.url.includes('open.bigmodel.cn/api/coding/paas/v4/models'))
+    assert.ok(nativeCall !== undefined, 'the first-party endpoint was hit')
+    assert.equal(nativeCall.headers.authorization, 'Bearer native-key', 'resolved key on the native request')
+  } finally {
+    await fiber.dispose()
+    globalThis.fetch = originalFetch
+    process.env.HOME = realHome
+    resetModelsStoreCache()
+    rmSync(scratchHome, { recursive: true, force: true })
+  }
+})
+
+await checkAsync('settings mode: providerNativeFetch=false keeps the old pi.dev-only round', async () => {
+  const root = new Context()
+  const settingsSpy = makeSpySettingsService({
+    writeMode: 'settings',
+    startupDelaySeconds: 3600,
+    managedRoutes: ['zai-coding-cn'],
+    keepBuiltinOnly: false,
+    providerNativeFetch: false,
+  })
+  settingsSpy.mutate = async function (ns, ops) {
+    this.mutations += 1
+    this.lastOps = ops
+  }
+  root.provide('settings', settingsSpy)
+  root.provide('credentials', {
+    async describe() {
+      return { configured: true }
+    },
+    async resolve() {
+      return { value: 'native-key' }
+    },
+  })
+  root.provide('launchEnvironment', { get: () => undefined })
+
+  const originalFetch = globalThis.fetch
+  const fetchLog = []
+  globalThis.fetch = makeUnionRoundFetch(fetchLog)
+  const realHome = process.env.HOME
+  const scratchHome = mkdtempSync(join(tmpdir(), 'model-sync-native-'))
+  process.env.HOME = scratchHome
+  resetModelsStoreCache()
+  const fiber = root.plugin(plugin)
+  try {
+    await fiber
+    const report = await root.get('modelSync').syncNow()
+    assert.doesNotMatch(report, /provider-native/, `report: ${report}`)
+    assert.equal(settingsSpy.mutations, 1)
+    const ops = JSON.stringify(settingsSpy.lastOps)
+    assert.doesNotMatch(ops, /flashx/, 'native-only id must not appear')
+    assert.match(ops, /glm-5\.3/, 'pi.dev ids still written')
+    assert.ok(fetchLog.every((c) => c.url.startsWith('https://pi.dev/')), 'only pi.dev was fetched')
+  } finally {
+    await fiber.dispose()
+    globalThis.fetch = originalFetch
+    process.env.HOME = realHome
+    resetModelsStoreCache()
+    rmSync(scratchHome, { recursive: true, force: true })
   }
 })
 

@@ -37,6 +37,7 @@ Model lists drift: providers ship new models, retire old ones, and adjust capabi
   - `keepBuiltinOnly: true` — keep built-in catalog models that are not (yet) on pi.dev, so adopting the sync doesn't delete models you already use.
   - `dropUnserviceable: true` — drop unserviceable entries and continue; set to `false` to abort the whole route instead of writing a partial list.
   - `forceMaxReasoningEffort` — force models with a non-empty `thinkingFormat` to max reasoning effort (ensures `reasoningEfforts` contains `max` and forces `compat.supportsReasoningEffort = true` on `openai-completions`).
+- **First-party listings, unioned in (`providerNativeFetch`, default on).** pi.dev lags the providers, so every mapped route also fetches the provider's own OpenAI-shaped `GET /models` listing and unions it in: DeepSeek, Moonshot/Kimi (`moonshotai`, `moonshotai-cn`, `kimi-coding`), Zhipu (`zai`, `zai-coding-cn`), and Xiaomi MiMo (`xiaomi`, `xiaomi-token-plan-cn/ams/sgp`; `api-key` header auth). The merge is additions-only — ids pi.dev already carries keep pi.dev's metadata, listing-only ids enter as minimal entries. Unknown capacities are simply not written (`contextWindow` only when the listing states one, e.g. Moonshot's `context_length`; `maxTokens` never), so the route's `defaultContextWindow` / `defaultMaxTokens` apply. A failed listing fetch degrades to the pi.dev result and never loses models; `providerNativeFetch: false` restores the pi.dev-only behavior.
 - **Conflict-safe writes.** Writes carry the settings revision and retry once on `SETTINGS_CONFLICT` (`writer.ts`).
 
 ## Install
@@ -79,6 +80,7 @@ Configure the plugin under the `model-sync` namespace in `settings.yaml` — eve
 | `dropUnserviceable` | `true` | Drop unserviceable entries; `false` aborts the route instead |
 | `syncNotify` | `false` | Notify on changes (logger + `/model-sync` report) |
 | `forceMaxReasoningEffort` | `false` | Force max reasoning effort on models with a non-empty `thinkingFormat` |
+| `providerNativeFetch` | `true` | Union each mapped provider's first-party `/models` listing into the pi.dev result (additions only) |
 
 Example:
 

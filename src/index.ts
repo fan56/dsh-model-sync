@@ -45,6 +45,13 @@ import {
 import { BUILTIN_CATALOG_SNAPSHOT } from './builtin-catalog-snapshot.ts'
 import { refreshLiveCatalog, getLiveBuiltinCatalogForRoute } from './live-catalog.ts'
 import { checkRouteCredential, type RouteCredentialContext } from './route-credential.ts'
+import {
+  PROVIDER_NATIVE_ENDPOINTS,
+  fetchProviderNativeModels,
+  mergeProviderNativeEntries,
+  resolveRouteCredentialValue,
+  type NativeCredentialContext,
+} from './provider-native.ts'
 
 export const name = 'dsh-model-sync'
 
@@ -77,6 +84,12 @@ const ModelSyncConfig = z.object({
   keepBuiltinOnly: z.boolean().default(true),
   /** Drop unserviceable entries (true) or abort the entire route (false). */
   dropUnserviceable: z.boolean().default(true),
+  /**
+   * Union each mapped route's first-party /models listing into the pi.dev
+   * result (additions only — see provider-native.ts). Default on: the native
+   * listing is the fresher source; pi.dev lags (measured 2026-09-22).
+   */
+  providerNativeFetch: z.boolean().default(true),
   /** Notify on changes (logger + /model-sync report). */
   syncNotify: z.boolean().default(false),
   /**
@@ -99,6 +112,7 @@ interface ModelSyncConfigValue {
   dropUnserviceable: boolean
   syncNotify: boolean
   forceMaxReasoningEffort: boolean
+  providerNativeFetch: boolean
 }
 
 /** The llm seam as this plugin needs it (overlay mode). */
@@ -265,13 +279,55 @@ export function apply(ctx: Context): void {
       // base-matching classification. In a real deployment, this would come
       // from the built-in snapshot file.
       const builtinData = getBuiltinCatalogForRoute(route)
+
+      // Provider-native union: fold the route's first-party /models listing
+      // (the fresher source — pi.dev lags; measured 2026-09-22) into the
+      // pi.dev result. Additions only, capacities only where the listing
+      // states them; any failure degrades to the pi.dev list unchanged so a
+      // native hiccup can never lose models.
+      let entries = result.entries
+      if (config.providerNativeFetch && PROVIDER_NATIVE_ENDPOINTS[route] !== undefined) {
+        const apiKey = await resolveRouteCredentialValue(
+          ctx as unknown as NativeCredentialContext,
+          gateDesc,
+          route,
+        )
+        if (apiKey === undefined) {
+          lines.push(`${route}: provider-native skipped — credential value unavailable`)
+        } else {
+          const native = await fetchProviderNativeModels(route, apiKey, config.refreshTimeoutMs)
+          if (native.ok) {
+            // Base-less synthesis needs the route's one addressable api;
+            // unknown or mixed-protocol routes skip synthesis wholesale.
+            const routeApis = [...new Set(builtinData.map((b) => b.api))]
+            const merged = mergeProviderNativeEntries(
+              entries,
+              native,
+              route,
+              routeApis.length === 1 ? routeApis[0] : undefined,
+            )
+            entries = merged.entries
+            if (merged.addedIds.length > 0) {
+              lines.push(
+                `${route}: provider-native added ${merged.addedIds.join(', ')} (${native.ids.length} ids from first-party listing)`,
+              )
+            }
+            if (merged.skippedReason !== undefined) {
+              lines.push(`${route}: provider-native ${merged.skippedReason}`)
+            }
+          } else {
+            lines.push(`${route}: provider-native ${native.error} — pi.dev list only`)
+          }
+        }
+      }
+
       const builtinIds = new Set(builtinData.map((b) => b.id))
       const builtinOnlyEntries = config.keepBuiltinOnly
-        ? getBuiltinOnlyEntries(route, result.entries, builtinIds)
+        ? getBuiltinOnlyEntries(route, entries, builtinIds)
         : undefined
 
       const translated = translateEntries(
-        result.entries,
+        entries,
         builtinIds,
         builtinData,
         route,

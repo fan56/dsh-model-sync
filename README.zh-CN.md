@@ -37,6 +37,7 @@ https://github.com/user-attachments/assets/c3f9c8b1-ea5e-470c-b8a8-60a81fc5c20a
   - `keepBuiltinOnly: true`——保留内置目录里有、但 pi.dev 上（还）没有的模型，启用同步不会删掉你正在用的模型。
   - `dropUnserviceable: true`——丢弃不可服务的条目并继续；设为 `false` 则改为中止整条路由，而不是写入残缺列表。
   - `forceMaxReasoningEffort`——强制所有 `thinkingFormat` 非空的模型使用 max reasoning effort（确保 `reasoningEfforts` 包含 `max`，并在 `openai-completions` 上强制 `compat.supportsReasoningEffort = true`）。
+- **厂商原生列表并入（`providerNativeFetch`，默认开）。** pi.dev 的目录滞后于厂商，所以每轮同步还会拉取映射路由的厂商自家 OpenAI 形状 `GET /models` 列表并做并集：DeepSeek、Moonshot/Kimi（`moonshotai`、`moonshotai-cn`、`kimi-coding`）、智谱（`zai`、`zai-coding-cn`）、小米 MiMo（`xiaomi`、`xiaomi-token-plan-cn/ams/sgp`，用 `api-key` 请求头认证）。合并只增不减——pi.dev 已有的 id 保留其元数据，仅厂商列表独有的 id 以最小条目进入。未知的容量参数一律不写（`contextWindow` 仅当列表自带，如 Moonshot 的 `context_length`；`maxTokens` 从不写），落到路由的 `defaultContextWindow` / `defaultMaxTokens` 兜底。拉取失败降级为纯 pi.dev 结果、绝不丢模型；`providerNativeFetch: false` 恢复旧行为。
 - **冲突安全写入。** 写入携带 settings revision，遇 `SETTINGS_CONFLICT` 自动重试一次（`writer.ts`）。
 
 ## 安装
@@ -79,6 +80,7 @@ dsh plugin remove @aiwayds/dsh-model-sync
 | `dropUnserviceable` | `true` | 丢弃不可服务的条目；`false` 改为中止整条路由 |
 | `syncNotify` | `false` | 有变更时通知（logger + `/model-sync` 报告） |
 | `forceMaxReasoningEffort` | `false` | 对 `thinkingFormat` 非空的模型强制 max reasoning effort |
+| `providerNativeFetch` | `true` | 把各厂商自家的 `/models` 列表并入 pi.dev 结果（只增不减） |
 
 示例：
 
