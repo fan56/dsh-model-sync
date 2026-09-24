@@ -31,7 +31,8 @@
  *   stored ones (a re-added key is the user's latest intent).
  * - Revision conflict retry: catch SETTINGS_CONFLICT, re-read, re-translate,
  *   re-write once
- * - Never touches ~/.dsh/settings.yaml directly — only through settings.mutate
+ * - Never touches the settings document directly (settings.yaml up to
+ *   dsh 0.1.6, the profile patch on 0.1.7+) — only through settings.mutate
  * - Store read failure: when the models-store read fails (corrupt JSON,
  *   EACCES, …) AND settings carries no overrides key, skip the round with
  *   reason 'store-unavailable' and leave settings.models untouched — the

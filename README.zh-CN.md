@@ -4,9 +4,9 @@
 
 [![npm version](https://img.shields.io/npm/v/@aiwayds/dsh-model-sync)](https://www.npmjs.com/package/@aiwayds/dsh-model-sync) · [GitHub](https://github.com/fan56/dsh-model-sync)
 
-一个 dsh（DeepSeek Harness）Cordis 插件：把 `llm-pi-ai` 各 provider 路由的模型目录与 pi.dev 网关的模型列表保持同步，并通过官方 settings 接缝（`settings.mutate`）写进 dsh 的 `settings.yaml`——对 dsh 内部零补丁。
+一个 dsh（DeepSeek Harness）Cordis 插件：把 `llm-pi-ai` 各 provider 路由的模型目录与 pi.dev 网关的模型列表保持同步——经官方 settings 接缝（`settings.mutate`）写入，对 dsh 内部零补丁。
 
-**要求 dsh >= 0.1.5-rc.2** — 本插件只跟随 dsh RC/stable 线（CI 与发版在运行时解析 latest/next 中更新的 dist-tag）。**不再支持 alpha 线。**
+**要求 dsh >= 0.1.7-rc.1** — 本插件只跟随 dsh RC/stable 线（CI 与发版在运行时解析 latest/next 中更新的 dist-tag）。**不再支持 alpha 线。** dsh 0.1.7 起 settings 文档是 profile patch（旧 settings.yaml 导入一次后改名）；本插件始终只经官方 API 写入，两种形态下行为一致。
 
 https://github.com/user-attachments/assets/c3f9c8b1-ea5e-470c-b8a8-60a81fc5c20a
 
@@ -17,7 +17,7 @@ https://github.com/user-attachments/assets/c3f9c8b1-ea5e-470c-b8a8-60a81fc5c20a
 模型列表会漂移：provider 不断上架新模型、下线旧模型、调整能力字段（`contextWindow`、`input` 模态、`thinkingFormat`、reasoning efforts）。靠手工跟进既枯燥又容易出错，dsh-model-sync 替你做完这一切：
 
 - **只增只改的写入。** pi.dev 上的新模型被合并进来，已有模型按需更新，没有变化的路由完全不动——writer 会先和 settings 里的原始 user 段做比较，无变化即跳过（`writer.ts`、`profilesEqual`、`reason: 'no-change'`）。
-- **不再手工维护模型表。** 对受管路由而言，pi.dev remote catalog 就是唯一事实来源，你的 `settings.yaml` 只是它的投影。
+- **不再手工维护模型表。** 对受管路由而言，pi.dev remote catalog 就是唯一事实来源，你的 settings（`llm-pi-ai` provider 配置）只是它的投影。
 - **定时刷新。** 启动后不久自动跑一轮，之后按可配置的周期持续刷新，目录无需任何手动操作即可保持最新。
 
 ## 特性
@@ -25,7 +25,7 @@ https://github.com/user-attachments/assets/c3f9c8b1-ea5e-470c-b8a8-60a81fc5c20a
 - **pi.dev 网关同步。** 从 `https://pi.dev/api/models/providers/<route>` 拉取每条受管路由的模型列表，带 ETag/304 revalidation，并在 `~/.dsh/models-store.json` 维护按 provider 持久化的缓存（`remote-catalog.ts`）。瞬时故障与中断保留上次成功的缓存（last-good）；404/501 视为该路由本轮不存在。
 - **默认路由。** `managedRoutes` 为空时，同步以下 pi.dev 路由：`opencode-go`、`zai-coding-cn`、`minimax-cn`、`xiaomi-token-plan-cn`（`src/index.ts` 的 `DEFAULT_ROUTES`）。
 - **两种写模式**（`writeMode`）：
-  - `settings`（默认）——零补丁流水线：fetch → translate → `settings.mutate`。自包含，从不直接改写 `settings.yaml`，只经官方 settings API 落盘。
+  - `settings`（默认）——零补丁流水线：fetch → translate → `settings.mutate`。自包含，从不直接改写 settings 文档，只经官方 settings API 落盘。
   - `overlay`（旧方案）——委托打了补丁的 `dsh-llm-pi-ai` 适配器的 `piAiCatalog.refresh()`，把 pi.dev 条目合并进内存（需要可选补丁）。
 - **定时刷新。** `intervalMinutes` 周期轮（默认 240，即 4 小时）加 `startupDelaySeconds` 启动延迟（默认 5 秒）；每轮自动刷新输出的报告与手动刷新完全相同。`0` 表示关闭周期（仅启动时刷一次）。配置变更时周期会实时重新挂载（`src/index.ts`）。
 - **变更报告 / diff。** 每轮报告新增/移除的模型 id（`diffModelIds`）；`settings` 模式下还会对照当前原始 settings 报告新增/移除/变更的条目（`diffEntries`，`diff.ts`）。被丢弃（dropped）与降级（degraded）的条目连同原因一并报告。
@@ -49,7 +49,7 @@ npm i @aiwayds/dsh-model-sync
 dsh plugin add @aiwayds/dsh-model-sync
 ```
 
-包内附带 `cordis.patch.yml`（经 `dsh.bundle.patch` 接线），它把插件挂载进 profile 的装配树（稳定的插件 id `dsh-model-sync`），并注册 `model-sync` settings 命名空间。
+包内附带 `cordis.patch.yml`（经 `dsh.bundle.patch` 接线），它把插件挂载进 profile 的装配树（稳定的插件 id `dsh-model-sync`）——dsh 0.1.7 起该 entry id 即插件 `Config` schema 对应的 settings 命名空间。
 
 本插件独立分发——需要时用 `dsh plugin add @aiwayds/dsh-model-sync` 显式安装即可。
 
@@ -62,12 +62,12 @@ dsh plugin remove @aiwayds/dsh-model-sync
 宿主会自动清理：bundles 条目会从 profile 中摘除，插件自带的 patch 层随包一起消失，同步轮次与 `/model-sync` 命令就此停止。有三样东西会刻意留在磁盘上：
 
 1. **`~/.dsh/models-store.json`——清除前请先备份这个文件。** 它保存目录缓存**以及**你的 `modelOverrides`：在 store-first 不变式下，插件把覆盖值折叠进写入的 models 并清掉 settings 里的键，因此对受管路由而言 store 可能是覆盖值的**唯一**副本。删掉文件就等于删掉它们。
-2. **`~/.dsh/settings.yaml` 里已同步的模型列表。** 插件经官方 settings 接缝把它们写进了宿主持有的 `llm-pi-ai` 命名空间（`providers.<route>.models`）。卸载后它们会保留，并且仍是合法的宿主配置——dsh 会照常消费，就像你手写的一样。不想要就手动删除对应条目。
+2. **settings 文档里已同步的模型列表。** 插件经官方 settings 接缝把它们写进了宿主持有的 `llm-pi-ai` 命名空间（`providers.<route>.models`；dsh ≤0.1.6 在 `~/.dsh/settings.yaml`，0.1.7+ 在 profile patch）。卸载后它们会保留，并且仍是合法的宿主配置——dsh 会照常消费，就像你手写的一样。不想要就手动删除对应条目。
 3. **极少数情况下的残留暂存文件。** store 的写入走临时文件 + rename；若进程在写入中途死掉，可能留下 `~/.dsh/models-store.json.<pid>.tmp`。直接删除是安全的。
 
 ## 用法
 
-在 `settings.yaml` 的 `model-sync` 命名空间下配置本插件——每个键都是可选的：
+在 `dsh-model-sync` 设置条目下配置本插件——dsh 0.1.7+ 的 entry id（与 bundle patch 一直使用的稳定 id 相同）即 settings 命名空间，在设置 UI 或 profile patch 中编辑即可。每个键都是可选的，且全部是 volatile 字段，改动无需重启插件即可生效：
 
 | 键 | 默认值 | 说明 |
 |---|---|---|
@@ -81,11 +81,14 @@ dsh plugin remove @aiwayds/dsh-model-sync
 | `syncNotify` | `false` | 有变更时通知（logger + `/model-sync` 报告） |
 | `forceMaxReasoningEffort` | `false` | 对 `thinkingFormat` 非空的模型强制 max reasoning effort |
 | `providerNativeFetch` | `true` | 把各厂商自家的 `/models` 列表并入 pi.dev 结果（只增不减） |
+| `keepDeprecatedBuiltin` | `false` | 重新同步官方默认列表已移除的内置 id（dsh 0.1.7 移除了 `deepseek-v4-flash` / `deepseek-v4-flash-vision-exp`；快照保留数据但默认不再同步） |
 
 示例：
 
+示例（settings 段名 `dsh-model-sync`；dsh 0.1.7 不会自动导入旧 `settings.yaml` 里的 `model-sync:` 段——请把原值在新条目下重新声明一次）：
+
 ```yaml
-model-sync:
+dsh-model-sync:
   writeMode: settings
   intervalMinutes: 30
   managedRoutes:
@@ -127,7 +130,7 @@ npm test        # node --test（pretest 先构建）：diff / translate / writer
 
 `scripts/` 下的工具脚本：
 
-- `generate-builtin-snapshot.mjs`——从已安装的 `@deepseek-ai/dsh-llm-pi-ai` catalog 重新生成 `src/builtin-catalog-snapshot.ts`（`--generate` 用于开发，`--check` 用于 CI）。
+- `generate-builtin-snapshot.mjs`——从已安装的 `@deepseek-ai/dsh-llm-pi-ai` catalog 重新生成 `src/builtin-catalog-snapshot.ts`（`--generate` 用于开发，`--check` 用于 CI）。手工维护的 `deprecated: true` 标记（官方默认列表已移除的 id）在重新生成时按 id 保留。
 - `verify-no-patch.mjs`——若已安装的 `dsh-llm-pi-ai` 仍带有 overlay 补丁签名（`withRemoteCatalog` / `piAiCatalog`）则非零退出。
 - `backup/backup-patched.mjs`——把打过补丁的 `dsh-llm-pi-ai/lib/index.js` 备份到 `backups/`。
 - `backup/restore-official.mjs`——从 npm 恢复官方未打补丁的 `dsh-llm-pi-ai/lib/index.js`，并对照补丁校验（支持 `--dry-run`）。

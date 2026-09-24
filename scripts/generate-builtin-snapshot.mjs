@@ -144,9 +144,31 @@ async function parseExistingSnapshot() {
 }
 
 /**
+ * Carry the hand-maintained `deprecated: true` state from the existing
+ * snapshot, by route+id. The marks record ids the official default model
+ * list dropped (dsh 0.1.7: deepseek-v4-flash / deepseek-v4-flash-vision-exp)
+ * while keeping their data for historical user configurations. Returns both
+ * the marks for entries the installed catalog still lists AND the full
+ * entries for ids it no longer lists — a regeneration must not lose either.
+ */
+function inheritDeprecatedState(existing) {
+  const marks = new Map()   // "route\0id" -> true, for entries present in the installed catalog
+  const missing = new Map() // route -> [model], for entries the installed catalog dropped
+  for (const [route, models] of Object.entries(existing ?? {})) {
+    for (const model of models ?? []) {
+      if (model?.deprecated !== true) continue
+      marks.set(`${route}\u0000${model.id}`, true)
+      if (!missing.has(route)) missing.set(route, [])
+      missing.get(route).push({ ...model })
+    }
+  }
+  return { marks, missing }
+}
+
+/**
  * Generate the TypeScript snapshot file content.
  */
-function generateSnapshotContent(catalog) {
+function generateSnapshotContent(catalog, deprecatedMarks) {
   const lines = [
     '// Plan C (settings-seam): builtin catalog snapshot — single source of truth.',
     '',
@@ -158,6 +180,15 @@ function generateSnapshotContent(catalog) {
     ' * data used by index.ts, translate.test.mjs, and serviceability.test.mjs.',
     ' *',
     ' * To regenerate: run `node scripts/generate-builtin-snapshot.mjs --generate`',
+    ' *',
+    ' * Entries marked `deprecated: true` are ids the official default model list',
+    ' * dropped (dsh 0.1.7-rc.1 removed deepseek-v4-flash /',
+    ' * deepseek-v4-flash-vision-exp; DeepSeek renamed deepseek-v4-flash →',
+    ' * deepseek-flash on its own listing). The data is retained for historical',
+    ' * user configurations: keepBuiltinOnly emission skips deprecated ids',
+    ' * unless keepDeprecatedBuiltin opts back in. Marks and entries survive',
+    ' * regeneration — this script re-adds them even when the installed catalog',
+    ' * no longer lists the id.',
     ' *',
     ' * @module dsh-model-sync/builtin-catalog-snapshot',
     ' */',
@@ -185,7 +216,11 @@ function generateSnapshotContent(catalog) {
       const model = models[j]
       const isLastModel = j === models.length - 1
       const maxTokensStr = model.maxTokens !== undefined ? `, maxTokens: ${model.maxTokens}` : ''
-      lines.push(`    { id: '${model.id}', api: '${model.api}'${maxTokensStr} }${isLastModel ? '' : ','}`)
+      // `deprecated: true` is hand-maintained state (kept across generations
+      // via inheritDeprecatedMarks): the id left the official default model
+      // list but its data stays for historical user configurations.
+      const deprecatedStr = deprecatedMarks.get(`${route}\u0000${model.id}`) ? ', deprecated: true' : ''
+      lines.push(`    { id: '${model.id}', api: '${model.api}'${maxTokensStr}${deprecatedStr} }${isLastModel ? '' : ','}`)
     }
 
     lines.push(`  ]${isLast ? '' : ','}`)
@@ -289,11 +324,30 @@ async function main() {
 
   if (isGenerateMode) {
     console.log('Generating snapshot...')
-    const content = generateSnapshotContent(installed)
+    const existing = await parseExistingSnapshot().catch(() => undefined)
+    const { marks, missing } = inheritDeprecatedState(existing)
+    // Re-insert deprecated entries the installed catalog no longer lists, so
+    // the retained data survives a regeneration against a newer host.
+    for (const [route, models] of missing) {
+      const list = installed[route]
+      if (list === undefined) {
+        installed[route] = models
+        continue
+      }
+      const have = new Set(list.map((m) => m.id))
+      for (const model of models) {
+        if (!have.has(model.id)) list.push(model)
+      }
+      list.sort((a, b) => a.id.localeCompare(b.id))
+    }
+    const content = generateSnapshotContent(installed, marks)
     await writeFile(SNAPSHOT_PATH, content, 'utf8')
     console.log(`Wrote snapshot to ${SNAPSHOT_PATH}`)
     console.log('Routes:', Object.keys(installed).sort().join(', '))
     console.log('Total models:', Object.values(installed).reduce((sum, m) => sum + m.length, 0))
+    if (marks.size > 0) {
+      console.log(`Preserved deprecated entries: ${marks.size}`)
+    }
     process.exit(0)
   }
 }

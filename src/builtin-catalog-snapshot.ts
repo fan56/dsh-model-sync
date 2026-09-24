@@ -9,6 +9,15 @@
  *
  * To regenerate: run `node scripts/generate-builtin-snapshot.mjs --generate`
  *
+ * Entries marked `deprecated: true` are ids the official default model list
+ * dropped (dsh 0.1.7-rc.1 removed deepseek-v4-flash /
+ * deepseek-v4-flash-vision-exp; DeepSeek renamed deepseek-v4-flash →
+ * deepseek-flash on its own listing). The data is retained for historical
+ * user configurations: keepBuiltinOnly emission skips deprecated ids
+ * unless keepDeprecatedBuiltin opts back in. Marks and entries survive
+ * regeneration — this script re-adds them even when the installed catalog
+ * no longer lists the id.
+ *
  * @module dsh-model-sync/builtin-catalog-snapshot
  */
 
@@ -27,8 +36,8 @@ export const BUILTIN_CATALOG_SNAPSHOT: BuiltinCatalogSnapshotMap = {
     { id: 'MiniMax-M3', api: 'anthropic-messages', maxTokens: 512000 }
   ],
   'opencode-go': [
-    { id: 'deepseek-v4-flash', api: 'openai-completions', maxTokens: 384000 },
-    { id: 'deepseek-v4-flash-vision-exp', api: 'openai-completions', maxTokens: 384000 },
+    { id: 'deepseek-v4-flash', api: 'openai-completions', maxTokens: 384000, deprecated: true },
+    { id: 'deepseek-v4-flash-vision-exp', api: 'openai-completions', maxTokens: 384000, deprecated: true },
     { id: 'deepseek-v4-pro', api: 'openai-completions', maxTokens: 384000 },
     { id: 'glm-5.1', api: 'openai-completions', maxTokens: 32768 },
     { id: 'glm-5.2', api: 'openai-completions', maxTokens: 131072 },

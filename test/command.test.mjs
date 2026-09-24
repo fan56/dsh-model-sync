@@ -36,7 +36,7 @@ const checkAsync = async (name, fn) => {
   }
 }
 
-/** Config shaped like the resolved model-sync namespace (fast timers). */
+/** Config shaped like the resolved Config schema (fast timers). */
 const defaultConfig = {
   writeMode: 'overlay',
   intervalMinutes: 0,
@@ -47,32 +47,51 @@ const defaultConfig = {
   dropUnserviceable: true,
   syncNotify: false,
   forceMaxReasoningEffort: false,
+  providerNativeFetch: true,
+  keepDeprecatedBuiltin: false,
 }
 
 /**
- * Fake cordis context stubbing everything apply() touches: settings.register,
- * scope.watch, ctx.get/logger/provide, ctx.effect (runs the body eagerly and
- * collects the returned disposer, like cordis), ctx.inject (runs the sub-fiber
- * body immediately when every injected service exists, never when one is
- * missing — real cordis would also fire it if a missing service appears
- * later), and the optional commands registry.
+ * Wrap plain values in the volatile-reference shape the dsh 0.1.7 host
+ * delivers to apply(): every volatile Config field is a stable `{ get() }`
+ * reference the host swaps in place on edits.
+ */
+function asVolatileConfig(values) {
+  return Object.fromEntries(
+    Object.entries({ ...defaultConfig, ...values }).map(([key, value]) => [key, { get: () => value }]),
+  )
+}
+
+/**
+ * Fake cordis context stubbing everything apply() touches: the settings
+ * service stub (inject gating only — the plugin no longer calls register),
+ * the settings/document-updated subscription via ctx.on, ctx.get/logger/
+ * provide, ctx.effect (runs the body eagerly and collects the returned
+ * disposer, like cordis), ctx.inject (runs the sub-fiber body immediately
+ * when every injected service exists, never when one is missing — real
+ * cordis would also fire it if a missing service appears later), and the
+ * optional commands registry.
  */
 function createFakeContext({ config = defaultConfig, services = {}, get } = {}) {
   const state = {
     definitions: [], // command definitions passed to commands.register
     unregisterCalls: 0, // how often the registry disposer ran
-    effectDisposers: [], // disposers returned by ctx.effect bodies
+    effectDisposers: [], // disposers returned from ctx.effect bodies
     effectLabels: [],
     provided: [],
-  }
-  const scope = {
-    get: () => config,
-    watch: () => {},
+    eventListeners: [], // { event, listener } registered via ctx.on
   }
   const ctx = {
-    settings: { register: () => scope },
+    settings: { describe: () => [], mutate: async () => {} },
     get: get ?? ((name) => services[name]),
     logger: { info() {}, warn() {}, debug() {} },
+    on(event, listener) {
+      state.eventListeners.push({ event, listener })
+      return () => {
+        const index = state.eventListeners.findIndex((entry) => entry.event === event && entry.listener === listener)
+        if (index >= 0) state.eventListeners.splice(index, 1)
+      }
+    },
     effect(fn, label) {
       state.effectLabels.push(label)
       const disposer = fn()
@@ -95,7 +114,7 @@ function createFakeContext({ config = defaultConfig, services = {}, get } = {}) 
       },
     },
   }
-  return { ctx, state }
+  return { ctx, state, config: asVolatileConfig(config) }
 }
 
 /** Tear down everything apply() armed (timers, command registration). */
@@ -117,8 +136,8 @@ function fakeInvocation(rawInput = '') {
 // Registration
 // ---------------------------------------------------------------------------
 check('apply registers exactly one model-sync command definition', () => {
-  const { ctx, state } = createFakeContext()
-  apply(ctx)
+  const { ctx, state, config } = createFakeContext()
+  apply(ctx, config)
   assert.equal(state.definitions.length, 1, 'exactly one command definition')
   const definition = state.definitions[0]
   assert.equal(definition.name, 'model-sync')
@@ -126,12 +145,27 @@ check('apply registers exactly one model-sync command definition', () => {
     'description is a non-empty string')
   assert.equal(typeof definition.handler, 'function')
   assert.ok(state.effectLabels.includes('dsh-model-sync: /model-sync'), 'effect is labeled')
+  assert.ok(
+    state.eventListeners.some((entry) => entry.event === 'settings/document-updated'),
+    'the hot-reload event subscription is registered',
+  )
+  disposeAll(state)
+  assert.equal(state.eventListeners.length, 0, 'the event subscription disposes with the effect')
+})
+
+check('the settings/document-updated listener re-arms without throwing', () => {
+  const { ctx, state, config } = createFakeContext()
+  apply(ctx, config)
+  const entry = state.eventListeners.find((e) => e.event === 'settings/document-updated')
+  assert.ok(entry, 'listener registered')
+  assert.doesNotThrow(() => entry.listener('llm-pi-ai', 1), 'a foreign ns is ignored')
+  assert.doesNotThrow(() => entry.listener('dsh-model-sync', 2), 'the own ns re-arms the timers')
   disposeAll(state)
 })
 
 check('the effect disposer unregisters the command', () => {
-  const { ctx, state } = createFakeContext()
-  apply(ctx)
+  const { ctx, state, config } = createFakeContext()
+  apply(ctx, config)
   assert.equal(state.unregisterCalls, 0, 'not unregistered while plugin is live')
   disposeAll(state)
   assert.equal(state.unregisterCalls, 1, 'unregistered exactly once on dispose')
@@ -142,7 +176,7 @@ check('the effect disposer unregisters the command', () => {
 // ---------------------------------------------------------------------------
 await checkAsync('handler returns the syncNow report on success (empty rawInput)', async () => {
   // overlay mode with a patched catalog stub → one full round, deterministic report
-  const { ctx, state } = createFakeContext({
+  const { ctx, state, config } = createFakeContext({
     services: {
       llm: {
         listProviders: () => [{ id: 'route-a' }],
@@ -151,7 +185,7 @@ await checkAsync('handler returns the syncNow report on success (empty rawInput)
       piAiCatalog: { refresh: async () => new Map() },
     },
   })
-  apply(ctx)
+  apply(ctx, config)
   const result = await state.definitions[0].handler(fakeInvocation(''))
   assert.equal(result.kind, 'success')
   assert.ok(result.text.includes('route-a'), `report mentions the provider, got: ${result.text}`)
@@ -161,7 +195,7 @@ await checkAsync('handler returns the syncNow report on success (empty rawInput)
 })
 
 await checkAsync('handler notes the ignored argument when rawInput is non-empty', async () => {
-  const { ctx, state } = createFakeContext({
+  const { ctx, state, config } = createFakeContext({
     services: {
       llm: {
         listProviders: () => [{ id: 'route-a' }],
@@ -170,7 +204,7 @@ await checkAsync('handler notes the ignored argument when rawInput is non-empty'
       piAiCatalog: { refresh: async () => new Map() },
     },
   })
-  apply(ctx)
+  apply(ctx, config)
   const result = await state.definitions[0].handler(fakeInvocation(' route-a '))
   assert.equal(result.kind, 'success')
   assert.ok(result.text.includes('managedRoutes'), 'note names managedRoutes')
@@ -180,13 +214,13 @@ await checkAsync('handler notes the ignored argument when rawInput is non-empty'
 })
 
 await checkAsync('handler settles syncNow rejections as kind:error', async () => {
-  const { ctx, state } = createFakeContext({
+  const { ctx, state, config } = createFakeContext({
     get(name) {
       if (name === 'llm') throw new Error('llm service exploded')
       return undefined
     },
   })
-  apply(ctx)
+  apply(ctx, config)
   const result = await state.definitions[0].handler(fakeInvocation())
   assert.equal(result.kind, 'error')
   assert.ok(result.text.includes('llm service exploded'), `error text carries the message, got: ${result.text}`)
@@ -197,9 +231,9 @@ await checkAsync('handler settles syncNow rejections as kind:error', async () =>
 // Degraded host: no commands service
 // ---------------------------------------------------------------------------
 await checkAsync('apply without a commands service skips registration and keeps the modelSync service', async () => {
-  const { ctx, state } = createFakeContext()
+  const { ctx, state, config } = createFakeContext()
   delete ctx.commands
-  apply(ctx) // must not throw
+  apply(ctx, config) // must not throw
   assert.equal(state.definitions.length, 0, 'nothing registered')
   const provided = state.provided.find((entry) => entry.name === 'modelSync')
   assert.ok(provided, 'modelSync service still provided')

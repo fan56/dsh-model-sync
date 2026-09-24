@@ -62,7 +62,8 @@ export interface RouteCredentialContext {
 /**
  * The settings descriptor shape this module needs (matches writer.ts's
  * `SettingsDescriptor`). Only `user.providers.<route>.apiKeyEnv` is read —
- * the value the user explicitly declared in settings.yaml.
+ * the value the user explicitly declared in the llm-pi-ai provider profile
+ * (settings.yaml up to dsh 0.1.6, the profile patch on 0.1.7+).
  */
 export interface RouteCredentialSettingsDescriptor {
   user?: Record<string, unknown>

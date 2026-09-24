@@ -11,6 +11,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { translateEntries } from '../lib/translate.js'
 import { BUILTIN_CATALOG_SNAPSHOT } from '../lib/builtin-catalog-snapshot.js'
+import { getBuiltinOnlyEntries } from '../lib/index.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, 'fixtures')
@@ -822,6 +823,46 @@ check('capacity guard: base-matching entry keeps contextWindow sync, still strip
   assert.equal(entry.contextWindow, 300000, 'fresh contextWindow from the listing is the sync value-prop')
   assert.equal(entry.maxTokens, undefined, 'base-matching maxTokens still falls back to the installed catalog')
   assert.equal(result.warnings.length, 0)
+})
+
+// ---------------------------------------------------------------------------
+// 0.1.7 snapshot deprecation: retired ids kept as data, out of the emission
+// (official default list removed deepseek-v4-flash / deepseek-v4-flash-vision-exp)
+// ---------------------------------------------------------------------------
+check('deprecated 0.1.7: snapshot keeps the retired deepseek entries marked deprecated', () => {
+  const og = BUILTIN_CATALOG_SNAPSHOT['opencode-go']
+  const flash = og.find(m => m.id === 'deepseek-v4-flash')
+  const vision = og.find(m => m.id === 'deepseek-v4-flash-vision-exp')
+  assert.ok(flash, 'deepseek-v4-flash data is retained (no deletion)')
+  assert.ok(vision, 'deepseek-v4-flash-vision-exp data is retained (no deletion)')
+  assert.equal(flash.deprecated, true, 'deepseek-v4-flash is marked deprecated')
+  assert.equal(vision.deprecated, true, 'deepseek-v4-flash-vision-exp is marked deprecated')
+  assert.equal(flash.api, 'openai-completions', 'retained data keeps its api')
+  assert.equal(flash.maxTokens, 384000, 'retained data keeps its maxTokens')
+  // Everything else stays unmarked — the deprecation is per-id, not per-route.
+  assert.ok(og.filter(m => m.deprecated).every(m => m.id.startsWith('deepseek-v4-flash')),
+    'only the two retired ids carry the deprecated mark')
+})
+
+check('deprecated 0.1.7: keepBuiltinOnly emission skips retired ids unless opted in', () => {
+  const builtinData = BUILTIN_CATALOG_SNAPSHOT['opencode-go']
+  // Nothing on pi.dev → every non-deprecated builtin id is emission-eligible.
+  const byDefault = getBuiltinOnlyEntries('opencode-go', [], builtinData, false)
+  assert.ok(!byDefault.some(e => e.id === 'deepseek-v4-flash'),
+    'deepseek-v4-flash must not be re-emitted by default')
+  assert.ok(!byDefault.some(e => e.id === 'deepseek-v4-flash-vision-exp'),
+    'deepseek-v4-flash-vision-exp must not be re-emitted by default')
+  assert.ok(byDefault.some(e => e.id === 'deepseek-v4-pro'),
+    'non-deprecated ids still emit (deepseek-v4-pro)')
+
+  const optIn = getBuiltinOnlyEntries('opencode-go', [], builtinData, true)
+  assert.ok(optIn.some(e => e.id === 'deepseek-v4-flash'),
+    'keepDeprecatedBuiltin=true opts the retired id back in')
+
+  // An id pi.dev still lists is never duplicated by either path.
+  const withPiDev = getBuiltinOnlyEntries('opencode-go', [{ id: 'deepseek-v4-pro' }], builtinData, true)
+  assert.ok(!withPiDev.some(e => e.id === 'deepseek-v4-pro'), 'pi.dev ids are not re-emitted')
+  assert.ok(withPiDev.some(e => e.id === 'deepseek-v4-flash'), 'opt-in still applies alongside')
 })
 
 // ---------------------------------------------------------------------------

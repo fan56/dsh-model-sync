@@ -39,24 +39,24 @@ const checkAsync = async (name, fn) => {
   }
 }
 
-/** Idle config: no interval, one immediate (harmless) startup round. */
-const config = {
+/** Idle mount config: no interval, one immediate (harmless) startup round.
+ *  Partial on purpose — the plugin's Config schema resolves defaults for the
+ *  rest, exactly like the 0.1.7 loader does. */
+const mountConfig = (overrides = {}) => ({
   writeMode: 'overlay',
   intervalMinutes: 0,
   startupDelaySeconds: 0,
-  refreshTimeoutMs: 120000,
-  managedRoutes: [],
-  keepBuiltinOnly: true,
-  dropUnserviceable: true,
-  syncNotify: false,
-  forceMaxReasoningEffort: false,
-}
+  ...overrides,
+})
 
-/** A real cordis root with the `settings` seam provided, like dsh-base does. */
+/** A real cordis root with the `settings` seam provided, like dsh-base does.
+ *  The 0.1.7 settings service no longer exposes register() — the plugin's
+ *  Config schema IS its registration, so the double only needs describe. */
 function makeRoot() {
   const root = new Context()
   root.provide('settings', {
-    register: (namespace, schema) => ({ get: () => config, watch: () => {} }),
+    describe: () => [],
+    async mutate() {},
   })
   return root
 }
@@ -66,21 +66,13 @@ function makeRoot() {
  * short-circuited the whole pipeline (no fetch, no translate, no mutate).
  * Plug this in BEFORE mounting the plugin.
  *
- * `scopeValue` lets a test advertise a different `model-sync` config value
- * than the file-level `config` const (which is in `overlay` mode for the
- * legacy tests above). Default: `config`. Mutated before `root.plugin(...)`
- * so the closure built during register() already captures the override.
+ * Config values no longer ride the settings seam (the 0.1.7 Config schema
+ * replaced register()); tests pass them as the mount config instead.
  */
-function makeSpySettingsService(overrides = undefined) {
-  const scopeValue = overrides !== undefined ? { ...config, ...overrides } : config
+function makeSpySettingsService() {
   const spy = {
     mutations: 0,
     describeCalls: 0,
-    scopeValue,
-    register() {
-      const v = this.scopeValue
-      return { get: () => v, watch: () => {} }
-    },
     describe() {
       this.describeCalls += 1
       return [{
@@ -102,10 +94,12 @@ function makeSpySettingsService(overrides = undefined) {
 // ---------------------------------------------------------------------------
 // Plugin shape loads as a cordis plugin object
 // ---------------------------------------------------------------------------
-checkAsync('plugin module exposes name/inject/apply', async () => {
+checkAsync('plugin module exposes name/inject/apply/Config', async () => {
   assert.equal(plugin.name, 'dsh-model-sync')
   assert.deepEqual([...plugin.inject].sort(), ['settings'])
   assert.equal(typeof plugin.apply, 'function')
+  assert.equal(typeof plugin.Config, 'function', 'the Config schema is exported (settings-form registration)')
+  assert.ok(plugin.Config['~standard'], 'Config validates through the standard-schema protocol (cordis resolveConfig)')
 })
 
 // ---------------------------------------------------------------------------
@@ -137,7 +131,7 @@ await checkAsync('tripwire: bare ctx.commands read with deferred registry throws
 // ---------------------------------------------------------------------------
 await checkAsync('boots without the registry, registers /model-sync when it appears', async () => {
   const root = makeRoot()
-  await root.plugin(plugin) // must not reject — 0.1.3 did, exactly here
+  await root.plugin(plugin, mountConfig()) // must not reject — 0.1.3 did, exactly here
   root.plugin(commandsPlugin)
   await new Promise((resolve) => setImmediate(resolve))
   const registered = root.get('commands').list().map((entry) => entry?.name ?? entry)
@@ -155,7 +149,7 @@ await checkAsync('boots without the registry, registers /model-sync when it appe
 await checkAsync('registers /model-sync immediately when the registry is already up', async () => {
   const root = makeRoot()
   root.plugin(commandsPlugin)
-  await root.plugin(plugin)
+  await root.plugin(plugin, mountConfig())
   const registered = root.get('commands').list().map((entry) => entry?.name ?? entry)
   assert.ok(registered.includes('model-sync'), `/model-sync expected, got: ${JSON.stringify(registered)}`)
 })
@@ -165,7 +159,7 @@ await checkAsync('registers /model-sync immediately when the registry is already
 // ---------------------------------------------------------------------------
 await checkAsync('boots with no registry ever appearing (optional peer stays dormant)', async () => {
   const root = makeRoot()
-  await root.plugin(plugin)
+  await root.plugin(plugin, mountConfig())
   assert.equal(typeof root.get('modelSync')?.syncNow, 'function', 'modelSync service provided')
 })
 
@@ -182,7 +176,7 @@ await checkAsync('overlay mode degrades with the patch-not-applied notice when p
     listProviders: () => [{ id: 'opencode-go' }],
     listModels: async () => [{ id: 'x' }],
   })
-  await root.plugin(plugin)
+  await root.plugin(plugin, mountConfig())
   const report = await root.get('modelSync').syncNow()
   assert.ok(
     report.includes('remote-catalog patch is not applied'),
@@ -207,13 +201,13 @@ await checkAsync('overlay mode degrades with the patch-not-applied notice when p
 
 await checkAsync('seams absent → settings mode skips every route with zero mutations', async () => {
   const root = new Context()
-  const settingsSpy = makeSpySettingsService({ writeMode: 'settings', startupDelaySeconds: 3600 })
+  const settingsSpy = makeSpySettingsService()
   root.provide('settings', settingsSpy)
   // With both services absent, the gate reads process.env. Isolate the
   // managed references and restore them after disposing the startup timer.
   const refs = DEFAULT_ROUTES_LIST.map((route) => `${route.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}_API_KEY`)
   const previous = refs.map((ref) => process.env[ref])
-  const fiber = root.plugin(plugin)
+  const fiber = root.plugin(plugin, mountConfig({ writeMode: 'settings', startupDelaySeconds: 3600 }))
   try {
     for (const ref of refs) delete process.env[ref]
     await fiber
@@ -239,7 +233,7 @@ await checkAsync('seam says configured=false → skipped report for every route,
   // are resolved at plugin mount, and `provide('settings', spy)` after mount
   // would not affect the plugin's captured reference.
   const root = new Context()
-  const settingsSpy = makeSpySettingsService({ writeMode: 'settings', startupDelaySeconds: 3600 })
+  const settingsSpy = makeSpySettingsService()
   root.provide('settings', settingsSpy)
   // Plant a credentials seam that says EVERY reference is unconfigured.
   // Mirrors llm-pi-ai's surface exactly (just the `describe` half the gate
@@ -257,7 +251,7 @@ await checkAsync('seam says configured=false → skipped report for every route,
     fetchCalls += 1
     throw new Error('unexpected fetch in a skipped round')
   }
-  const fiber = root.plugin(plugin)
+  const fiber = root.plugin(plugin, mountConfig({ writeMode: 'settings', startupDelaySeconds: 3600 }))
   try {
     await fiber
     const report = await root.get('modelSync').syncNow()
@@ -311,13 +305,7 @@ function makeUnionRoundFetch(log) {
 
 await checkAsync('settings mode: provider-native union adds the first-party listing (default on)', async () => {
   const root = new Context()
-  const settingsSpy = makeSpySettingsService({
-    writeMode: 'settings',
-    startupDelaySeconds: 3600,
-    managedRoutes: ['zai-coding-cn'],
-    keepBuiltinOnly: false,
-    providerNativeFetch: true,
-  })
+  const settingsSpy = makeSpySettingsService()
   settingsSpy.mutate = async function (ns, ops) {
     this.mutations += 1
     this.lastOps = ops
@@ -340,7 +328,13 @@ await checkAsync('settings mode: provider-native union adds the first-party list
   const scratchHome = mkdtempSync(join(tmpdir(), 'model-sync-native-'))
   process.env.HOME = scratchHome
   resetModelsStoreCache()
-  const fiber = root.plugin(plugin)
+  const fiber = root.plugin(plugin, mountConfig({
+    writeMode: 'settings',
+    startupDelaySeconds: 3600,
+    managedRoutes: ['zai-coding-cn'],
+    keepBuiltinOnly: false,
+    providerNativeFetch: true,
+  }))
   try {
     await fiber
     const report = await root.get('modelSync').syncNow()
@@ -363,13 +357,7 @@ await checkAsync('settings mode: provider-native union adds the first-party list
 
 await checkAsync('settings mode: providerNativeFetch=false keeps the old pi.dev-only round', async () => {
   const root = new Context()
-  const settingsSpy = makeSpySettingsService({
-    writeMode: 'settings',
-    startupDelaySeconds: 3600,
-    managedRoutes: ['zai-coding-cn'],
-    keepBuiltinOnly: false,
-    providerNativeFetch: false,
-  })
+  const settingsSpy = makeSpySettingsService()
   settingsSpy.mutate = async function (ns, ops) {
     this.mutations += 1
     this.lastOps = ops
@@ -392,7 +380,13 @@ await checkAsync('settings mode: providerNativeFetch=false keeps the old pi.dev-
   const scratchHome = mkdtempSync(join(tmpdir(), 'model-sync-native-'))
   process.env.HOME = scratchHome
   resetModelsStoreCache()
-  const fiber = root.plugin(plugin)
+  const fiber = root.plugin(plugin, mountConfig({
+    writeMode: 'settings',
+    startupDelaySeconds: 3600,
+    managedRoutes: ['zai-coding-cn'],
+    keepBuiltinOnly: false,
+    providerNativeFetch: false,
+  }))
   try {
     await fiber
     const report = await root.get('modelSync').syncNow()

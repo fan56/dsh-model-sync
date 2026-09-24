@@ -4,9 +4,9 @@
 
 [![npm version](https://img.shields.io/npm/v/@aiwayds/dsh-model-sync)](https://www.npmjs.com/package/@aiwayds/dsh-model-sync) · [GitHub](https://github.com/fan56/dsh-model-sync)
 
-A dsh (DeepSeek Harness) Cordis plugin that keeps the model catalog of your `llm-pi-ai` provider routes in step with the pi.dev gateway's model listing — written into dsh `settings.yaml` through the official settings seam (`settings.mutate`), with zero patches to dsh internals.
+A dsh (DeepSeek Harness) Cordis plugin that keeps the model catalog of your `llm-pi-ai` provider routes in step with the pi.dev gateway's model listing — written through the official settings seam (`settings.mutate`), with zero patches to dsh internals.
 
-**Requires dsh >= 0.1.5-rc.2** — this plugin targets the dsh RC/stable line only (CI and releases resolve the newest of the `latest`/`next` dist-tags at runtime). **The alpha line is no longer supported.**
+**Requires dsh >= 0.1.7-rc.1** — this plugin targets the dsh RC/stable line only (CI and releases resolve the newest of the `latest`/`next` dist-tags at runtime). **The alpha line is no longer supported.** On dsh 0.1.7+ the settings document is the profile patch (settings.yaml is imported once and renamed); the plugin only ever writes through the official API, so it works unchanged on either shape.
 
 https://github.com/user-attachments/assets/c3f9c8b1-ea5e-470c-b8a8-60a81fc5c20a
 
@@ -17,7 +17,7 @@ https://github.com/user-attachments/assets/c3f9c8b1-ea5e-470c-b8a8-60a81fc5c20a
 Model lists drift: providers ship new models, retire old ones, and adjust capabilities (`contextWindow`, `input` modalities, `thinkingFormat`, reasoning efforts). Keeping them in sync by hand is error-prone busywork. dsh-model-sync does it for you:
 
 - **Add-only, change-only writes.** New models from pi.dev are merged in, existing ones updated, and unchanged routes are left completely untouched — the writer compares against the raw user segment and skips a route when nothing changed (`writer.ts`, `profilesEqual`, `reason: 'no-change'`).
-- **No hand-maintained model lists.** The pi.dev remote catalog is the source of truth for the managed routes; your `settings.yaml` simply reflects it.
+- **No hand-maintained model lists.** The pi.dev remote catalog is the source of truth for the managed routes; your settings (the `llm-pi-ai` provider profile) simply reflect it.
 - **Scheduled refresh.** An auto round runs shortly after startup and then on a configurable interval, so the catalog stays current without any interaction.
 
 ## Features
@@ -25,7 +25,7 @@ Model lists drift: providers ship new models, retire old ones, and adjust capabi
 - **pi.dev gateway sync.** Fetches each managed route's model list from `https://pi.dev/api/models/providers/<route>` with ETag/304 revalidation and a persistent per-provider cache under `~/.dsh/models-store.json` (`remote-catalog.ts`). Transient failures and aborts keep the last-good cache; a 404/501 treats the route as absent for the round.
 - **Default routes.** When `managedRoutes` is empty, these pi.dev routes are synced: `opencode-go`, `zai-coding-cn`, `minimax-cn`, `xiaomi-token-plan-cn` (`DEFAULT_ROUTES` in `src/index.ts`).
 - **Two write modes** (`writeMode`):
-  - `settings` (default) — the zero-patch pipeline: fetch → translate → `settings.mutate`. Self-contained; never touches `settings.yaml` directly, only via the official settings API.
+  - `settings` (default) — the zero-patch pipeline: fetch → translate → `settings.mutate`. Self-contained; never touches the settings document directly, only via the official settings API.
   - `overlay` (legacy) — delegates to the patched `dsh-llm-pi-ai` adapter's `piAiCatalog.refresh()` and merges pi.dev entries in memory (requires the optional patch).
 - **Scheduled refresh.** `intervalMinutes` auto rounds (default 240 / 4h) plus a `startupDelaySeconds` initial delay (default 5); each round logs the same report a manual refresh produces. `0` disarms the interval (startup-only). The interval re-arms live when the config changes (`src/index.ts`).
 - **Change reporting / diff.** Every round reports added/removed model ids (`diffModelIds`), and in `settings` mode added/removed/changed entries against the current raw settings (`diffEntries`, `diff.ts`). Dropped and degraded entries are reported with their reasons.
@@ -49,7 +49,7 @@ npm i @aiwayds/dsh-model-sync
 dsh plugin add @aiwayds/dsh-model-sync
 ```
 
-The package ships `cordis.patch.yml` (wired as `dsh.bundle.patch`), which mounts the plugin into the profile's assembly tree under the stable plugin id `dsh-model-sync` and registers the `model-sync` settings namespace.
+The package ships `cordis.patch.yml` (wired as `dsh.bundle.patch`), which mounts the plugin into the profile's assembly tree under the stable plugin id `dsh-model-sync` — on dsh 0.1.7+ that entry id doubles as the settings namespace for the plugin's `Config` schema.
 
 This plugin ships standalone — install it explicitly with `dsh plugin add @aiwayds/dsh-model-sync` when you want it.
 
@@ -62,12 +62,12 @@ dsh plugin remove @aiwayds/dsh-model-sync
 The host auto-cleans: the bundles entry is spliced out of the profile and the plugin's patch layer drops with the package, so the sync rounds and the `/model-sync` command simply stop. Three things intentionally stay on disk:
 
 1. **`~/.dsh/models-store.json` — back this file up before purging it.** It holds the catalog cache *plus* your `modelOverrides`: under the store-first invariant the plugin folds overrides into the written models and unsets the settings key, so for a managed route the store can be the **only** copy of your override values. Deleting the file deletes them.
-2. **Synced model lists in `~/.dsh/settings.yaml`.** The plugin wrote them into the host-owned `llm-pi-ai` namespace (`providers.<route>.models`) through the official settings seam. They persist after removal and remain valid host config — dsh consumes them exactly as if you had written them by hand. Remove those entries by hand if you don't want them.
+2. **Synced model lists in the settings document.** The plugin wrote them into the host-owned `llm-pi-ai` namespace (`providers.<route>.models`) through the official settings seam (`~/.dsh/settings.yaml` up to dsh 0.1.6, the profile patch on 0.1.7+). They persist after removal and remain valid host config — dsh consumes them exactly as if you had written them by hand. Remove those entries by hand if you don't want them.
 3. **A stale staging file, rarely.** The store's writes go through a temp-file + rename; if a process died mid-write a `~/.dsh/models-store.json.<pid>.tmp` file can remain. It is safe to delete.
 
 ## Usage
 
-Configure the plugin under the `model-sync` namespace in `settings.yaml` — every key is optional:
+Configure the plugin under the `dsh-model-sync` settings entry — on dsh 0.1.7+ the entry id (the same stable id the bundle patch always mounted) is the settings namespace; edit it in the settings UI or your profile patch. Every key is optional, and every key is a volatile field, so edits apply without restarting the plugin:
 
 | Key | Default | Description |
 |---|---|---|
@@ -81,11 +81,12 @@ Configure the plugin under the `model-sync` namespace in `settings.yaml` — eve
 | `syncNotify` | `false` | Notify on changes (logger + `/model-sync` report) |
 | `forceMaxReasoningEffort` | `false` | Force max reasoning effort on models with a non-empty `thinkingFormat` |
 | `providerNativeFetch` | `true` | Union each mapped provider's first-party `/models` listing into the pi.dev result (additions only) |
+| `keepDeprecatedBuiltin` | `false` | Opt back into emitting builtin ids the official default model list dropped (dsh 0.1.7 removed `deepseek-v4-flash` / `deepseek-v4-flash-vision-exp`; the snapshot keeps the data but no longer syncs them by default) |
 
-Example:
+Example (settings section `dsh-model-sync`; a legacy `settings.yaml` `model-sync:` section is **not** auto-imported by dsh 0.1.7 — re-declare your values once under the new entry):
 
 ```yaml
-model-sync:
+dsh-model-sync:
   writeMode: settings
   intervalMinutes: 30
   managedRoutes:
@@ -127,7 +128,7 @@ Tests use per-route pi.dev fixtures under `test/fixtures/` and temp directories 
 
 Utility scripts under `scripts/`:
 
-- `generate-builtin-snapshot.mjs` — regenerate `src/builtin-catalog-snapshot.ts` from the installed `@deepseek-ai/dsh-llm-pi-ai` catalog (`--generate` for dev, `--check` for CI).
+- `generate-builtin-snapshot.mjs` — regenerate `src/builtin-catalog-snapshot.ts` from the installed `@deepseek-ai/dsh-llm-pi-ai` catalog (`--generate` for dev, `--check` for CI). Hand-maintained `deprecated: true` marks (ids the official default model list dropped) are preserved by id across regenerations.
 - `verify-no-patch.mjs` — exits non-zero if any installed `dsh-llm-pi-ai` still carries the overlay patch signatures (`withRemoteCatalog` / `piAiCatalog`).
 - `backup/backup-patched.mjs` — back up a patched `dsh-llm-pi-ai/lib/index.js` to `backups/`.
 - `backup/restore-official.mjs` — restore the official unpatched `dsh-llm-pi-ai/lib/index.js` from npm, validated against the patch (`--dry-run` supported).

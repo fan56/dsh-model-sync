@@ -6,7 +6,8 @@
  *
  * Supports two write modes:
  * - 'settings' (default): self-contained fetch → translate → settings.mutate
- *   pipeline that writes directly to settings.yaml (zero patch required)
+ *   pipeline that writes through the host settings service (zero patch
+ *   required; settings.yaml up to dsh 0.1.6, the profile patch on 0.1.7+)
  * - 'overlay' (legacy): uses the patched dsh-llm-pi-ai's piAiCatalog.refresh()
  *   to overlay pi.dev entries in memory (requires patch)
  *
@@ -35,6 +36,7 @@ import {
   type SettingsModelProfile,
   type TranslateOptions,
   type DropWarning,
+  type BuiltinModelData,
 } from './translate.ts'
 import {
   syncToSettings,
@@ -58,61 +60,89 @@ export const name = 'dsh-model-sync'
 /** The settings seam this plugin consumes (its own config namespace). */
 export const inject = ['settings']
 
-// dsh-settings 0.1.2-alpha.3 removed the runtime settingsNamespace() helper:
-// register() now brand-checks the namespace at the type level
-// (SettingsNamespaceInput) and validates the same pattern at runtime. A plain
-// literal is the supported spelling.
-const OWN_NS = 'model-sync'
+// dsh-settings 0.1.7 rewrote the seam: the runtime register(ns, schema) call
+// is gone, and a plugin's settings form is projected from its exported
+// `Config` schema — the namespace IS the profile entry id. The bundle patch
+// mounts this plugin under the stable id below, so `dsh-model-sync` is the
+// namespace the settings UI (and the legacy settings.yaml import) address.
+const OWN_ENTRY_ID = 'dsh-model-sync'
 
-/** The `model-sync` settings namespace: user-editable in settings.yaml. */
-const ModelSyncConfig = z.object({
+/**
+ * The plugin's `Config` schema: the settings form the 0.1.7 host projects from
+ * the `dsh-model-sync` entry. Every field is user-adjustable and therefore
+ * `.volatile()` — volatile fields are the only ones the settings page can edit
+ * (and the only ones the legacy settings.yaml import accepts), and they hot-
+ * reload without remounting the plugin. Requires schemastery >= 3.18.4 (the
+ * version the dsh 0.1.7 wave ships), which provides `.volatile()`.
+ */
+export const Config = z.object({
   /**
    * Write mode: 'settings' (default, zero-patch settings.mutate pipeline) or
    * 'overlay' (legacy, delegates to the patched adapter's piAiCatalog.refresh
    * and requires the optional patch).
    */
-  writeMode: z.union(['settings', 'overlay']).default('settings'),
+  writeMode: z.union(['settings', 'overlay']).default('settings').volatile(),
   /** Minutes between auto refreshes (default 240 = 4 hours); 0 = startup-only. */
-  intervalMinutes: z.number().step(1).min(0).default(240),
+  intervalMinutes: z.number().step(1).min(0).default(240).volatile(),
   /** Delay before the first auto refresh, so the llm adapter is ready. */
-  startupDelaySeconds: z.number().step(1).min(0).default(5),
+  startupDelaySeconds: z.number().step(1).min(0).default(5).volatile(),
   /** Abort budget for one forced refresh's network round. */
-  refreshTimeoutMs: z.number().step(1).min(1000).default(120000),
+  refreshTimeoutMs: z.number().step(1).min(1000).default(120000).volatile(),
   /** Routes to manage (empty = all pi.dev routes). */
-  managedRoutes: z.array(z.string()).default([]),
+  managedRoutes: z.array(z.string()).default([]).volatile(),
   /** Keep builtin-only models not in pi.dev (smooth migration). */
-  keepBuiltinOnly: z.boolean().default(true),
+  keepBuiltinOnly: z.boolean().default(true).volatile(),
   /** Drop unserviceable entries (true) or abort the entire route (false). */
-  dropUnserviceable: z.boolean().default(true),
+  dropUnserviceable: z.boolean().default(true).volatile(),
   /**
    * Union each mapped route's first-party /models listing into the pi.dev
    * result (additions only — see provider-native.ts). Default on: the native
    * listing is the fresher source; pi.dev lags (measured 2026-09-22).
    */
-  providerNativeFetch: z.boolean().default(true),
+  providerNativeFetch: z.boolean().default(true).volatile(),
   /** Notify on changes (logger + /model-sync report). */
-  syncNotify: z.boolean().default(false),
+  syncNotify: z.boolean().default(false).volatile(),
   /**
    * Force all models with a non-empty thinkingFormat to have max reasoning
    * effort. Skips S2 gate's SRE check, ensures reasoningEfforts contains
    * max, and forces compat.supportsReasoningEffort=true (S5 gate, openai-
    * completions only). 400 risk is on the user.
    */
-  forceMaxReasoningEffort: z.boolean().default(false),
+  forceMaxReasoningEffort: z.boolean().default(false).volatile(),
+  /**
+   * keepBuiltinOnly may re-emit builtin ids the official default model list
+   * dropped (dsh 0.1.7 removed deepseek-v4-flash / deepseek-v4-flash-vision-
+   * exp). Those stay in the snapshot for historical user configurations but
+   * are excluded from the synced list unless this flag opts them back in —
+   * a re-emitted retired id is a model the 0.1.7 host no longer resolves.
+   */
+  keepDeprecatedBuiltin: z.boolean().default(false).volatile(),
 })
 
-/** Typed view of the resolved `model-sync` namespace value. */
+/**
+ * A stable configuration reference — the protocol the 0.1.7 host hands the
+ * plugin for every volatile `Config` field (cosmokit's `Volatile<T>`, declared
+ * locally as a structural type so this module stays dependency-free). `get()`
+ * returns the current immutable snapshot; the host swaps the value in place on
+ * volatile-only edits, so reading per round is always fresh.
+ */
+interface VolatileRef<T> {
+  get(): T
+}
+
+/** Typed view of the resolved `Config` value as delivered to apply(). */
 interface ModelSyncConfigValue {
-  writeMode: 'overlay' | 'settings'
-  intervalMinutes: number
-  startupDelaySeconds: number
-  refreshTimeoutMs: number
-  managedRoutes: string[]
-  keepBuiltinOnly: boolean
-  dropUnserviceable: boolean
-  syncNotify: boolean
-  forceMaxReasoningEffort: boolean
-  providerNativeFetch: boolean
+  writeMode: VolatileRef<'settings' | 'overlay'>
+  intervalMinutes: VolatileRef<number>
+  startupDelaySeconds: VolatileRef<number>
+  refreshTimeoutMs: VolatileRef<number>
+  managedRoutes: VolatileRef<readonly string[]>
+  keepBuiltinOnly: VolatileRef<boolean>
+  dropUnserviceable: VolatileRef<boolean>
+  syncNotify: VolatileRef<boolean>
+  forceMaxReasoningEffort: VolatileRef<boolean>
+  providerNativeFetch: VolatileRef<boolean>
+  keepDeprecatedBuiltin: VolatileRef<boolean>
 }
 
 /** The llm seam as this plugin needs it (overlay mode). */
@@ -152,8 +182,12 @@ const DEFAULT_ROUTES = [
  *  runtime surface; subject to change without notice. */
 export const DEFAULT_ROUTES_LIST = DEFAULT_ROUTES
 
-export function apply(ctx: Context): void {
-  const scope = ctx.settings.register(OWN_NS, ModelSyncConfig)
+export function apply(ctx: Context, config: ModelSyncConfigValue): void {
+  // On dsh 0.1.7 the resolved Config arrives as apply()'s second argument:
+  // every volatile field is a stable reference (see VolatileRef), so the
+  // reads below are live views — no scope.get() and no scope.watch() (both
+  // removed from dsh-settings; the hot-reload notification moved to the
+  // settings/document-updated event, subscribed at the bottom of apply()).
 
   // -----------------------------------------------------------------------
   // Overlay mode sync (existing behavior)
@@ -194,7 +228,7 @@ export function apply(ctx: Context): void {
     const before = await list()
     const errors = await catalog.refresh({
       force,
-      signal: AbortSignal.timeout(config.refreshTimeoutMs),
+      signal: AbortSignal.timeout(config.refreshTimeoutMs.get()),
     })
     const after = await list()
 
@@ -233,8 +267,9 @@ export function apply(ctx: Context): void {
     const lines: string[] = []
 
     // Determine routes to sync
-    const routes = config.managedRoutes.length > 0
-      ? config.managedRoutes
+    const managedRoutes = config.managedRoutes.get()
+    const routes = managedRoutes.length > 0
+      ? [...managedRoutes]
       : DEFAULT_ROUTES
 
     const gateDesc = settings?.describe().find((d) => d.ns === 'llm-pi-ai')
@@ -254,7 +289,7 @@ export function apply(ctx: Context): void {
       }
 
       // Fetch from pi.dev — pass force to bypass revalidation throttle (I-5)
-      const result = await fetchRemoteCatalog(route, config.refreshTimeoutMs, store, { force })
+      const result = await fetchRemoteCatalog(route, config.refreshTimeoutMs.get(), store, { force })
 
       if (result.error !== undefined && result.entries.length === 0) {
         lines.push(`${route}: fetch failed (${result.error}); keeping last-good`)
@@ -268,10 +303,10 @@ export function apply(ctx: Context): void {
 
       // Translate
       const translateOpts: TranslateOptions = {
-        keepBuiltinOnly: config.keepBuiltinOnly,
-        dropUnserviceable: config.dropUnserviceable,
+        keepBuiltinOnly: config.keepBuiltinOnly.get(),
+        dropUnserviceable: config.dropUnserviceable.get(),
         dropWarnings: [],
-        forceMaxReasoningEffort: config.forceMaxReasoningEffort,
+        forceMaxReasoningEffort: config.forceMaxReasoningEffort.get(),
       }
 
       // For builtin catalog snapshot: we use a mock for now since we can't
@@ -286,7 +321,7 @@ export function apply(ctx: Context): void {
       // states them; any failure degrades to the pi.dev list unchanged so a
       // native hiccup can never lose models.
       let entries = result.entries
-      if (config.providerNativeFetch && PROVIDER_NATIVE_ENDPOINTS[route] !== undefined) {
+      if (config.providerNativeFetch.get() && PROVIDER_NATIVE_ENDPOINTS[route] !== undefined) {
         const apiKey = await resolveRouteCredentialValue(
           ctx as unknown as NativeCredentialContext,
           gateDesc,
@@ -295,7 +330,7 @@ export function apply(ctx: Context): void {
         if (apiKey === undefined) {
           lines.push(`${route}: provider-native skipped — credential value unavailable`)
         } else {
-          const native = await fetchProviderNativeModels(route, apiKey, config.refreshTimeoutMs)
+          const native = await fetchProviderNativeModels(route, apiKey, config.refreshTimeoutMs.get())
           if (native.ok) {
             // Base-less synthesis needs the route's one addressable api;
             // unknown or mixed-protocol routes skip synthesis wholesale.
@@ -322,8 +357,8 @@ export function apply(ctx: Context): void {
       }
 
       const builtinIds = new Set(builtinData.map((b) => b.id))
-      const builtinOnlyEntries = config.keepBuiltinOnly
-        ? getBuiltinOnlyEntries(route, entries, builtinIds)
+      const builtinOnlyEntries = translateOpts.keepBuiltinOnly
+        ? getBuiltinOnlyEntries(route, entries, builtinData, config.keepDeprecatedBuiltin.get())
         : undefined
 
       const translated = translateEntries(
@@ -421,16 +456,19 @@ export function apply(ctx: Context): void {
   // Unified syncNow
   // -----------------------------------------------------------------------
   const syncNow = async (force: boolean): Promise<string> => {
-    const config = scope.get() as unknown as ModelSyncConfigValue
+    // Read the live refs up front; the volatile snapshots are fresh per call.
+    const writeMode = config.writeMode.get()
+    const managedRoutes = config.managedRoutes.get()
+    const routes = managedRoutes.length > 0 ? [...managedRoutes] : DEFAULT_ROUTES
 
     // Prefer the host's live pi-ai catalog for this round; the frozen
     // snapshot is only the no-host fallback. Without this, keepBuiltinOnly
     // re-emits ids the host's catalog has already dropped. Awaiting keeps the
     // `which`/`npm` probes off the host's event loop (they used to block every
     // surface for ~0.2s per round).
-    await refreshLiveCatalog(config.managedRoutes.length > 0 ? config.managedRoutes : DEFAULT_ROUTES)
+    await refreshLiveCatalog(routes)
 
-    if (config.writeMode === 'settings') {
+    if (writeMode === 'settings') {
       return syncSettings(config, force)
     }
 
@@ -472,16 +510,22 @@ export function apply(ctx: Context): void {
     if (startupTimer !== undefined) clearTimeout(startupTimer)
   })
 
-  const initial = scope.get() as unknown as ModelSyncConfigValue
-  startupTimer = setTimeout(runAuto, Math.max(0, initial?.startupDelaySeconds ?? 5) * 1000)
-  armInterval(initial?.intervalMinutes ?? 240)
-  scope.watch((next) => {
-    const value = next as unknown as ModelSyncConfigValue
-    armInterval(value?.intervalMinutes ?? 0)
+  // Volatile fields are stable references, so the initial arms read them once
+  // and the interval keeps working; the hot-reload notification arrives as a
+  // settings/document-updated event (the 0.1.7 replacement for scope.watch).
+  startupTimer = setTimeout(runAuto, Math.max(0, config.startupDelaySeconds.get() ?? 5) * 1000)
+  armInterval(config.intervalMinutes.get() ?? 240)
+  ctx.effect(() => ctx.on('settings/document-updated', (ns) => {
+    // Only this plugin's entry (the bundle-patch id) re-arms the timers; the
+    // handler is idempotent — the refs already carry the new values, so the
+    // next round reads them fresh. Never throws: an interval re-arm is two
+    // timer calls, and a throwing settings listener is a host-side incident.
+    if (ns !== OWN_ENTRY_ID) return
+    armInterval(config.intervalMinutes.get() ?? 0)
     // Clear any pending startup timer before setting a new one
     if (startupTimer !== undefined) clearTimeout(startupTimer)
     startupTimer = setTimeout(runAuto, 1000)
-  })
+  }), 'dsh-model-sync: settings/document-updated')
 
   // The modelSync service stays exposed for UIs that want direct access. The
   // /model-sync command itself is registered by this plugin (below) through
@@ -535,7 +579,7 @@ export function apply(ctx: Context): void {
  * gets the whole llm-pi-ai namespace rejected by the alpha line's strict
  * registration.
  */
-function getBuiltinCatalogForRoute(route: string): Array<{ id: string; api: string; maxTokens?: number }> {
+function getBuiltinCatalogForRoute(route: string): BuiltinModelData[] {
   return getLiveBuiltinCatalogForRoute(route) ?? BUILTIN_CATALOG_SNAPSHOT[route] ?? []
 }
 
@@ -543,17 +587,28 @@ function getBuiltinCatalogForRoute(route: string): Array<{ id: string; api: stri
  * Get entries from builtin catalog that are not in pi.dev (for keepBuiltinOnly).
  * Returns minimal RemoteCatalogEntry-shaped objects — translateEntries only
  * reads entry.id from these, emitting {id} profiles (I-3).
+ *
+ * Deprecated snapshot entries (the official default model list dropped them —
+ * dsh 0.1.7 removed deepseek-v4-flash / deepseek-v4-flash-vision-exp) are
+ * excluded unless `includeDeprecated` opts them back in: a re-emitted retired
+ * id is a model the 0.1.7 host no longer resolves. The data itself stays in
+ * the snapshot for historical user configurations.
+ *
+ * Exported for the test suite; not part of the public runtime surface.
  */
-function getBuiltinOnlyEntries(
+export function getBuiltinOnlyEntries(
   route: string,
   piDevEntries: RemoteCatalogEntry[],
-  builtinIds: Set<string>,
+  builtinData: BuiltinModelData[],
+  includeDeprecated = false,
 ): RemoteCatalogEntry[] {
   const piDevIds = new Set(piDevEntries.map((e) => e.id))
-  const builtinData = getBuiltinCatalogForRoute(route)
 
   return builtinData
-    .filter((b) => !piDevIds.has(b.id) && builtinIds.has(b.id))
+    .filter((b) =>
+      !piDevIds.has(b.id)
+      && (includeDeprecated || b.deprecated !== true)
+    )
     .map((b) => ({
       id: b.id,
       name: b.id,

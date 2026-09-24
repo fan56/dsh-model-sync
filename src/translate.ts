@@ -108,6 +108,14 @@ export interface BuiltinModelData {
   id: string
   api: string
   maxTokens?: number
+  /**
+   * The id left the official default model list (dsh 0.1.7 removed
+   * deepseek-v4-flash / deepseek-v4-flash-vision-exp) but the data is kept
+   * for historical user configurations. Deprecated entries still serve
+   * base-matching classification, but the keepBuiltinOnly emission skips
+   * them unless explicitly opted back in (see index.ts getBuiltinOnlyEntries).
+   */
+  deprecated?: boolean
 }
 
 // ---------------------------------------------------------------------------

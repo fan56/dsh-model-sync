@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-model-sync",
+    "description": "经官方 settings 通道，让 llm-pi-ai provider 路由的模型列表与 pi.dev 网关保持同步。"
+  }
+}

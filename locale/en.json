@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-model-sync",
+    "description": "Keeps llm-pi-ai provider routes' model lists in step with the pi.dev gateway, written through the official settings seam."
+  }
+}

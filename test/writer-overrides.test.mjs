@@ -619,9 +619,19 @@ await checkAsync('e2e: settings mode round reports the fold+unset, persists the 
       },
     }
     const state = { provided: [], effectDisposers: [] }
-    const scope = { get: () => config, watch: () => {} }
+    // The plugin reads Config through volatile references (the shape the
+    // dsh 0.1.7 host delivers to apply()); wrap the plain values to match.
+    const volatileConfig = (values) => Object.fromEntries(
+      Object.entries({ providerNativeFetch: true, keepDeprecatedBuiltin: false, ...values })
+        .map(([key, value]) => [key, { get: () => value }]),
+    )
     const ctx = {
-      settings: { register: () => scope },
+      settings: { describe: () => [], mutate: async () => {} },
+      on(event, listener) {
+        state.eventListeners = state.eventListeners ?? []
+        state.eventListeners.push({ event, listener })
+        return () => {}
+      },
       get: (name) => {
         if (name === 'settings') return settingsService
         if (name === 'credentials') return credentialsService
@@ -669,7 +679,7 @@ await checkAsync('e2e: settings mode round reports the fold+unset, persists the 
     }
 
     try {
-      apply(ctx)
+      apply(ctx, volatileConfig(config))
       const modelSync = state.provided.find((entry) => entry.name === 'modelSync')?.service
       assert.ok(modelSync, 'modelSync service provided')
 
