@@ -67,7 +67,7 @@ dsh plugin remove @aiwayds/dsh-model-sync
 
 ## 用法
 
-在 `dsh-model-sync` 设置条目下配置本插件——dsh 0.1.7+ 的 entry id（与 bundle patch 一直使用的稳定 id 相同）即 settings 命名空间，在设置 UI 或 profile patch 中编辑即可。每个键都是可选的，且全部是 volatile 字段，改动无需重启插件即可生效：
+在 `dsh-model-sync` 设置条目下配置本插件——dsh 0.1.7+ 的 entry id（与 bundle patch 一直使用的稳定 id 相同）即 settings 命名空间，在设置 UI 或 profile patch 中编辑即可。每个键都是可选的，且全部是 volatile 字段，改动无需重启插件即可生效。从 0.1.7 之前升级：旧 `settings.yaml` 里的 `model-sync:` 段会在下次插件 boot 时一次性自动迁入新条目（审计档在 `~/.dsh/storages/dsh-model-sync/legacy-import.json`）：
 
 | 键 | 默认值 | 说明 |
 |---|---|---|
@@ -85,7 +85,7 @@ dsh plugin remove @aiwayds/dsh-model-sync
 
 示例：
 
-示例（settings 段名 `dsh-model-sync`；dsh 0.1.7 不会自动导入旧 `settings.yaml` 里的 `model-sync:` 段——请把原值在新条目下重新声明一次）：
+示例（settings 段名 `dsh-model-sync`；dsh 0.1.7 宿主本身不会自动导入旧 `settings.yaml` 里的 `model-sync:` 段——插件会在 boot 时一次性迁回，见上文）：
 
 ```yaml
 dsh-model-sync:

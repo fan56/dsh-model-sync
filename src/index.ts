@@ -54,6 +54,12 @@ import {
   resolveRouteCredentialValue,
   type NativeCredentialContext,
 } from './provider-native.ts'
+import {
+  runLegacySettingsImport,
+  resolveDshHome,
+  type LegacyImportLogger,
+  type SettingsUpdateSeam,
+} from './legacy-import.ts'
 
 export const name = 'dsh-model-sync'
 
@@ -182,7 +188,7 @@ const DEFAULT_ROUTES = [
  *  runtime surface; subject to change without notice. */
 export const DEFAULT_ROUTES_LIST = DEFAULT_ROUTES
 
-export function apply(ctx: Context, config: ModelSyncConfigValue): void {
+export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise<void> {
   // On dsh 0.1.7 the resolved Config arrives as apply()'s second argument:
   // every volatile field is a stable reference (see VolatileRef), so the
   // reads below are live views — no scope.get() and no scope.watch() (both
@@ -565,6 +571,31 @@ export function apply(ctx: Context, config: ModelSyncConfigValue): void {
       return commands.register(definition)
     }, 'dsh-model-sync: /model-sync')
   })
+
+  // One-time legacy settings import (0.1.5 → 0.1.7 upgrade path, see
+  // legacy-import.ts): recover the old `model-sync:` section for hosts where
+  // the 0.1.7 one-shot settings.yaml import never carried it over. Awaited
+  // as apply()'s LAST step — every registration above stays synchronous
+  // (fake-ctx tests keep working), while a real boot, whose loader awaits
+  // the fiber setup, settles the import before activation completes. Fully
+  // contained: any failure only warns and leaves the audit marker unwritten,
+  // so the next boot retries; activation never depends on this.
+  try {
+    await runLegacySettingsImport({
+      home: resolveDshHome(),
+      settings: ctx.settings as SettingsUpdateSeam,
+      logger: (ctx as unknown as { logger?: LegacyImportLogger }).logger,
+      // The volatile refs read fresh, and the update itself fires
+      // settings/document-updated for this entry — the timers armed above
+      // with the pre-import value re-arm to it without a restart.
+      getCurrent: (key) => {
+        const slot = (config as unknown as Record<string, unknown>)[key] as { get?: unknown } | undefined
+        return typeof slot?.get === 'function' ? slot.get() : slot
+      },
+    })
+  } catch (error) {
+    ctx.logger.warn('model-sync: legacy settings import failed (will retry next boot): %o', error)
+  }
 }
 
 // ---------------------------------------------------------------------------

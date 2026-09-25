@@ -67,7 +67,7 @@ The host auto-cleans: the bundles entry is spliced out of the profile and the pl
 
 ## Usage
 
-Configure the plugin under the `dsh-model-sync` settings entry — on dsh 0.1.7+ the entry id (the same stable id the bundle patch always mounted) is the settings namespace; edit it in the settings UI or your profile patch. Every key is optional, and every key is a volatile field, so edits apply without restarting the plugin:
+Configure the plugin under the `dsh-model-sync` settings entry — on dsh 0.1.7+ the entry id (the same stable id the bundle patch always mounted) is the settings namespace; edit it in the settings UI or your profile patch. Every key is optional, and every key is a volatile field, so edits apply without restarting the plugin. Upgrading from a pre-0.1.7 install: a legacy top-level `model-sync:` section in the old `settings.yaml` is imported once into the new entry automatically at the next plugin boot (the audit record lands in `~/.dsh/storages/dsh-model-sync/legacy-import.json`):
 
 | Key | Default | Description |
 |---|---|---|
@@ -83,7 +83,7 @@ Configure the plugin under the `dsh-model-sync` settings entry — on dsh 0.1.7+
 | `providerNativeFetch` | `true` | Union each mapped provider's first-party `/models` listing into the pi.dev result (additions only) |
 | `keepDeprecatedBuiltin` | `false` | Opt back into emitting builtin ids the official default model list dropped (dsh 0.1.7 removed `deepseek-v4-flash` / `deepseek-v4-flash-vision-exp`; the snapshot keeps the data but no longer syncs them by default) |
 
-Example (settings section `dsh-model-sync`; a legacy `settings.yaml` `model-sync:` section is **not** auto-imported by dsh 0.1.7 — re-declare your values once under the new entry):
+Example (settings section `dsh-model-sync`; a legacy `settings.yaml` `model-sync:` section is not auto-imported by the dsh 0.1.7 host itself — the plugin recovers it once at boot, see above):
 
 ```yaml
 dsh-model-sync:
