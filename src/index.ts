@@ -574,16 +574,22 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
 
   // One-time legacy settings import (0.1.5 → 0.1.7 upgrade path, see
   // legacy-import.ts): recover the old `model-sync:` section for hosts where
-  // the 0.1.7 one-shot settings.yaml import never carried it over. Awaited
-  // as apply()'s LAST step — every registration above stays synchronous
-  // (fake-ctx tests keep working), while a real boot, whose loader awaits
-  // the fiber setup, settles the import before activation completes. Fully
-  // contained: any failure only warns and leaves the audit marker unwritten,
-  // so the next boot retries; activation never depends on this.
-  try {
-    await runLegacySettingsImport({
+  // the 0.1.7 one-shot settings.yaml import never carried it over. Wired
+  // through ctx.inject(['settings'], …) instead of a direct `ctx.settings`
+  // read: a real boot can run apply() before the settings service mounts,
+  // and the direct read then silently no-settings'd the import away every
+  // boot. The inject callback fires the moment the service exists
+  // (immediately when it already does — fake-ctx tests stay synchronous),
+  // fire-and-forget so activation never waits on it. Fully contained: any
+  // failure only warns and leaves the audit marker unwritten, so the next
+  // boot retries; activation never depends on this. The volatile refs read
+  // fresh, and the update itself fires settings/document-updated for this
+  // entry — the timers armed above with the pre-import value re-arm to it
+  // without a restart.
+  ctx.inject(['settings'], (sctx) => {
+    void runLegacySettingsImport({
       home: resolveDshHome(),
-      settings: ctx.settings as SettingsUpdateSeam,
+      settings: (sctx as unknown as { settings?: SettingsUpdateSeam }).settings,
       logger: (ctx as unknown as { logger?: LegacyImportLogger }).logger,
       // The volatile refs read fresh, and the update itself fires
       // settings/document-updated for this entry — the timers armed above
@@ -592,10 +598,10 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
         const slot = (config as unknown as Record<string, unknown>)[key] as { get?: unknown } | undefined
         return typeof slot?.get === 'function' ? slot.get() : slot
       },
+    }).catch((error) => {
+      ctx.logger.warn('model-sync: legacy settings import failed (will retry next boot): %o', error)
     })
-  } catch (error) {
-    ctx.logger.warn('model-sync: legacy settings import failed (will retry next boot): %o', error)
-  }
+  })
 }
 
 // ---------------------------------------------------------------------------

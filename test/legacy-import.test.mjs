@@ -253,22 +253,52 @@ await checkAsync('import: settings.update rejects → warn, NO marker (next boot
   const t = boot({ settings: fakeSettings({ fail: true }) })
   try {
     writeLegacyDoc(t.home, 'settings.yaml.imported', LEGACY_DOC)
-    const result = await runLegacySettingsImport({ home: t.home, settings: t.settings.seam, logger: t.logger.logger, getCurrent: () => undefined })
+    const result = await runLegacySettingsImport({ home: t.home, settings: t.settings.seam, logger: t.logger.logger, getCurrent: () => undefined, updateRetry: { attempts: 3, delayMs: 1 } })
     assert.equal(result.outcome, 'update-failed')
     assert.equal(existsSync(legacyMarkerPath(t.home)), false, 'no marker on a failed update')
+    assert.equal(t.logger.lines.filter((l) => l.level === 'warn' && l.message.includes('attempt 3/3')).length, 1, 'all retry attempts ran and were logged')
     assert.ok(t.logger.lines.some((l) => l.level === 'warn' && l.message.includes('retry next boot')))
   } finally {
     t.cleanup()
   }
 })
 
-await checkAsync('import: no settings seam → no marker, nothing read or written', async () => {
+await checkAsync('import: settings.update recovers within the retry budget → imported (boot-time lock contention)', async () => {
+  // The real-host failure mode (2026-09-25): during boot the host holds the
+  // profile writer lock, so the first update calls time out and only a retry
+  // lands. The seam here rejects twice, then accepts.
+  const t = boot()
+  let failures = 2
+  const flakySeam = {
+    async update(ns, patch) {
+      if (failures > 0) {
+        failures -= 1
+        throw new Error('atomic-write: timed out waiting for the writer lock at package.json.lock')
+      }
+      t.settings.calls.push({ ns, patch })
+    },
+  }
+  try {
+    writeLegacyDoc(t.home, 'settings.yaml.imported', LEGACY_DOC)
+    const result = await runLegacySettingsImport({ home: t.home, settings: flakySeam, logger: t.logger.logger, getCurrent: () => undefined, updateRetry: { attempts: 5, delayMs: 1 } })
+    assert.equal(result.outcome, 'imported')
+    assert.deepEqual(t.settings.calls[0].patch, { writeMode: 'settings', intervalMinutes: 240 })
+    const marker = JSON.parse(readFileSync(legacyMarkerPath(t.home), 'utf8'))
+    assert.equal(marker.outcome, 'imported')
+    assert.ok(t.logger.lines.some((l) => l.level === 'warn' && l.message.includes('attempt 1/5')), 'failed attempts are logged, not silent')
+  } finally {
+    t.cleanup()
+  }
+})
+
+await checkAsync('import: no settings seam → warn (not silent), no marker, nothing read or written', async () => {
   const t = boot()
   try {
     writeLegacyDoc(t.home, 'settings.yaml.imported', LEGACY_DOC)
-    const result = await runLegacySettingsImport({ home: t.home, settings: undefined, getCurrent: t.getCurrent })
+    const result = await runLegacySettingsImport({ home: t.home, settings: undefined, logger: t.logger.logger, getCurrent: t.getCurrent })
     assert.equal(result.outcome, 'no-settings')
     assert.equal(existsSync(legacyMarkerPath(t.home)), false)
+    assert.ok(t.logger.lines.some((l) => l.level === 'warn' && l.message.includes('no-settings')), 'a no-settings warn line is logged')
   } finally {
     t.cleanup()
   }

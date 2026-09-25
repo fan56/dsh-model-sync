@@ -72,7 +72,7 @@ function asVolatileConfig(values) {
  * cordis would also fire it if a missing service appears later), and the
  * optional commands registry.
  */
-function createFakeContext({ config = defaultConfig, services = {}, get } = {}) {
+function createFakeContext({ config = defaultConfig, services = {}, get, settings: settingsOverride } = {}) {
   const state = {
     definitions: [], // command definitions passed to commands.register
     unregisterCalls: 0, // how often the registry disposer ran
@@ -82,7 +82,7 @@ function createFakeContext({ config = defaultConfig, services = {}, get } = {}) 
     eventListeners: [], // { event, listener } registered via ctx.on
   }
   const ctx = {
-    settings: { describe: () => [], mutate: async () => {} },
+    settings: settingsOverride ?? { describe: () => [], mutate: async () => {} },
     get: get ?? ((name) => services[name]),
     logger: { info() {}, warn() {}, debug() {} },
     on(event, listener) {
@@ -240,6 +240,48 @@ await checkAsync('apply without a commands service skips registration and keeps 
   const report = await provided.service.syncNow()
   assert.ok(typeof report === 'string' && report.length > 0, `syncNow still reports, got: ${report}`)
   disposeAll(state)
+})
+
+// ---------------------------------------------------------------------------
+// Legacy settings import wiring
+// ---------------------------------------------------------------------------
+// Regression gate for the 2026-09-24 incident (siblings): apply() used to
+// read `ctx.settings` directly at its tail — undefined on a real boot whose
+// settings service mounts after apply, so the import silently no-settings'd
+// every boot. apply must wire the import through ctx.inject(['settings'], …).
+await checkAsync('legacy import wiring: apply rides ctx.inject(settings), marker lands in $DSH_HOME', async () => {
+  const { mkdtempSync, rmSync, writeFileSync, readFileSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { legacyMarkerPath } = await import('../lib/legacy-import.js')
+  const home = mkdtempSync(join(tmpdir(), 'model-sync-wiring-'))
+  const prevDshHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  const updateCalls = []
+  const seam = {
+    describe: () => [],
+    async mutate() {},
+    async update(ns, patch) {
+      updateCalls.push({ ns, patch })
+    },
+  }
+  const { ctx, state, config } = createFakeContext({ settings: seam })
+  try {
+    writeFileSync(join(home, 'settings.yaml.imported'), 'model-sync:\n  writeMode: overlay\n  intervalMinutes: 99\n')
+    apply(ctx, config)
+    // Fire-and-forget: let the floating import promise settle.
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    // writeMode 'overlay' equals the mount config; intervalMinutes differs.
+    assert.deepEqual(updateCalls, [{ ns: 'dsh-model-sync', patch: { intervalMinutes: 99 } }])
+    const marker = JSON.parse(readFileSync(legacyMarkerPath(home), 'utf8'))
+    assert.equal(marker.outcome, 'imported')
+    assert.equal(marker.source, 'settings.yaml.imported')
+  } finally {
+    if (prevDshHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = prevDshHome
+    rmSync(home, { recursive: true, force: true })
+    disposeAll(state)
+  }
 })
 
 // ---------------------------------------------------------------------------
