@@ -6,7 +6,7 @@
 
 A dsh (DeepSeek Harness) Cordis plugin that keeps the model catalog of your `llm-pi-ai` provider routes in step with the pi.dev gateway's model listing — written through the official settings seam (`settings.mutate`), with zero patches to dsh internals.
 
-**Requires dsh >= 0.1.7-rc.1** — this plugin targets the dsh RC/stable line only (CI and releases resolve the newest of the `latest`/`next` dist-tags at runtime). **The alpha line is no longer supported.** On dsh 0.1.7+ the settings document is the profile patch (settings.yaml is imported once and renamed); the plugin only ever writes through the official API, so it works unchanged on either shape.
+**Requires dsh >= 0.2.0-rc.2** — this plugin targets the dsh RC/stable line only (CI and releases resolve the newest of the `latest`/`next` dist-tags at runtime). **The alpha line is no longer supported.** On dsh 0.1.7+ the settings document is the profile patch (settings.yaml is imported once and renamed); the plugin only ever writes through the official API, so it works unchanged on either shape.
 
 https://github.com/user-attachments/assets/c3f9c8b1-ea5e-470c-b8a8-60a81fc5c20a
 
@@ -81,7 +81,7 @@ Configure the plugin under the `dsh-model-sync` settings entry — on dsh 0.1.7+
 | `syncNotify` | `false` | Notify on changes (logger + `/model-sync` report) |
 | `forceMaxReasoningEffort` | `false` | Force max reasoning effort on models with a non-empty `thinkingFormat` |
 | `providerNativeFetch` | `true` | Union each mapped provider's first-party `/models` listing into the pi.dev result (additions only) |
-| `keepDeprecatedBuiltin` | `false` | Opt back into emitting builtin ids the official default model list dropped (dsh 0.1.7 removed `deepseek-v4-flash` / `deepseek-v4-flash-vision-exp`; the snapshot keeps the data but no longer syncs them by default) |
+| `keepDeprecatedBuiltin` | `false` | Opt back into emitting builtin ids the official default model list dropped (dsh 0.1.7 removed `deepseek-v4-flash` / `deepseek-v4-flash-vision-exp`; dsh 0.2.0 removed `omen-alpha` on opencode-go and `glm-4.7` / `glm-5-turbo` / `glm-5.1` / `glm-5.2` / `glm-5.2-highspeed` / `glm-5v-turbo` on zai-coding-cn; the snapshot keeps the data but no longer syncs them by default) |
 
 Example (settings section `dsh-model-sync`; a legacy `settings.yaml` `model-sync:` section is not auto-imported by the dsh 0.1.7 host itself — the plugin recovers it once at boot, see above):
 

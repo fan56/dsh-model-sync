@@ -12,11 +12,13 @@
  * Entries marked `deprecated: true` are ids the official default model list
  * dropped (dsh 0.1.7-rc.1 removed deepseek-v4-flash /
  * deepseek-v4-flash-vision-exp; DeepSeek renamed deepseek-v4-flash →
- * deepseek-flash on its own listing). The data is retained for historical
- * user configurations: keepBuiltinOnly emission skips deprecated ids
- * unless keepDeprecatedBuiltin opts back in. Marks and entries survive
- * regeneration — this script re-adds them even when the installed catalog
- * no longer lists the id.
+ * deepseek-flash on its own listing. dsh 0.2.0-rc.2 removed omen-alpha
+ * on opencode-go and six zai-coding-cn ids: glm-4.7, glm-5-turbo,
+ * glm-5.1, glm-5.2, glm-5.2-highspeed, glm-5v-turbo). The data is
+ * retained for historical user configurations: keepBuiltinOnly emission
+ * skips deprecated ids unless keepDeprecatedBuiltin opts back in. Marks
+ * and entries survive regeneration — this script re-adds them even when
+ * the installed catalog no longer lists the id.
  *
  * @module dsh-model-sync/builtin-catalog-snapshot
  */
@@ -39,12 +41,14 @@ export const BUILTIN_CATALOG_SNAPSHOT: BuiltinCatalogSnapshotMap = {
     { id: 'deepseek-v4-flash', api: 'openai-completions', maxTokens: 384000, deprecated: true },
     { id: 'deepseek-v4-flash-vision-exp', api: 'openai-completions', maxTokens: 384000, deprecated: true },
     { id: 'deepseek-v4-pro', api: 'openai-completions', maxTokens: 384000 },
+    { id: 'deepseek-v4.1-flash', api: 'openai-completions', maxTokens: 384000 },
     { id: 'glm-5.1', api: 'openai-completions', maxTokens: 32768 },
     { id: 'glm-5.2', api: 'openai-completions', maxTokens: 131072 },
     { id: 'glm-5.3', api: 'openai-completions', maxTokens: 131072 },
     { id: 'glm-5.3-flash', api: 'openai-completions', maxTokens: 131072 },
     { id: 'gpt-5.6-luna', api: 'openai-responses', maxTokens: 128000 },
     { id: 'grok-4.6', api: 'openai-responses', maxTokens: 500000 },
+    { id: 'grok-4.7', api: 'openai-responses', maxTokens: 500000 },
     { id: 'hy3', api: 'openai-completions', maxTokens: 128000 },
     { id: 'hy4-preview', api: 'openai-completions', maxTokens: 64000 },
     { id: 'kimi-k2.6', api: 'openai-completions', maxTokens: 65536 },
@@ -53,11 +57,13 @@ export const BUILTIN_CATALOG_SNAPSHOT: BuiltinCatalogSnapshotMap = {
     { id: 'longcat-2.0', api: 'openai-completions', maxTokens: 131072 },
     { id: 'mimo-v2.5', api: 'openai-completions', maxTokens: 128000 },
     { id: 'mimo-v2.5-pro', api: 'openai-completions', maxTokens: 128000 },
+    { id: 'mimo-v2.6-flash', api: 'openai-completions', maxTokens: 131072 },
+    { id: 'mimo-v2.6-pro', api: 'openai-completions', maxTokens: 131072 },
     { id: 'minimax-m2.7', api: 'openai-completions', maxTokens: 131072 },
     { id: 'minimax-m3', api: 'anthropic-messages', maxTokens: 131072 },
     { id: 'muse-spark-1.2-contributor', api: 'openai-responses', maxTokens: 131072 },
     { id: 'muse-spark-1.3-contributor', api: 'openai-responses', maxTokens: 131072 },
-    { id: 'omen-alpha', api: 'openai-completions', maxTokens: 128000 },
+    { id: 'omen-alpha', api: 'openai-completions', maxTokens: 128000, deprecated: true },
     { id: 'qwen3.6-plus', api: 'openai-completions', maxTokens: 65536 },
     { id: 'qwen3.7-max', api: 'openai-completions', maxTokens: 65536 },
     { id: 'qwen3.7-plus', api: 'openai-completions', maxTokens: 65536 },
@@ -66,18 +72,20 @@ export const BUILTIN_CATALOG_SNAPSHOT: BuiltinCatalogSnapshotMap = {
   ],
   'xiaomi-token-plan-cn': [
     { id: 'mimo-v2.5', api: 'openai-completions', maxTokens: 131072 },
-    { id: 'mimo-v2.5-pro', api: 'openai-completions', maxTokens: 131072 }
+    { id: 'mimo-v2.5-pro', api: 'openai-completions', maxTokens: 131072 },
+    { id: 'mimo-v2.6-flash', api: 'openai-completions', maxTokens: 131072 },
+    { id: 'mimo-v2.6-pro', api: 'openai-completions', maxTokens: 131072 }
   ],
   'zai-coding-cn': [
     { id: 'glm-4.6v', api: 'openai-completions', maxTokens: 32768 },
-    { id: 'glm-4.7', api: 'openai-completions', maxTokens: 131072 },
-    { id: 'glm-5-turbo', api: 'openai-completions', maxTokens: 131072 },
-    { id: 'glm-5.1', api: 'openai-completions', maxTokens: 131072 },
-    { id: 'glm-5.2', api: 'openai-completions', maxTokens: 131072 },
-    { id: 'glm-5.2-highspeed', api: 'openai-completions', maxTokens: 131072 },
+    { id: 'glm-4.7', api: 'openai-completions', maxTokens: 131072, deprecated: true },
+    { id: 'glm-5-turbo', api: 'openai-completions', maxTokens: 131072, deprecated: true },
+    { id: 'glm-5.1', api: 'openai-completions', maxTokens: 131072, deprecated: true },
+    { id: 'glm-5.2', api: 'openai-completions', maxTokens: 131072, deprecated: true },
+    { id: 'glm-5.2-highspeed', api: 'openai-completions', maxTokens: 131072, deprecated: true },
     { id: 'glm-5.3', api: 'openai-completions', maxTokens: 131072 },
     { id: 'glm-5.3-flash', api: 'openai-completions', maxTokens: 131072 },
     { id: 'glm-5.3-highspeed', api: 'openai-completions', maxTokens: 131072 },
-    { id: 'glm-5v-turbo', api: 'openai-completions', maxTokens: 131072 }
+    { id: 'glm-5v-turbo', api: 'openai-completions', maxTokens: 131072, deprecated: true }
   ]
 }

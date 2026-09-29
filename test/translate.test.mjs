@@ -840,8 +840,12 @@ check('deprecated 0.1.7: snapshot keeps the retired deepseek entries marked depr
   assert.equal(flash.api, 'openai-completions', 'retained data keeps its api')
   assert.equal(flash.maxTokens, 384000, 'retained data keeps its maxTokens')
   // Everything else stays unmarked — the deprecation is per-id, not per-route.
-  assert.ok(og.filter(m => m.deprecated).every(m => m.id.startsWith('deepseek-v4-flash')),
-    'only the two retired ids carry the deprecated mark')
+  // (0.2.0 update: omen-alpha joined the retired set on this route, see the
+  // 0.2.0 block below.)
+  const ogDeprecated = og.filter(m => m.deprecated).map(m => m.id).sort()
+  assert.deepEqual(ogDeprecated,
+    ['deepseek-v4-flash', 'deepseek-v4-flash-vision-exp', 'omen-alpha'],
+    'retired ids on opencode-go: exactly the 0.1.7 pair plus 0.2.0 omen-alpha')
 })
 
 check('deprecated 0.1.7: keepBuiltinOnly emission skips retired ids unless opted in', () => {
@@ -863,6 +867,48 @@ check('deprecated 0.1.7: keepBuiltinOnly emission skips retired ids unless opted
   const withPiDev = getBuiltinOnlyEntries('opencode-go', [{ id: 'deepseek-v4-pro' }], builtinData, true)
   assert.ok(!withPiDev.some(e => e.id === 'deepseek-v4-pro'), 'pi.dev ids are not re-emitted')
   assert.ok(withPiDev.some(e => e.id === 'deepseek-v4-flash'), 'opt-in still applies alongside')
+})
+
+// ---------------------------------------------------------------------------
+// 0.2.0 snapshot deprecation: pi-ai 0.85.1 -> 0.87.1 removed ids from the
+// routes we snapshot (opencode-go: omen-alpha; zai-coding-cn: glm-4.7,
+// glm-5-turbo, glm-5.1, glm-5.2, glm-5.2-highspeed, glm-5v-turbo — the route
+// dropped from 10 to 4 entries). Same contract as the 0.1.7 pair above: data
+// retained for historical user configurations, skipped by keepBuiltinOnly.
+// ---------------------------------------------------------------------------
+check('deprecated 0.2.0: removed ids are retained and marked on both routes', () => {
+  const og = BUILTIN_CATALOG_SNAPSHOT['opencode-go']
+  const omen = og.find(m => m.id === 'omen-alpha')
+  assert.ok(omen, 'omen-alpha data is retained (no deletion)')
+  assert.equal(omen.deprecated, true, 'omen-alpha is marked deprecated')
+  assert.equal(omen.maxTokens, 128000, 'retained data keeps its maxTokens')
+
+  const zai = BUILTIN_CATALOG_SNAPSHOT['zai-coding-cn']
+  const retiredZai = ['glm-4.7', 'glm-5-turbo', 'glm-5.1', 'glm-5.2', 'glm-5.2-highspeed', 'glm-5v-turbo']
+  for (const id of retiredZai) {
+    const entry = zai.find(m => m.id === id)
+    assert.ok(entry, `${id} data is retained (no deletion)`)
+    assert.equal(entry.deprecated, true, `${id} is marked deprecated`)
+    assert.equal(entry.api, 'openai-completions', `${id} retained data keeps its api`)
+  }
+  const zaiDeprecated = zai.filter(m => m.deprecated).map(m => m.id).sort()
+  assert.deepEqual(zaiDeprecated, retiredZai.slice().sort(),
+    'exactly the six retired zai ids carry the mark on this route')
+  assert.ok(zai.find(m => m.id === 'glm-5.3' && !m.deprecated),
+    'current ids (glm-5.3) stay unmarked')
+})
+
+check('deprecated 0.2.0: keepBuiltinOnly emission skips the retired zai ids unless opted in', () => {
+  const builtinData = BUILTIN_CATALOG_SNAPSHOT['zai-coding-cn']
+  const byDefault = getBuiltinOnlyEntries('zai-coding-cn', [], builtinData, false)
+  assert.ok(!byDefault.some(e => e.id === 'glm-5.2'),
+    'glm-5.2 must not be re-emitted by default')
+  assert.ok(byDefault.some(e => e.id === 'glm-5.3'),
+    'current ids still emit (glm-5.3)')
+
+  const optIn = getBuiltinOnlyEntries('zai-coding-cn', [], builtinData, true)
+  assert.ok(optIn.some(e => e.id === 'glm-5.2'),
+    'keepDeprecatedBuiltin=true opts the retired zai id back in')
 })
 
 // ---------------------------------------------------------------------------

@@ -184,11 +184,13 @@ function generateSnapshotContent(catalog, deprecatedMarks) {
     ' * Entries marked `deprecated: true` are ids the official default model list',
     ' * dropped (dsh 0.1.7-rc.1 removed deepseek-v4-flash /',
     ' * deepseek-v4-flash-vision-exp; DeepSeek renamed deepseek-v4-flash →',
-    ' * deepseek-flash on its own listing). The data is retained for historical',
-    ' * user configurations: keepBuiltinOnly emission skips deprecated ids',
-    ' * unless keepDeprecatedBuiltin opts back in. Marks and entries survive',
-    ' * regeneration — this script re-adds them even when the installed catalog',
-    ' * no longer lists the id.',
+    ' * deepseek-flash on its own listing. dsh 0.2.0-rc.2 removed omen-alpha',
+    ' * on opencode-go and six zai-coding-cn ids: glm-4.7, glm-5-turbo,',
+    ' * glm-5.1, glm-5.2, glm-5.2-highspeed, glm-5v-turbo). The data is',
+    ' * retained for historical user configurations: keepBuiltinOnly emission',
+    ' * skips deprecated ids unless keepDeprecatedBuiltin opts back in. Marks',
+    ' * and entries survive regeneration — this script re-adds them even when',
+    ' * the installed catalog no longer lists the id.',
     ' *',
     ' * @module dsh-model-sync/builtin-catalog-snapshot',
     ' */',
@@ -246,10 +248,20 @@ function compareCatalogs(installed, existing) {
 
     const installedIds = new Set(installedModels.map(m => m.id))
     const existingIds = new Set(existingModels.map(m => m.id))
+    // Ids the snapshot marks deprecated are retained by design (historical
+    // user configurations) even when the installed catalog no longer lists
+    // them — exempt them from the "extra in snapshot" gate, else --check can
+    // never pass once a deprecated id leaves the installed data files
+    // (first happened with the dsh 0.2.0-rc.2 removals).
+    const deprecatedInExisting = new Set(
+      existingModels.filter(m => m?.deprecated === true).map(m => m.id)
+    )
 
     // Check for missing/extra model ids
     const missingInExisting = [...installedIds].filter(id => !existingIds.has(id))
-    const extraInExisting = [...existingIds].filter(id => !installedIds.has(id))
+    const extraInExisting = [...existingIds]
+      .filter(id => !installedIds.has(id))
+      .filter(id => !deprecatedInExisting.has(id))
 
     if (missingInExisting.length > 0 || extraInExisting.length > 0) {
       diffs.push({

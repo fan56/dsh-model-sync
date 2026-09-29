@@ -6,7 +6,7 @@
 
 一个 dsh（DeepSeek Harness）Cordis 插件：把 `llm-pi-ai` 各 provider 路由的模型目录与 pi.dev 网关的模型列表保持同步——经官方 settings 接缝（`settings.mutate`）写入，对 dsh 内部零补丁。
 
-**要求 dsh >= 0.1.7-rc.1** — 本插件只跟随 dsh RC/stable 线（CI 与发版在运行时解析 latest/next 中更新的 dist-tag）。**不再支持 alpha 线。** dsh 0.1.7 起 settings 文档是 profile patch（旧 settings.yaml 导入一次后改名）；本插件始终只经官方 API 写入，两种形态下行为一致。
+**要求 dsh >= 0.2.0-rc.2** — 本插件只跟随 dsh RC/stable 线（CI 与发版在运行时解析 latest/next 中更新的 dist-tag）。**不再支持 alpha 线。** dsh 0.1.7 起 settings 文档是 profile patch（旧 settings.yaml 导入一次后改名）；本插件始终只经官方 API 写入，两种形态下行为一致。
 
 https://github.com/user-attachments/assets/c3f9c8b1-ea5e-470c-b8a8-60a81fc5c20a
 
@@ -81,7 +81,7 @@ dsh plugin remove @aiwayds/dsh-model-sync
 | `syncNotify` | `false` | 有变更时通知（logger + `/model-sync` 报告） |
 | `forceMaxReasoningEffort` | `false` | 对 `thinkingFormat` 非空的模型强制 max reasoning effort |
 | `providerNativeFetch` | `true` | 把各厂商自家的 `/models` 列表并入 pi.dev 结果（只增不减） |
-| `keepDeprecatedBuiltin` | `false` | 重新同步官方默认列表已移除的内置 id（dsh 0.1.7 移除了 `deepseek-v4-flash` / `deepseek-v4-flash-vision-exp`；快照保留数据但默认不再同步） |
+| `keepDeprecatedBuiltin` | `false` | 重新同步官方默认列表已移除的内置 id（dsh 0.1.7 移除了 `deepseek-v4-flash` / `deepseek-v4-flash-vision-exp`；dsh 0.2.0 移除了 opencode-go 的 `omen-alpha` 与 zai-coding-cn 的 `glm-4.7` / `glm-5-turbo` / `glm-5.1` / `glm-5.2` / `glm-5.2-highspeed` / `glm-5v-turbo`；快照保留数据但默认不再同步） |
 
 示例：
 
