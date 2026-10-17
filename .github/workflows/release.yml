@@ -93,13 +93,18 @@ jobs:
               const [ver, dir] = process.argv.slice(1)
               const deps = JSON.parse(execFileSync("npm", ["view", `@deepseek-ai/dsh@${ver}`, "dependencies", "--json"], { encoding: "utf8" }))
               const overrides = {}
-              // Pin companions to the SELECTED host version, not to the base
-              // of the declared range: when the host line moves, base-pinning
-              // yields old-tower companions that the compat preflight then
-              // disables wholesale ("required plugin did not activate").
-              // Companions ship in the same wave as the host.
-              for (const name of Object.keys(deps ?? {})) {
-                if (name.startsWith("@deepseek-ai/")) overrides[name] = ver
+              // Wave-line companions (dsh / dsh-*) ride the SELECTED host
+              // version; independently versioned scoped packages (cordis,
+              // schemastery, loader — own semver lines) keep their declared
+              // range base. Pinning the latter to the host version asks npm
+              // for versions that do not exist (ETARGET).
+              for (const [name, range] of Object.entries(deps ?? {})) {
+                if (!name.startsWith("@deepseek-ai/")) continue
+                if (name === "@deepseek-ai/dsh" || name.startsWith("@deepseek-ai/dsh-")) {
+                  overrides[name] = ver
+                } else if (/^[~^]/.test(range)) {
+                  overrides[name] = range.replace(/^[~^]/, "")
+                }
               }
               mkdirSync(dir, { recursive: true })
               writeFileSync(`${dir}/package.json`, JSON.stringify({
