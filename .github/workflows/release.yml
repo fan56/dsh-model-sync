@@ -93,11 +93,11 @@ jobs:
               const [ver, dir] = process.argv.slice(1)
               const deps = JSON.parse(execFileSync("npm", ["view", `@deepseek-ai/dsh@${ver}`, "dependencies", "--json"], { encoding: "utf8" }))
               const overrides = {}
-              // Pin companions to the SELECTED host version (not the range's
-              // base): 0.2.1-rc.2 still declares companions at ^0.2.0-rc.2, so
-              // base-pinning yields an rc.2 host with exact 0.2.0 rows — the
-              // compat preflight disables those rows wholesale ("required
-              // plugin did not activate"). Companions ship in the same wave.
+              // Pin companions to the SELECTED host version, not to the base
+              // of the declared range: when the host line moves, base-pinning
+              // yields old-tower companions that the compat preflight then
+              // disables wholesale ("required plugin did not activate").
+              // Companions ship in the same wave as the host.
               for (const name of Object.keys(deps ?? {})) {
                 if (name.startsWith("@deepseek-ai/")) overrides[name] = ver
               }
