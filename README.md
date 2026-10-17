@@ -26,7 +26,7 @@ Model lists drift: providers ship new models, retire old ones, and adjust capabi
 - **Default routes.** When `managedRoutes` is empty, these pi.dev routes are synced: `opencode-go`, `zai-coding-cn`, `minimax-cn`, `xiaomi-token-plan-cn` (`DEFAULT_ROUTES` in `src/index.ts`).
 - **Two write modes** (`writeMode`):
   - `settings` (default) — the zero-patch pipeline: fetch → translate → `settings.mutate`. Self-contained; never touches the settings document directly, only via the official settings API.
-  - `overlay` (legacy) — delegates to the patched `dsh-llm-pi-ai` adapter's `piAiCatalog.refresh()` and merges pi.dev entries in memory (requires the optional patch).
+  - `overlay` (legacy, **deprecated**) — delegates to the patched `dsh-llm-pi-ai` adapter's `piAiCatalog.refresh()` and merges pi.dev entries in memory (requires the optional patch). dsh 0.2.1 removed the `piAiCatalog` seam outright (pi-ai 1.3.0 ModelsStore rework), so every overlay round now degrades to a notice — use the `settings` mode.
 - **Scheduled refresh.** `intervalMinutes` auto rounds (default 240 / 4h) plus a `startupDelaySeconds` initial delay (default 5); each round logs the same report a manual refresh produces. `0` disarms the interval (startup-only). The interval re-arms live when the config changes (`src/index.ts`).
 - **Change reporting / diff.** Every round reports added/removed model ids (`diffModelIds`), and in `settings` mode added/removed/changed entries against the current raw settings (`diffEntries`, `diff.ts`). Dropped and degraded entries are reported with their reasons.
 - **`modelSync` service.** Exposes a `modelSync` service (`syncNow()`) that a UI can call to force one refresh round and read the report.
@@ -71,7 +71,7 @@ Configure the plugin under the `dsh-model-sync` settings entry — on dsh 0.1.7+
 
 | Key | Default | Description |
 |---|---|---|
-| `writeMode` | `'settings'` | Zero-patch pipeline; `'overlay'` for the legacy patched-adapter mode |
+| `writeMode` | `'settings'` | Zero-patch pipeline; `'overlay'` (deprecated since dsh 0.2.1) for the legacy patched-adapter mode |
 | `intervalMinutes` | `240 (4h)` | Auto-refresh interval in minutes; `0` = startup-only |
 | `startupDelaySeconds` | `5` | Delay before the first auto refresh, so the llm adapter is ready |
 | `refreshTimeoutMs` | `120000` | Abort budget for one refresh round's network request (min `1000`) |

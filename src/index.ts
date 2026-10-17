@@ -8,8 +8,11 @@
  * - 'settings' (default): self-contained fetch → translate → settings.mutate
  *   pipeline that writes through the host settings service (zero patch
  *   required; settings.yaml up to dsh 0.1.6, the profile patch on 0.1.7+)
- * - 'overlay' (legacy): uses the patched dsh-llm-pi-ai's piAiCatalog.refresh()
- *   to overlay pi.dev entries in memory (requires patch)
+ * - 'overlay' (legacy, deprecated): delegates to the patched dsh-llm-pi-ai's
+ *   piAiCatalog.refresh() to overlay pi.dev entries in memory. dsh 0.2.1
+ *   removed the piAiCatalog seam entirely (the pi-ai 0.87.1 → 1.3.0
+ *   ModelsStore rework), so this mode can never refresh there and every
+ *   round degrades to a notice; use the settings mode.
  *
  * @module dsh-model-sync
  */
@@ -84,8 +87,10 @@ const OWN_ENTRY_ID = 'dsh-model-sync'
 export const Config = z.object({
   /**
    * Write mode: 'settings' (default, zero-patch settings.mutate pipeline) or
-   * 'overlay' (legacy, delegates to the patched adapter's piAiCatalog.refresh
-   * and requires the optional patch).
+   * 'overlay'. DEPRECATED: 'overlay' delegates to the patched adapter's
+   * piAiCatalog.refresh, a seam dsh 0.2.1 removed outright (pi-ai 1.3.0
+   * ModelsStore rework) — every overlay round now degrades to a notice.
+   * Use the settings mode.
    */
   writeMode: z.union(['settings', 'overlay']).default('settings').volatile(),
   /** Minutes between auto refreshes (default 240 = 4 hours); 0 = startup-only. */
@@ -208,9 +213,11 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
       // Degradation path (never throws): the overlay needs a hand-patched
       // dsh-llm-pi-ai exposing piAiCatalog.refresh(). Since dsh 0.1.2-alpha.3
       // the patch cannot even apply (it shims settingsNamespace and
-      // installSettingsSection, both removed from dsh-settings), so hosts on
-      // the alpha line always land here unless they run the settings mode.
-      return 'catalog refresh is unavailable — the dsh-llm-pi-ai remote-catalog patch is not applied; the model list is the static catalog only.'
+      // installSettingsSection, both removed from dsh-settings), and dsh
+      // 0.2.1 removed the piAiCatalog seam outright (pi-ai 1.3.0 ModelsStore
+      // rework) — so every host now lands here unless it runs the settings
+      // mode, which is the supported path.
+      return 'catalog refresh is unavailable — the dsh-llm-pi-ai remote-catalog patch is not applied (deprecated: dsh 0.2.1 removed the piAiCatalog seam, pi-ai 1.3.0 ModelsStore rework); the model list is the static catalog only. Switch writeMode to the supported settings mode.'
     }
     let providers: readonly { id: string }[]
     try {
@@ -461,6 +468,8 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
   // -----------------------------------------------------------------------
   // Unified syncNow
   // -----------------------------------------------------------------------
+  /** One-shot guard for the overlay-mode deprecation warning. */
+  let overlayDeprecationWarned = false
   const syncNow = async (force: boolean): Promise<string> => {
     // Read the live refs up front; the volatile snapshots are fresh per call.
     const writeMode = config.writeMode.get()
@@ -478,7 +487,15 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
       return syncSettings(config, force)
     }
 
-    // Overlay mode (existing behavior)
+    // Overlay mode (legacy). dsh 0.2.1 removed the piAiCatalog seam (pi-ai
+    // 1.3.0 ModelsStore rework), so this mode can no longer refresh anywhere;
+    // warn once per process and let the round degrade with its notice.
+    if (!overlayDeprecationWarned) {
+      overlayDeprecationWarned = true
+      ctx.logger.warn(
+        "model-sync: writeMode 'overlay' is deprecated — dsh 0.2.1 removed the piAiCatalog seam (pi-ai 1.3.0 ModelsStore rework); switch to the default 'settings' mode",
+      )
+    }
     const llm = ctx.get('llm') as LlmSeam | undefined
     if (llm === undefined || llm.listProviders === undefined || llm.listModels === undefined) {
       return 'llm service is not available yet; try again shortly.'

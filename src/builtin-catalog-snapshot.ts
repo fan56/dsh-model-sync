@@ -14,7 +14,9 @@
  * deepseek-v4-flash-vision-exp; DeepSeek renamed deepseek-v4-flash →
  * deepseek-flash on its own listing. dsh 0.2.0-rc.2 removed omen-alpha
  * on opencode-go and six zai-coding-cn ids: glm-4.7, glm-5-turbo,
- * glm-5.1, glm-5.2, glm-5.2-highspeed, glm-5v-turbo). The data is
+ * glm-5.1, glm-5.2, glm-5.2-highspeed, glm-5v-turbo. dsh 0.2.1-rc.2
+ * (pi-ai 1.3.0) removed six more opencode-go ids: glm-5.1, grok-4.6,
+ * kimi-k2.6, minimax-m2.7, qwen3.6-plus, qwen3.7-max). The data is
  * retained for historical user configurations: keepBuiltinOnly emission
  * skips deprecated ids unless keepDeprecatedBuiltin opts back in. Marks
  * and entries survive regeneration — this script re-adds them even when
@@ -38,37 +40,44 @@ export const BUILTIN_CATALOG_SNAPSHOT: BuiltinCatalogSnapshotMap = {
     { id: 'MiniMax-M3', api: 'anthropic-messages', maxTokens: 512000 }
   ],
   'opencode-go': [
+    { id: 'cat-jam-free', api: 'openai-completions', maxTokens: 131072 },
+    { id: 'claude-haiku-5-5', api: 'anthropic-messages', maxTokens: 128000 },
     { id: 'deepseek-v4-flash', api: 'openai-completions', maxTokens: 384000, deprecated: true },
     { id: 'deepseek-v4-flash-vision-exp', api: 'openai-completions', maxTokens: 384000, deprecated: true },
     { id: 'deepseek-v4-pro', api: 'openai-completions', maxTokens: 384000 },
     { id: 'deepseek-v4.1-flash', api: 'openai-completions', maxTokens: 384000 },
-    { id: 'glm-5.1', api: 'openai-completions', maxTokens: 32768 },
+    { id: 'gemini-4-argon-contributor', api: 'google-generative-ai', maxTokens: 65536 },
+    { id: 'glm-5.1', api: 'openai-completions', maxTokens: 32768, deprecated: true },
     { id: 'glm-5.2', api: 'openai-completions', maxTokens: 131072 },
     { id: 'glm-5.3', api: 'openai-completions', maxTokens: 131072 },
     { id: 'glm-5.3-flash', api: 'openai-completions', maxTokens: 131072 },
     { id: 'gpt-5.6-luna', api: 'openai-responses', maxTokens: 128000 },
-    { id: 'grok-4.6', api: 'openai-responses', maxTokens: 500000 },
+    { id: 'gpt-6-luna', api: 'openai-responses', maxTokens: 128000 },
+    { id: 'grok-4.6', api: 'openai-responses', maxTokens: 500000, deprecated: true },
     { id: 'grok-4.7', api: 'openai-responses', maxTokens: 500000 },
     { id: 'hy3', api: 'openai-completions', maxTokens: 128000 },
     { id: 'hy4-preview', api: 'openai-completions', maxTokens: 64000 },
-    { id: 'kimi-k2.6', api: 'openai-completions', maxTokens: 65536 },
+    { id: 'kimi-k2.6', api: 'openai-completions', maxTokens: 65536, deprecated: true },
     { id: 'kimi-k2.7-code', api: 'openai-completions', maxTokens: 262144 },
     { id: 'kimi-k3', api: 'openai-completions', maxTokens: 131072 },
     { id: 'longcat-2.0', api: 'openai-completions', maxTokens: 131072 },
+    { id: 'longcat-2.5-preview-free', api: 'openai-completions', maxTokens: 131072 },
     { id: 'mimo-v2.5', api: 'openai-completions', maxTokens: 128000 },
     { id: 'mimo-v2.5-pro', api: 'openai-completions', maxTokens: 128000 },
     { id: 'mimo-v2.6-flash', api: 'openai-completions', maxTokens: 131072 },
     { id: 'mimo-v2.6-pro', api: 'openai-completions', maxTokens: 131072 },
-    { id: 'minimax-m2.7', api: 'openai-completions', maxTokens: 131072 },
+    { id: 'minimax-m2.7', api: 'openai-completions', maxTokens: 131072, deprecated: true },
     { id: 'minimax-m3', api: 'anthropic-messages', maxTokens: 131072 },
     { id: 'muse-spark-1.2-contributor', api: 'openai-responses', maxTokens: 131072 },
     { id: 'muse-spark-1.3-contributor', api: 'openai-responses', maxTokens: 131072 },
     { id: 'omen-alpha', api: 'openai-completions', maxTokens: 128000, deprecated: true },
-    { id: 'qwen3.6-plus', api: 'openai-completions', maxTokens: 65536 },
-    { id: 'qwen3.7-max', api: 'openai-completions', maxTokens: 65536 },
-    { id: 'qwen3.7-plus', api: 'openai-completions', maxTokens: 65536 },
+    { id: 'qwen3.6-plus', api: 'openai-completions', maxTokens: 65536, deprecated: true },
+    { id: 'qwen3.7-max', api: 'openai-completions', maxTokens: 65536, deprecated: true },
+    { id: 'qwen3.7-plus', api: 'anthropic-messages', maxTokens: 65536 },
     { id: 'qwen3.8-flash', api: 'anthropic-messages', maxTokens: 131072 },
-    { id: 'qwen3.8-max', api: 'openai-completions', maxTokens: 131072 }
+    { id: 'qwen3.8-max', api: 'anthropic-messages', maxTokens: 131072 },
+    { id: 'space-bunny', api: 'openai-completions', maxTokens: 524288 },
+    { id: 'step-5-preview-free', api: 'openai-completions', maxTokens: 65536 }
   ],
   'xiaomi-token-plan-cn': [
     { id: 'mimo-v2.5', api: 'openai-completions', maxTokens: 131072 },

@@ -164,11 +164,14 @@ await checkAsync('boots with no registry ever appearing (optional peer stays dor
 })
 
 // ---------------------------------------------------------------------------
-// Overlay degradation (dsh 0.1.2-alpha.3): no piAiCatalog service, a working
-// llm seam — syncNow must return the patch-not-applied notice instead of
-// throwing. Load-bearing since alpha.3: the hand patch cannot apply anymore
-// (it shims settingsNamespace/installSettingsSection, both removed from
-// dsh-settings), so every unpatched host takes exactly this path.
+// Overlay degradation (dsh 0.1.2-alpha.3, universal since dsh 0.2.1): no
+// piAiCatalog service, a working llm seam — syncNow must return the
+// patch-not-applied notice instead of throwing. Load-bearing since alpha.3:
+// the hand patch cannot apply anymore (it shims settingsNamespace/
+// installSettingsSection, both removed from dsh-settings); dsh 0.2.1 then
+// removed the piAiCatalog seam outright (pi-ai 1.3.0 ModelsStore rework), so
+// EVERY unpatched host takes exactly this path, and the notice must say the
+// mode is deprecated and point at the settings mode.
 // ---------------------------------------------------------------------------
 await checkAsync('overlay mode degrades with the patch-not-applied notice when piAiCatalog is absent', async () => {
   const root = makeRoot()
@@ -181,6 +184,10 @@ await checkAsync('overlay mode degrades with the patch-not-applied notice when p
   assert.ok(
     report.includes('remote-catalog patch is not applied'),
     `expected the degradation notice, got: ${JSON.stringify(report)}`,
+  )
+  assert.ok(
+    report.includes('deprecated') && report.includes('settings'),
+    `expected the deprecation + settings-mode pointer in the notice, got: ${JSON.stringify(report)}`,
   )
 })
 

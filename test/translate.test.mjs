@@ -840,12 +840,14 @@ check('deprecated 0.1.7: snapshot keeps the retired deepseek entries marked depr
   assert.equal(flash.api, 'openai-completions', 'retained data keeps its api')
   assert.equal(flash.maxTokens, 384000, 'retained data keeps its maxTokens')
   // Everything else stays unmarked — the deprecation is per-id, not per-route.
-  // (0.2.0 update: omen-alpha joined the retired set on this route, see the
-  // 0.2.0 block below.)
+  // (0.2.0 update: omen-alpha joined the retired set on this route. 0.2.1
+  // update: pi-ai 1.3.0 retired six more — glm-5.1, grok-4.6, kimi-k2.6,
+  // minimax-m2.7, qwen3.6-plus, qwen3.7-max — see the 0.2.1 block below.)
   const ogDeprecated = og.filter(m => m.deprecated).map(m => m.id).sort()
   assert.deepEqual(ogDeprecated,
-    ['deepseek-v4-flash', 'deepseek-v4-flash-vision-exp', 'omen-alpha'],
-    'retired ids on opencode-go: exactly the 0.1.7 pair plus 0.2.0 omen-alpha')
+    ['deepseek-v4-flash', 'deepseek-v4-flash-vision-exp', 'glm-5.1', 'grok-4.6',
+      'kimi-k2.6', 'minimax-m2.7', 'omen-alpha', 'qwen3.6-plus', 'qwen3.7-max'],
+    'retired ids on opencode-go: the 0.1.7 pair, 0.2.0 omen-alpha, and the six 0.2.1 pi-ai 1.3.0 removals')
 })
 
 check('deprecated 0.1.7: keepBuiltinOnly emission skips retired ids unless opted in', () => {
@@ -896,6 +898,35 @@ check('deprecated 0.2.0: removed ids are retained and marked on both routes', ()
     'exactly the six retired zai ids carry the mark on this route')
   assert.ok(zai.find(m => m.id === 'glm-5.3' && !m.deprecated),
     'current ids (glm-5.3) stay unmarked')
+})
+
+// ---------------------------------------------------------------------------
+// 0.2.1 snapshot deprecation: pi-ai 0.87.1 -> 1.3.0 (dsh 0.2.1-rc.2) removed
+// six more opencode-go ids: glm-5.1 (already retired on zai-coding-cn in the
+// 0.2.0 wave — this route's copy is a separate mark), grok-4.6, kimi-k2.6,
+// minimax-m2.7, qwen3.6-plus, qwen3.7-max. Same contract as the waves above:
+// data retained for historical user configurations, skipped by
+// keepBuiltinOnly; qwen3.7-plus / qwen3.8-max changed protocol
+// (openai-completions -> anthropic-messages) but stay current ids.
+// ---------------------------------------------------------------------------
+check('deprecated 0.2.1: pi-ai 1.3.0 removals are retained and marked on opencode-go', () => {
+  const og = BUILTIN_CATALOG_SNAPSHOT['opencode-go']
+  const retiredOg = ['glm-5.1', 'grok-4.6', 'kimi-k2.6', 'minimax-m2.7', 'qwen3.6-plus', 'qwen3.7-max']
+  for (const id of retiredOg) {
+    const entry = og.find(m => m.id === id)
+    assert.ok(entry, `${id} data is retained (no deletion)`)
+    assert.equal(entry.deprecated, true, `${id} is marked deprecated`)
+  }
+  // Retained data keeps the api each id had when it left the official list:
+  // grok-4.6 was the one openai-responses entry among the six.
+  assert.equal(og.find(m => m.id === 'grok-4.6').api, 'openai-responses',
+    'grok-4.6 retained data keeps its openai-responses api')
+  assert.equal(og.find(m => m.id === 'kimi-k2.6').maxTokens, 65536,
+    'retained data keeps its maxTokens (kimi-k2.6)')
+  assert.ok(og.find(m => m.id === 'qwen3.7-plus' && !m.deprecated),
+    'qwen3.7-plus survives the protocol change as a current id')
+  assert.ok(og.find(m => m.id === 'qwen3.8-max' && !m.deprecated),
+    'qwen3.8-max survives the protocol change as a current id')
 })
 
 check('deprecated 0.2.0: keepBuiltinOnly emission skips the retired zai ids unless opted in', () => {
