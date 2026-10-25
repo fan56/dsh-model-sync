@@ -16,7 +16,11 @@
  * on opencode-go and six zai-coding-cn ids: glm-4.7, glm-5-turbo,
  * glm-5.1, glm-5.2, glm-5.2-highspeed, glm-5v-turbo. dsh 0.2.1-rc.2
  * (pi-ai 1.3.0) removed six more opencode-go ids: glm-5.1, grok-4.6,
- * kimi-k2.6, minimax-m2.7, qwen3.6-plus, qwen3.7-max). The data is
+ * kimi-k2.6, minimax-m2.7, qwen3.6-plus, qwen3.7-max. The 2026-10
+ * catalog refresh dropped mimo-v2.5/mimo-v2.5-pro on xiaomi-token-plan-cn,
+ * replaced the opencode-go free ids cat-jam-free/space-bunny/
+ * step-5-preview-free with beam-free/minimax-m3.1-flash-free/step-5-preview,
+ * and added MiniMax-M3.1-Flash on minimax-cn). The data is
  * retained for historical user configurations: keepBuiltinOnly emission
  * skips deprecated ids unless keepDeprecatedBuiltin opts back in. Marks
  * and entries survive regeneration — this script re-adds them even when
@@ -37,10 +41,11 @@ export const BUILTIN_CATALOG_SNAPSHOT: BuiltinCatalogSnapshotMap = {
   'minimax-cn': [
     { id: 'MiniMax-M2.7', api: 'anthropic-messages', maxTokens: 131072 },
     { id: 'MiniMax-M2.7-highspeed', api: 'anthropic-messages', maxTokens: 131072 },
-    { id: 'MiniMax-M3', api: 'anthropic-messages', maxTokens: 512000 }
+    { id: 'MiniMax-M3', api: 'anthropic-messages', maxTokens: 524288 },
+    { id: 'MiniMax-M3.1-Flash', api: 'anthropic-messages', maxTokens: 524288 }
   ],
   'opencode-go': [
-    { id: 'cat-jam-free', api: 'openai-completions', maxTokens: 131072 },
+    { id: 'beam-free', api: 'openai-completions', maxTokens: 131072 },
     { id: 'claude-haiku-5-5', api: 'anthropic-messages', maxTokens: 128000 },
     { id: 'deepseek-v4-flash', api: 'openai-completions', maxTokens: 384000, deprecated: true },
     { id: 'deepseek-v4-flash-vision-exp', api: 'openai-completions', maxTokens: 384000, deprecated: true },
@@ -68,6 +73,7 @@ export const BUILTIN_CATALOG_SNAPSHOT: BuiltinCatalogSnapshotMap = {
     { id: 'mimo-v2.6-pro', api: 'openai-completions', maxTokens: 131072 },
     { id: 'minimax-m2.7', api: 'openai-completions', maxTokens: 131072, deprecated: true },
     { id: 'minimax-m3', api: 'anthropic-messages', maxTokens: 131072 },
+    { id: 'minimax-m3.1-flash-free', api: 'openai-completions', maxTokens: 512000 },
     { id: 'muse-spark-1.2-contributor', api: 'openai-responses', maxTokens: 131072 },
     { id: 'muse-spark-1.3-contributor', api: 'openai-responses', maxTokens: 131072 },
     { id: 'omen-alpha', api: 'openai-completions', maxTokens: 128000, deprecated: true },
@@ -76,12 +82,9 @@ export const BUILTIN_CATALOG_SNAPSHOT: BuiltinCatalogSnapshotMap = {
     { id: 'qwen3.7-plus', api: 'anthropic-messages', maxTokens: 65536 },
     { id: 'qwen3.8-flash', api: 'anthropic-messages', maxTokens: 131072 },
     { id: 'qwen3.8-max', api: 'anthropic-messages', maxTokens: 131072 },
-    { id: 'space-bunny', api: 'openai-completions', maxTokens: 524288 },
-    { id: 'step-5-preview-free', api: 'openai-completions', maxTokens: 65536 }
+    { id: 'step-5-preview', api: 'openai-completions', maxTokens: 65536 }
   ],
   'xiaomi-token-plan-cn': [
-    { id: 'mimo-v2.5', api: 'openai-completions', maxTokens: 131072 },
-    { id: 'mimo-v2.5-pro', api: 'openai-completions', maxTokens: 131072 },
     { id: 'mimo-v2.6-flash', api: 'openai-completions', maxTokens: 131072 },
     { id: 'mimo-v2.6-pro', api: 'openai-completions', maxTokens: 131072 }
   ],

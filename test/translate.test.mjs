@@ -377,8 +377,8 @@ check('keepBuiltinOnly=true: builtin-only models are preserved', () => {
   )
 
   assert.ok(result.entries.some(e => e.id === 'mimo-v2-pro'), 'mimo-v2-pro should be preserved with keepBuiltinOnly=true')
-  assert.ok(result.entries.some(e => e.id === 'mimo-v2.5'), 'mimo-v2.5 should still be present')
-  assert.ok(result.entries.some(e => e.id === 'mimo-v2.5-pro'), 'mimo-v2.5-pro should still be present')
+  assert.ok(result.entries.some(e => e.id === 'mimo-v2.6-flash'), 'mimo-v2.6-flash should still be present')
+  assert.ok(result.entries.some(e => e.id === 'mimo-v2.6-pro'), 'mimo-v2.6-pro should still be present')
 })
 
 check('keepBuiltinOnly=false: builtin-only models are NOT included', () => {
