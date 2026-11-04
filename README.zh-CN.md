@@ -139,4 +139,4 @@ npm test        # node --test（pretest 先构建）：diff / translate / writer
 
 ## 许可证
 
-MIT。
+Apache-2.0。

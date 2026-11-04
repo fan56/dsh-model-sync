@@ -137,4 +137,4 @@ The repo also carries the reference patches that document the legacy overlay beh
 
 ## License
 
-MIT.
+Apache-2.0.
