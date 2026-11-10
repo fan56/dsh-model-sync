@@ -1,6 +1,5 @@
 # CI: build, typecheck, test (including the real-cordis integration suite),
-# and a real-host boot smoke on every push to main, every pull request, and a
-# daily schedule.
+# and a real-host boot smoke on every push to main and every pull request.
 #
 # Why the smoke exists: 0.1.3 shipped with unit tests green and crashed every
 # dsh boot — the fake test context could not see cordis's inject gate. CI
@@ -16,19 +15,13 @@
 # `latest` wins over the rc by plain semver compare).
 # scripts/link-dsh-closure.mjs then re-points node_modules/@deepseek-ai/* at
 # that install's closure, so typecheck, tests, and the smoke all run against
-# exactly the code the host ships. The daily schedule re-tests against
-# whatever the rc/stable line has become since the last push, so a new dsh
-# build that breaks the plugin surfaces as a red run within a day instead of
-# at the next release.
+# exactly the code the host ships.
 name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
-  schedule:
-    # Daily 03:41 UTC — catches upstream dsh rc/stable drift without hand-pinning.
-    - cron: '41 3 * * *'
 
 permissions:
   contents: read
