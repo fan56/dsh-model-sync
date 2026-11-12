@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Rides the dsh 0.2.2-rc.2 dev closure; peer floors stay `>= 0.2.0-rc.2`.** The devDependency pins plus the pnpm overrides (`dsh-system-prompt`, `dsh-session-projection`) re-pin `0.2.2-rc.1` → `0.2.2-rc.2` exactly (the wave is complete on npm: every closure package publishes `0.2.2-rc.2`); `@deepseek-ai/dsh-invariants` stays `0.2.0-rc.2` (no `0.2.2` line of it exists on npm and the plugin never imports it). The dev-only `@deepseek-ai/cordis` (`4.1.0`) and `@deepseek-ai/schemastery` (`3.19.0`) pins already match what the rc.2 closure ships (`~4.1.0` / `~3.19.0`) — zero action there. The `>= 0.2.0-rc.2` peer floors are intentionally unchanged: no 0.2.2-only API is used and the host preflight satisfies ranges with `includePrerelease`, so the floor already matches the new rc. ci.yml and release.yml already resolve the host newest-of(latest/next) at runtime with the prerelease-aware node comparator — zero action. Mechanical dependency ride, no source changes. Re-verified: the full test suite passes with 0 failures against the 0.2.2-rc.2 scratch closure; real-host boot smoke PASS on the scratch `0.2.2-rc.2` host (composed, 25s boot window survived, removal restored the stock tree).
+
 ## [0.9.0] - 2026-11-06
 
 ### Added
