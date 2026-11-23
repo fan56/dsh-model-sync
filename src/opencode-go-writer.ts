@@ -13,7 +13,7 @@
 // Design refs: §6.1 (ledger key + preManagedSnapshot), §6.2.4 (ownership-aware
 // merge, double confirmation), §6.2.5 (route-field ownership), §9.1 (one
 // mutate per route), §9.4 (empty route → unset, never `models: []`),
-// §14.4 (eject only managed entries + plugin fields), ADR-004, V5/V9/V13.
+// ADR-004, V5/V9/V13. Rollback lives in opencode-go-migrate.ts.
 
 import type { SettingsModelProfile } from './translate.ts'
 import type { GoRouteSlot } from './opencode-go-grouping.ts'
@@ -125,20 +125,6 @@ export interface GoWriteResult {
   /** Routes whose mutate failed, with an honest reason. */
   failedRoutes: { route: string; reason: string }[]
   /** Planner report adjusted by writer decisions + `moved` association. */
-  report: GoPlanReportEntry[]
-}
-
-export interface GoEjectOptions {
-  routes: readonly string[]
-  keyFingerprint: string
-  settings: SettingsService | undefined
-  ownershipStore: GoOwnershipStore
-  logger: Logger
-}
-
-export interface GoEjectResult {
-  ejected: string[]
-  refused: { route: string; reason: string }[]
   report: GoPlanReportEntry[]
 }
 
@@ -753,132 +739,4 @@ export function associateGoMoves(report: readonly GoPlanReportEntry[]): GoPlanRe
     })
   }
   return [...out.filter((_, i) => !used.has(i)), ...moves]
-}
-
-// ---------------------------------------------------------------------------
-// eject: restore only managed entries + plugin fields (§14.4 / V13)
-// ---------------------------------------------------------------------------
-
-/**
- * Undo the plugin's ownership for the given routes. Restores the pre-managed
- * snapshot for plugin-managed ids, keeps every user-owned / post-takeover
- * value untouched, and unsets only route fields whose current value still
- * equals the value the plugin last wrote. Refuses (with a reason) when the
- * snapshot is missing or any managed model changed under the plugin.
- */
-export async function ejectGoRoutes(options: GoEjectOptions): Promise<GoEjectResult> {
-  const { routes, keyFingerprint, settings, ownershipStore, logger } = options
-  const result: GoEjectResult = { ejected: [], refused: [], report: [] }
-  const desc = settings === undefined ? undefined : findLlmDescriptor(settings)
-
-  for (const route of routes) {
-    const refuse = (reason: string): void => {
-      result.refused.push({ route, reason })
-      result.report.push({ level: 'error', code: 'eject-refused', route, message: `${route}: ${reason}` })
-    }
-    if (settings === undefined || desc === undefined) {
-      refuse('settings service / llm-pi-ai namespace unavailable')
-      continue
-    }
-
-    const key = goOwnershipKey(route, keyFingerprint)
-    let prior: GoOwnershipEntry | undefined
-    try {
-      prior = await ownershipStore.read(key)
-    } catch (err) {
-      refuse(`ownership store unreadable: ${errorText(err)}`)
-      continue
-    }
-    if (prior === undefined) {
-      refuse('no ownership ledger for this route/key')
-      continue
-    }
-    if (prior.preManagedSnapshot === undefined) {
-      refuse('pre-managed snapshot missing; refusing to guess a restore target')
-      continue
-    }
-
-    const current = rawModels(desc, route)
-    const currentById = new Map(current.map((model) => [model.id, model]))
-    let hashMismatch = false
-    for (const [id, record] of Object.entries(prior.managed)) {
-      const model = currentById.get(id)
-      // An id already gone from settings needs no verification; an id still
-      // present must match the hash we last wrote or it is a post-takeover edit.
-      if (model !== undefined && profileHash(model) !== record.hash) {
-        hashMismatch = true
-        break
-      }
-    }
-    if (hashMismatch) {
-      refuse('managed model hash mismatch (user edited after takeover); refusing eject')
-      continue
-    }
-
-    const managedIds = new Set(Object.keys(prior.managed))
-    const userKept = current.filter((model) => !managedIds.has(model.id))
-    const userKeptIds = new Set(userKept.map((model) => model.id))
-    const restored = prior.preManagedSnapshot.filter((model) => !userKeptIds.has(model.id))
-    const ejectModels = sortedModels([...userKept, ...restored])
-
-    const data = rawRoute(desc, route)
-    const ownedFields = prior.routeFields ?? {}
-    const foreignFields = OWNED_FIELDS.filter((field) =>
-      data?.[field] !== undefined && ownedFields[field] === undefined)
-    const ops: SettingsMutationOp[] = []
-    if (ejectModels.length === 0) {
-      // Whole route is plugin-created and now empty; never leave `models: []`.
-      if (foreignFields.length > 0) {
-        refuse('route would be empty but has user-owned fields; refusing whole-route unset')
-        continue
-      }
-      ops.push({ op: 'unset', path: ['providers', route] })
-    } else {
-      ops.push({ op: 'set', path: ['providers', route, 'models'], value: ejectModels })
-      for (const field of OWNED_FIELDS) {
-        if (ownedFields[field] !== undefined && data?.[field] === ownedFields[field]) {
-          ops.push({ op: 'unset', path: ['providers', route, field] })
-        }
-      }
-    }
-
-    let done = false
-    try {
-      await settings.mutate('llm-pi-ai', ops, desc.revision)
-      done = true
-    } catch (err) {
-      if (isConflictError(err)) {
-        try {
-          const fresh = findLlmDescriptor(settings)
-          if (fresh === undefined) throw new Error('llm-pi-ai namespace disappeared on retry')
-          await settings.mutate('llm-pi-ai', ops, fresh.revision)
-          done = true
-        } catch (retryErr) {
-          logger.warn('eject conflict retry failed for %s: %s', route, errorText(retryErr))
-        }
-      } else {
-        logger.warn('eject mutate failed for %s: %s', route, errorText(err))
-      }
-    }
-    if (!done) {
-      refuse('settings mutate failed; ledger kept for retry')
-      continue
-    }
-
-    try {
-      await ownershipStore.delete(key)
-    } catch (err) {
-      // Settings restored; a stale ledger entry is safe (next round treats it
-      // as a fresh key with no managed ids rather than deleting user data).
-      logger.warn('eject ledger cleanup failed for %s: %s', key, errorText(err))
-    }
-    result.ejected.push(route)
-    result.report.push({
-      level: 'info',
-      code: 'ejected',
-      route,
-      message: `restored managed entries of ${route} and removed plugin-owned fields`,
-    })
-  }
-  return result
 }

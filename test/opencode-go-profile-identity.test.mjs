@@ -25,6 +25,7 @@ const LOCK_PATH = join(
 
 const { apply } = await import('../lib/index.js')
 const { fingerprintSection, createFileMigrationStateStore, GO_MIGRATION_STORE_KEY } = await import('../lib/opencode-go-migration.js')
+const { migrationStatusReport } = await import('../lib/opencode-go-migrate.js')
 const { createFileOwnershipStore } = await import('../lib/opencode-go-store.js')
 const { goOwnershipKey } = await import('../lib/opencode-go-planner.js')
 const { parseGoModelsPayload, fingerprintKey } = await import('../lib/opencode-go-source.js')
@@ -464,6 +465,129 @@ test('N2: resolved identity → no identity hint (no false positive); legacy hin
     assert.equal(go.kind, 'success', go.text)
     assert.ok(inst.fetchCalls.length > 0, 'go round fetched the official listing')
     assert.ok(inst.settings.mutations.length > 0, 'go round wrote settings')
+  } finally {
+    inst?.dispose()
+    await rm(LOCK_PATH, { force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 8. D6: distinct status labels for unclaimable migration records
+// ---------------------------------------------------------------------------
+
+const IDENTITY_A = { profileContext: { name: 'A', dir: '/profiles/A' } }
+const APPLIED_IDENTITY = fingerprintSection({ 'opencode-go': structuredClone(LEGACY_CHAT) })
+
+/** Structured status over the real file-backed store (same path as the command). */
+const structuredStatus = async (settings) => migrationStatusReport({
+  settings,
+  migrationStore: createFileMigrationStateStore(loadModelsStore(STORE_FILE), 'A'),
+  keyFingerprint: KEY_FP,
+  routes: {},
+  now: Date.now(),
+}, { caller: 'go', goEnabled: true })
+
+test('D6: foreign-profile record → distinct label, writeAuthority=none, zero writes', async () => {
+  await resetStore({
+    'opencode-go': structuredClone(LEGACY_CHAT),
+    [`A#${GO_MIGRATION_STORE_KEY}`]: { profileKey: 'B', appliedIdentity: APPLIED_IDENTITY },
+  })
+  let inst
+  try {
+    inst = makeInstance({ identity: IDENTITY_A, initialRoutes: { 'opencode-go': structuredClone(LEGACY_CHAT) } })
+    const before = await readFile(STORE_FILE, 'utf8')
+    const text = (await inst.invoke('migrate status')).text
+    assert.match(text, /status: foreign-profile/, text)
+    assert.match(text, /state=foreign-profile/)
+    assert.match(text, /owner=none/)
+    assert.match(text, /writeAuthority=none/)
+    assert.match(text, /profileKey=B/)
+
+    const report = await structuredStatus(inst.settings)
+    assert.equal(report.overall, 'foreign-profile')
+    assert.equal(report.writeAuthority, 'none')
+    assert.deepEqual(report.unclaimed.map((u) => u.kind), ['foreign-profile'])
+    assert.ok(report.routes.every((r) => r.owner === 'none' && r.decision === 'skip'), 'every go route gated')
+    assert.equal(inst.settings.mutations.length, 0, 'zero settings writes')
+    assert.equal(await readFile(STORE_FILE, 'utf8'), before, 'store bytes unchanged')
+  } finally {
+    inst?.dispose()
+    await rm(LOCK_PATH, { force: true })
+  }
+})
+
+test('D6: legacy unscoped record → distinct label, writeAuthority=none, zero writes', async () => {
+  await resetStore({
+    'opencode-go': structuredClone(LEGACY_CHAT),
+    [GO_MIGRATION_STORE_KEY]: { appliedIdentity: APPLIED_IDENTITY }, // no profileKey = old format
+  })
+  let inst
+  try {
+    inst = makeInstance({ identity: IDENTITY_A, initialRoutes: { 'opencode-go': structuredClone(LEGACY_CHAT) } })
+    const before = await readFile(STORE_FILE, 'utf8')
+    const text = (await inst.invoke('migrate status')).text
+    assert.match(text, /status: legacy-store/, text)
+    assert.match(text, /state=legacy-store/)
+    assert.match(text, /owner=none/)
+    assert.match(text, /writeAuthority=none/)
+
+    const report = await structuredStatus(inst.settings)
+    assert.equal(report.overall, 'legacy-store')
+    assert.equal(report.writeAuthority, 'none')
+    assert.deepEqual(report.unclaimed.map((u) => u.kind), ['legacy-store'])
+    assert.equal(report.unclaimed[0].key, GO_MIGRATION_STORE_KEY)
+    assert.ok(report.routes.every((r) => r.owner === 'none' && r.decision === 'skip'))
+    assert.equal(inst.settings.mutations.length, 0, 'zero settings writes')
+    assert.equal(await readFile(STORE_FILE, 'utf8'), before, 'store bytes unchanged')
+
+    // No rollback deletion either: the legacy record survives a status read.
+    assert.deepEqual(await createFileMigrationStateStore(loadModelsStore(STORE_FILE), 'A').read(), undefined)
+  } finally {
+    inst?.dispose()
+    await rm(LOCK_PATH, { force: true })
+  }
+})
+
+test('D6: no record stays legacy-inline/absent; normal applied unchanged', async () => {
+  let inst
+  try {
+    // No record, section present → legacy-inline (NOT legacy-store/absent).
+    await resetStore({ 'opencode-go': structuredClone(LEGACY_CHAT) })
+    inst = makeInstance({ identity: IDENTITY_A, initialRoutes: { 'opencode-go': structuredClone(LEGACY_CHAT) } })
+    const legacyText = (await inst.invoke('migrate status')).text
+    assert.match(legacyText, /status: legacy-inline/, legacyText)
+    assert.doesNotMatch(legacyText, /status: (foreign-profile|legacy-store)/)
+    const legacyReport = await structuredStatus(inst.settings)
+    assert.equal(legacyReport.overall, 'legacy-inline')
+    assert.deepEqual(legacyReport.unclaimed, [])
+    assert.ok(legacyReport.routes.every((r) => r.owner === 'none'))
+    inst.dispose()
+    inst = undefined
+
+    // No record, no section → absent (gate is open by design, unchanged).
+    await resetStore({})
+    inst = makeInstance({ identity: IDENTITY_A })
+    const absentText = (await inst.invoke('migrate status')).text
+    assert.match(absentText, /status: absent/, absentText)
+    const absentReport = await structuredStatus(inst.settings)
+    assert.equal(absentReport.overall, 'absent')
+    assert.deepEqual(absentReport.unclaimed, [])
+    assert.equal(absentReport.writeAuthority, 'go')
+    inst.dispose()
+    inst = undefined
+
+    // A normal apply still yields the applied label + go authority.
+    await resetStore({ 'opencode-go': structuredClone(LEGACY_CHAT) })
+    inst = makeInstance({ identity: IDENTITY_A, initialRoutes: { 'opencode-go': structuredClone(LEGACY_CHAT) } })
+    const plan = parsePlan((await inst.invoke('migrate plan')).text)
+    assert.equal((await inst.invoke(`migrate apply --plan ${plan.planHash} --confirm ${plan.confirmCode} --ack-managed`)).kind, 'success')
+    const appliedText = (await inst.invoke('migrate status')).text
+    assert.match(appliedText, /status: applied/, appliedText)
+    assert.match(appliedText, /owner=go/)
+    const appliedReport = await structuredStatus(inst.settings)
+    assert.equal(appliedReport.overall, 'applied')
+    assert.equal(appliedReport.writeAuthority, 'go')
+    assert.deepEqual(appliedReport.unclaimed, [], 'our own stamped record is not unclaimed')
   } finally {
     inst?.dispose()
     await rm(LOCK_PATH, { force: true })

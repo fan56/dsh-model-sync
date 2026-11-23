@@ -1,7 +1,8 @@
 // P1c wiring: one complete opencode-go round through the REAL command surface.
 // source → planner → writer runs with an injected fetch, an injected ledger in
 // a temp dir, and an in-memory settings seam. No network, no real ~/.dsh, no
-// timers. All three go subcommands' write paths are exercised.
+// timers. The go/adopt write paths are exercised; the retired `eject` command
+// is asserted rejected (B3) instead of falling through to a sync round.
 
 import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
@@ -272,16 +273,14 @@ await checkAsync('adopt go: claims pre-existing models into this key\'s ledger',
   payload: { object: 'list', data: [officialPayload.data[0]] },
 }))
 
-await checkAsync('eject go: only managed routes are removed, missing ledger is refused', () => withHarness(async ({ invoke, settings, storeFile }) => {
-  await invoke('go')
-  assert.equal(settings.state.size, 3)
+await checkAsync('eject go: retired command is rejected with zero writes and no sync round', () => withHarness(async ({ invoke, settings, fetchCalls }) => {
   const result = await invoke('eject go')
-  assert.equal(result.kind, 'success', result.text)
-  assert.match(result.text, /opencode-go: ejected/)
-  assert.equal(settings.state.size, 0, 'plugin-created routes were unset wholesale')
-  const after = JSON.parse(await readFile(storeFile, 'utf8'))
-  assert.equal(after[`opencode-go#${FP}`], undefined)
-  assert.match(result.text, /opencode-go-google: refused — no ownership ledger/)
+  assert.equal(result.kind, 'error', result.text)
+  assert.match(result.text, /retired/)
+  assert.match(result.text, /migrate rollback/)
+  assert.deepEqual(settings.mutations, [], 'retired eject never writes settings')
+  assert.deepEqual(fetchCalls, [], 'retired eject never triggers a sync round')
+  assert.deepEqual(settings.state.size, 0, 'no routes created by the retired command')
 }))
 
 if (failed > 0) {

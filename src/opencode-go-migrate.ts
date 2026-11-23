@@ -46,6 +46,7 @@ import {
   type MigrationState,
   type MigrationStateStore,
   type RouteWriterConfig,
+  type UnclaimedMigrationRecord,
 } from './opencode-go-migration.ts'
 import type { GoOwnershipStore } from './opencode-go-writer.ts'
 import type { Logger, SettingsDescriptor, SettingsMutationOp, SettingsService } from './writer.ts'
@@ -1212,7 +1213,7 @@ export async function applyMigration(
       const entry: GoOwnershipEntry = {
         routeFields: planned.fields,
         managed,
-        // Legacy audit fields, still used by the P1b eject path.
+        // Audit-only pre-managed ids; rollback uses preManagedSection below.
         preManagedSnapshot: current.map((profile) => ({ ...profile })),
         // §14.3 whole-section snapshot: the exact pre-apply section (null when
         // the route did not exist) plus the ids this apply introduced.
@@ -1549,6 +1550,14 @@ export interface MigrationRouteStatus {
 
 export interface MigrateStatusResult {
   overall: MigrationState
+  /**
+   * D6: structured write-authority summary for automation. `none` whenever an
+   * unclaimed record is present (gate closed), otherwise whether any route was
+   * granted write authority. Per-route authority is in `routes[].owner`.
+   */
+  writeAuthority: 'none' | 'go'
+  /** D6: unclaimed migration records (foreign profile / legacy shape) — never claimed. */
+  unclaimed: UnclaimedMigrationRecord[]
   applying: boolean
   routes: MigrationRouteStatus[]
   text: string
@@ -1562,8 +1571,28 @@ export async function migrationStatusReport(
   const record = await readRecord(deps)
   const routeIds = Object.values({ ...GO_SLOT_ROUTES, ...deps.routes })
   const sections = readGoProviderSections(details, routeIds)
-  const overall = migrationStateForPlan(sections, record, routeIds[0])
-  const states = detectRouteStates(sections, record, routeIds, overall)
+  const sectionState = migrationStateForPlan(sections, record, routeIds[0])
+  // D6: the store hides unreadable records from read() (B1). Ask it separately
+  // for provenance so status can name the two unclaimable cases WITHOUT
+  // changing the gate: both keep write authority `none`, claim nothing, and
+  // never authorize rollback deletion. Detection is advisory and read-only.
+  //
+  // Only when read() found NO record for this profile: another profile's own
+  // valid record is normal multi-profile coexistence and must not relabel a
+  // profile that already has its own applied/drifted record (B1 isolation).
+  let unclaimed: UnclaimedMigrationRecord[] = []
+  if (record === undefined) {
+    try {
+      unclaimed = await deps.migrationStore.unclaimedRecords?.() ?? []
+    } catch {
+      // An unreadable store never changes status (same rule as legacyKeys).
+    }
+  }
+  const recordState: MigrationState | undefined = unclaimed.some((r) => r.kind === 'foreign-profile')
+    ? 'foreign-profile'
+    : unclaimed.length > 0 ? 'legacy-store' : undefined
+  const overall = recordState ?? sectionState
+  const states = detectRouteStates(sections, record, routeIds, sectionState)
   const authority: RouteWriterConfig = {
     caller: config?.caller ?? 'go',
     goEnabled: config?.goEnabled ?? true,
@@ -1583,12 +1612,29 @@ export async function migrationStatusReport(
   }
   const routes = routeIds.map((route) => {
     const decision = routeWriter(route, authority, stub)
-    return { route, state: states[route] ?? 'absent', owner: decision.owner, decision: decision.decision, reason: decision.reason }
+    return {
+      route,
+      // An unclaimed record closes the gate for the whole route set; surface
+      // that label on every go route instead of the misleading legacy-inline.
+      state: recordState ?? states[route] ?? 'absent',
+      owner: decision.owner,
+      decision: decision.decision,
+      reason: decision.reason,
+    }
   })
+  const writeAuthority: MigrateStatusResult['writeAuthority'] = unclaimed.length > 0
+    ? 'none'
+    : routes.some((r) => r.owner === 'go' && r.decision === 'write') ? 'go' : 'none'
   const lines = [
     `model-sync migrate status: ${overall}${stub.applying ? ' (applying)' : ''}`,
     ...routes.map((r) => `  ${r.route}: state=${r.state} owner=${r.owner} ${r.decision}${r.reason !== undefined ? ` (${r.reason})` : ''}`),
   ]
+  if (recordState !== undefined) {
+    lines.push(`  unclaimed: ${recordState} writeAuthority=none (不认领 / 不开门 / 不可回滚删除；请在归属 profile 重新运行 /model-sync migrate plan/apply)`)
+    for (const item of unclaimed) {
+      lines.push(`    ${item.kind}: ${item.key}${item.profileKey !== undefined ? ` (profileKey=${item.profileKey})` : ''}`)
+    }
+  }
   // B1 compatibility: unscoped legacy keys are reported but NEVER claimed.
   // A pre-fix record has no profile stamp, so its owner is unknown; adopting
   // it could open the gate for a profile that never consented. Tell the user
@@ -1602,5 +1648,5 @@ export async function migrationStatusReport(
   if (legacy.length > 0) {
     lines.push(`  警告: 检测到 ${legacy.length} 个无 profile 前缀的旧键（归属未知，未认领）: ${legacy.join(', ')}；请在归属 profile 重新运行 /model-sync migrate plan/apply`)
   }
-  return { overall, applying: stub.applying, routes, text: lines.join('\n') }
+  return { overall, writeAuthority, unclaimed, applying: stub.applying, routes, text: lines.join('\n') }
 }

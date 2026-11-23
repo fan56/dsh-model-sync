@@ -15,10 +15,8 @@ import { GO_SLOT_ROUTES, type GoRouteSlot } from './opencode-go-grouping.ts'
 import { goOwnershipKey, planGoRoutes, type GoOwnershipEntry, type GoOwnershipLedger, type GoRouteState } from './opencode-go-planner.ts'
 import { fetchGoOfficialModels, type GoFetchLike, type GoSourceResult } from './opencode-go-source.ts'
 import {
-  ejectGoRoutes,
   writeGoPlan,
   type GoCanWriteDecision,
-  type GoEjectResult,
   type GoOverrideStorer,
   type GoOwnershipStore,
   type GoWriteResult,
@@ -301,26 +299,5 @@ export function formatGoRoundReport(source: GoSourceResult, write: GoWriteResult
   if (write.writtenRoutes.length === 0 && write.failedRoutes.length === 0) {
     lines.push('  no settings changes')
   }
-  return lines.join('\n')
-}
-
-export interface GoRoundEjectDeps {
-  routes: readonly string[]
-  keyFingerprint: string
-  settings: SettingsService | undefined
-  ownershipStore: GoOwnershipStore
-  logger: Logger
-}
-
-/** Eject entry point used by `/model-sync eject go` (design §14.4). */
-export function runGoEject(deps: GoRoundEjectDeps): Promise<GoEjectResult> {
-  return ejectGoRoutes(deps)
-}
-
-/** Format the eject result for command output. */
-export function formatGoEjectReport(result: GoEjectResult): string {
-  const lines = [`opencode-go eject: ${result.ejected.length} ejected, ${result.refused.length} refused`]
-  for (const route of result.ejected) lines.push(`  ${route}: ejected`)
-  for (const refusal of result.refused) lines.push(`  ${refusal.route}: refused — ${refusal.reason}`)
   return lines.join('\n')
 }

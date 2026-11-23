@@ -26,7 +26,15 @@ export const GO_MIGRATION_STORE_SERVICE = 'goMigrationStore'
  */
 export const GO_MIGRATION_STORE_KEY = GO_MIGRATION_STORE_KEY_BASE
 
+/**
+ * D6 (design §6.1 / §14.1): `foreign-profile` and `legacy-store` describe a
+ * migration RECORD this profile will never claim. They are read-only labels —
+ * both keep the gate closed (write authority `none`), never open `applied`,
+ * and never authorize rollback deletion. They must remain distinguishable
+ * from `absent` (no record) and `legacy-inline` (unrecorded section with models).
+ */
 export type MigrationState = 'absent' | 'legacy-inherit' | 'legacy-inline' | 'drifted' | 'applied'
+  | 'foreign-profile' | 'legacy-store'
 /** The writer identity used by the single-writer priority table. */
 export type RouteWriterCaller = 'go' | 'zen' | 'pi.dev'
 /** Effective owner of a route (`none` = migration gate closed). */
@@ -96,6 +104,16 @@ export interface MigrationStatus {
   identityUnavailable?: boolean
 }
 
+/** D6: a migration record this profile must not claim (read-only provenance). */
+export interface UnclaimedMigrationRecord {
+  /** Which design-required status label this record maps to. */
+  kind: 'foreign-profile' | 'legacy-store'
+  /** models-store raw slot the record was found under. */
+  key: string
+  /** Profile stamp found in the record, when present. */
+  profileKey?: string
+}
+
 /** Migration record seam. `write` / `legacyKeys` are optional so read-only test stores keep working. */
 export interface MigrationStateStore {
   read(): Promise<MigrationRecord | undefined>
@@ -103,6 +121,12 @@ export interface MigrationStateStore {
   write?(record: MigrationRecord): Promise<void>
   /** Advisory: unscoped legacy keys found in the shared store (reported, never claimed). */
   legacyKeys?(): Promise<string[]>
+  /**
+   * D6 advisory: migration records that are NOT readable by this profile —
+   * a different `profileKey`, or a pre-fix record with no stamp at all.
+   * Pure read: never writes, never changes `read()`/gate/rollback behavior.
+   */
+  unclaimedRecords?(): Promise<UnclaimedMigrationRecord[]>
 }
 
 export interface RouteWriterConfig {
@@ -430,6 +454,31 @@ export function createFileMigrationStateStore(
     async legacyKeys(): Promise<string[]> {
       const keys = await accessor.listRawKeys()
       return keys.filter((key) => key === GO_MIGRATION_STORE_KEY || isUnscopedStoreKey(key))
+    },
+    async unclaimedRecords(): Promise<UnclaimedMigrationRecord[]> {
+      // No resolved profile → no "foreign" notion; legacy callers keep their
+      // pre-fix read behavior. Status in production always has a profileKey.
+      if (profileKey === undefined) return []
+      const keys = await accessor.listRawKeys()
+      const out: UnclaimedMigrationRecord[] = []
+      for (const key of keys) {
+        const isUnscopedSlot = key === GO_MIGRATION_STORE_KEY
+        const isScopedSlot = !isUnscopedSlot && key.endsWith(`#${GO_MIGRATION_STORE_KEY}`)
+        if (!isUnscopedSlot && !isScopedSlot) continue
+        let raw: Record<string, unknown> | undefined
+        try {
+          raw = await accessor.readRaw(key)
+        } catch {
+          continue // unreadable slot is advisory only; never changes the gate
+        }
+        if (!isRecord(raw)) continue
+        const stamp = typeof raw.profileKey === 'string' && raw.profileKey.length > 0
+          ? raw.profileKey : undefined
+        if (stamp === profileKey) continue // our own record — claimable as before
+        const kind: UnclaimedMigrationRecord['kind'] = stamp === undefined ? 'legacy-store' : 'foreign-profile'
+        out.push(stamp === undefined ? { kind, key } : { kind, key, profileKey: stamp })
+      }
+      return out
     },
   }
 }

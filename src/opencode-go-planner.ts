@@ -151,8 +151,8 @@ export interface GoOwnershipEntry {
   managed: Record<string, GoManagedModel>
   /**
    * Raw models present in the route before the plugin first claimed it (design
-   * §6.1 / ADR-004). Audit-only for the planner; the P1b writer uses it as the
-   * restore target for eject, never as a whole-route write-back.
+   * §6.1 / ADR-004). Audit-only: never used as a whole-route write-back.
+   * Rollback restores from `preManagedSection` (§14.3), not from this field.
    */
   preManagedSnapshot?: SettingsModelProfile[]
   /**

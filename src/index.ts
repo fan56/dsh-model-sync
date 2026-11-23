@@ -62,8 +62,6 @@ import {
   GO_FETCH_SERVICE,
   GO_OWNERSHIP_STORE_SERVICE,
   GO_OVERRIDE_STORER_SERVICE,
-  formatGoEjectReport,
-  runGoEject,
   runGoSyncRound,
   type GoSyncRoundResult,
   type GoSyncRuntimeConfig,
@@ -1299,7 +1297,7 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
     cmdCtx.effect(() => {
       const definition: CommandDefinition = {
         name: 'model-sync',
-        description: 'Force one model-list sync round from the pi.dev gateway into settings; go subcommands: go|status (one full opencode-go round), adopt go, eject go; migrate plan|apply|rollback|status (explicit consent only)',
+        description: 'Force one model-list sync round from the pi.dev gateway into settings; go subcommands: go|status (one full opencode-go round), adopt go; migrate plan|apply|rollback|status (explicit consent only)',
         handler: async (invocation) => {
           const args = invocation.rawInput.trim().split(/\s+/).filter((part) => part.length > 0)
           const [sub, scope] = args
@@ -1308,38 +1306,20 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
           if (sub === 'migrate') {
             return runMigrate(args.slice(1), cmdCtx)
           }
+          // B3 (31 R-4): `eject` is retired — `migrate rollback` is the only
+          // rollback entry. Reject the old invocation explicitly so it never
+          // falls through to a bare sync (which would write to go routes under
+          // a command name the user believed was read-only).
+          if (sub === 'eject') {
+            return { kind: 'error', text: 'model-sync eject go: retired; use /model-sync migrate rollback --plan <hash>' } satisfies CommandResult
+          }
           // Design §7.1 keeps bare `/model-sync` (pi.dev settings sync) exactly
           // as it was. The go subcommands are additive: `go`/`status` run one
-          // full go round, `adopt go` runs it with adoption, `eject go` undoes
-          // plugin ownership (design §14.1 / §14.4). Status stays the read-only
-          // `/opencode-status` command — it is never a write trigger.
-          if ((sub === 'go' || sub === 'status' || sub === 'adopt' || sub === 'eject')
+          // full go round, `adopt go` runs it with adoption. Status stays the
+          // read-only `/opencode-status` command — it is never a write trigger.
+          if ((sub === 'go' || sub === 'status' || sub === 'adopt')
             && (scope === undefined || scope === 'go')) {
             try {
-              if (sub === 'eject') {
-                const { value } = readGoRuntimeConfig(config)
-                const settings = settingsForWriteFrom(cmdCtx)
-                const desc = settings?.describe().find((d) => d.ns === 'llm-pi-ai')
-                const apiKey = await resolveRouteCredentialValue(
-                  cmdCtx as unknown as NativeCredentialContext,
-                  desc,
-                  'opencode-go',
-                  value.ref,
-                )
-                if (apiKey === undefined || apiKey.trim() === '') {
-                  return { kind: 'error', text: `model-sync eject go: no credential value for ${value.ref}; cannot derive the ledger key` } satisfies CommandResult
-                }
-                const ownershipStore = (cmdCtx.get(GO_OWNERSHIP_STORE_SERVICE) as GoOwnershipStore | undefined)
-                  ?? createModelsStoreOwnershipStore(undefined, requireScopedProfileKey())
-                const result = await runGoEject({
-                  routes: Object.values(value.routes),
-                  keyFingerprint: fingerprintKey(apiKey),
-                  settings,
-                  ownershipStore,
-                  logger: cmdCtx.logger as unknown as Logger,
-                })
-                return { kind: 'success', text: formatGoEjectReport(result) } satisfies CommandResult
-              }
               // Route manual rounds through the scheduler so they share the
               // single-flight lock with timer-driven rounds. A second trigger
               // while a round is in flight is skipped and reported (design

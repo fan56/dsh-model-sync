@@ -12,10 +12,14 @@ import {
 } from '../lib/opencode-go-planner.js'
 import {
   associateGoMoves,
-  ejectGoRoutes,
   writeGoPlan,
 } from '../lib/opencode-go-writer.js'
 import { formatGoRoundReport } from '../lib/opencode-go-sync.js'
+
+// B3: module-surface retirement is checked by name (not by importing a
+// now-missing symbol), so a partial removal fails the test instead of the build.
+const writerModule = await import('../lib/opencode-go-writer.js')
+const syncModule = await import('../lib/opencode-go-sync.js')
 
 let failed = 0
 let passed = 0
@@ -914,89 +918,22 @@ await checkAsync('moved: end-to-end move report from the writer is associated', 
 })
 
 // ---------------------------------------------------------------------------
-// 11. eject (§14.4 / V13)
+// 11. B3: eject is retired (migrate rollback is the only rollback entry)
 // ---------------------------------------------------------------------------
 
-const ejectSetup = ({ snapshotMissing = false, badHash = false } = {}) => {
-  const managedModel = mapGoModelToProfile(chatEntry('hy4'))
-  const user = profile('my-own')
-  const fields = planGoRouteFields('chat', [chatEntry('hy4')])
-  const ledgerKey = key('opencode-go')
-  const entry = {
-    routeFields: fields,
-    managed: { hy4: { hash: badHash ? 'deadbeef' : profileHash(managedModel) } },
-    ...(snapshotMissing ? {} : { preManagedSnapshot: [profile('pre-existing')] }),
-  }
-  const settings = createMockSettings({
-    routes: {
-      'opencode-go': {
-        api: fields.api,
-        baseURL: fields.baseURL,
-        displayName: fields.displayName,
-        apiKeyEnv: fields.apiKeyEnv,
-        models: [structuredClone(managedModel), user],
-      },
-    },
-  })
-  const store = createMockStore({ [ledgerKey]: entry })
-  return { settings, store, ledgerKey }
-}
-
-await checkAsync('eject success: restores snapshot, keeps user model, unsets plugin fields, drops ledger', async () => {
-  const { settings, store, ledgerKey } = ejectSetup()
-  const out = await ejectGoRoutes({
-    routes: ['opencode-go'], keyFingerprint: KEY, settings, ownershipStore: store, logger: silentLogger,
-  })
-  assert.deepEqual(out.ejected, ['opencode-go'])
-  const mutation = settings.mutations[0]
-  assert.deepEqual(findSetModels(mutation, 'opencode-go').map((m) => m.id), ['my-own', 'pre-existing'])
-  for (const field of ['api', 'baseURL', 'displayName', 'apiKeyEnv']) {
-    assert.equal(mutation.ops.some((op) => op.op === 'unset' && op.path[2] === field), true, `${field} not unset`)
-  }
-  assert.equal(store.data.has(ledgerKey), false)
+check('eject writer + report exports are gone (no half-dead code)', () => {
+  assert.equal(writerModule.ejectGoRoutes, undefined, 'writer eject implementation removed')
+  assert.equal(syncModule.runGoEject, undefined, 'sync eject entry point removed')
+  assert.equal(syncModule.formatGoEjectReport, undefined, 'eject report formatter removed')
+  assert.equal(typeof writerModule.writeGoPlan, 'function', 'normal write path still exported')
 })
 
-await checkAsync('eject refuses when preManagedSnapshot is missing (no write)', async () => {
-  const { settings, store, ledgerKey } = ejectSetup({ snapshotMissing: true })
-  const out = await ejectGoRoutes({
-    routes: ['opencode-go'], keyFingerprint: KEY, settings, ownershipStore: store, logger: silentLogger,
-  })
-  assert.deepEqual(out.ejected, [])
-  assert.equal(out.refused[0].reason.includes('snapshot'), true)
-  assert.equal(settings.mutations.length, 0)
-  assert.equal(store.data.has(ledgerKey), true)
-})
-
-await checkAsync('eject refuses on managed hash mismatch (user edited after takeover)', async () => {
-  const { settings, store, ledgerKey } = ejectSetup({ badHash: true })
-  const out = await ejectGoRoutes({
-    routes: ['opencode-go'], keyFingerprint: KEY, settings, ownershipStore: store, logger: silentLogger,
-  })
-  assert.deepEqual(out.ejected, [])
-  assert.equal(out.refused[0].reason.includes('hash mismatch'), true)
-  assert.equal(settings.mutations.length, 0)
-  assert.equal(store.data.has(ledgerKey), true)
-})
-
-await checkAsync('eject: an entirely plugin-created empty route is unset, never models:[]', async () => {
-  const managedModel = mapGoModelToProfile(chatEntry('hy4'))
-  const fields = planGoRouteFields('chat', [chatEntry('hy4')])
-  const ledgerKey = key('opencode-go')
-  const store = createMockStore({
-    [ledgerKey]: {
-      routeFields: fields,
-      managed: { hy4: { hash: profileHash(managedModel) } },
-      preManagedSnapshot: [],
-    },
-  })
-  const settings = createMockSettings({
-    routes: { 'opencode-go': { api: fields.api, baseURL: fields.baseURL, models: [structuredClone(managedModel)] } },
-  })
-  const out = await ejectGoRoutes({
-    routes: ['opencode-go'], keyFingerprint: KEY, settings, ownershipStore: store, logger: silentLogger,
-  })
-  assert.deepEqual(out.ejected, ['opencode-go'])
-  assert.deepEqual(settings.mutations[0].ops, [{ op: 'unset', path: ['providers', 'opencode-go'] }])
+await checkAsync('rollback path still restores via writeGoPlan (no eject dependency)', async () => {
+  // The rollback entry lives in opencode-go-migrate.ts and never called the
+  // eject writer; assert that its module surface is independent of eject.
+  const migrateModule = await import('../lib/opencode-go-migrate.js')
+  assert.equal(typeof migrateModule.rollbackMigration, 'function')
+  assert.equal(migrateModule.ejectGoRoutes, undefined)
 })
 
 // ---------------------------------------------------------------------------

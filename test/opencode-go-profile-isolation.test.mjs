@@ -236,7 +236,10 @@ await checkAsync('B1: A applied + B never migrated → B go round and bare sync 
   const b = makeProfile(accessor, 'B', { 'opencode-go': structuredClone(LEGACY_CHAT) })
   const status = await b.invoke('migrate status')
   assert.doesNotMatch(status.text, /status: applied/, 'B must NOT inherit A applied state')
-  assert.match(status.text, /legacy-inline/, status.text)
+  // D6: A's record is foreign to B; the unclaimable label replaces the old
+  // generic legacy-inline text so automation can tell it from "never migrated".
+  assert.match(status.text, /status: foreign-profile/, status.text)
+  assert.match(status.text, /owner=none/, status.text)
 
   const before = b.settings.mutations.length
   const go = await b.invoke('go')
