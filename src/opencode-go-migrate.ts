@@ -245,20 +245,52 @@ export function planHashOf(body: MigrationPlanBody): string {
   return hashCanonical(body)
 }
 
+/** The action-table subset both plan-time simulation and apply consume. */
+export interface MigrationActionTable {
+  routes: readonly MigrationPlannedRoute[]
+  idActions: readonly MigrationIdPlan[]
+}
+
 /**
- * Ids that land under plugin ownership on `route` after applying the table.
- * Reads the SAME `managed` flags the apply executor writes to the ledger, so the
- * B6 notice and the ledger can never disagree (user ruling: update rows are
- * never managed; `move` manages on its destination route only).
+ * THE single source of truth for the per-route "managed after apply" id set.
+ *
+ * It simulates the action table against the SAME settings descriptor apply
+ * will use, so the ids the plan advertises are exactly the ids apply actually
+ * writes or adopts into the ownership ledger. An id already sitting on its
+ * target with a user-edited value (an `update` row, or a `move` onto a
+ * different-valued target) is NEVER claimed: it is not written, so it must not
+ * be advertised as managed anywhere (B6 + user ruling: update never overwrites
+ * and never manages).
+ *
+ * `buildMigrationPlan` derives the informed-consent text from this function,
+ * and `applyMigration` derives the ledger `managed` / `appliedManagedIds` from
+ * the very same `buildRouteWriteStates` computation, so the four surfaces
+ * cannot disagree.
  */
-export function managedIdsForRoute(route: string, actions: readonly MigrationIdPlan[]): string[] {
-  const ids = new Set<string>()
+export function managedIdsAfterApply(
+  table: MigrationActionTable,
+  desc: SettingsDescriptor | undefined,
+): Record<string, string[]> {
+  const { byRoute } = buildRouteWriteStates(table, desc)
+  return Object.fromEntries(
+    [...byRoute].map(([route, state]) => [
+      route,
+      Object.keys(state.managed).sort((a, b) => a.localeCompare(b)),
+    ]),
+  )
+}
+
+const KNOWN_ACTION_OPS: ReadonlySet<string> = new Set<string>(['keep', 'add', 'update', 'move', 'delete'])
+
+/**
+ * Fail-closed guard: any op outside the closed `MigrationIdActionOp` union is
+ * rejected before a single write. Returns the first offending row, if any.
+ */
+export function findUnknownAction(actions: readonly MigrationIdPlan[]): { id: string; op: string } | undefined {
   for (const action of actions) {
-    if (action.managed !== true) continue
-    const targetRoute = action.op === 'move' ? action.to : action.route
-    if (targetRoute === route) ids.add(action.id)
+    if (!KNOWN_ACTION_OPS.has(String(action.op))) return { id: action.id, op: String(action.op) }
   }
-  return [...ids].sort((a, b) => a.localeCompare(b))
+  return undefined
 }
 
 export type ConsentResult =
@@ -585,12 +617,26 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
   for (const id of pinnedIds) pinnedSuggestions.add(id)
 
   // B6 informed-consent text — part of the hashed body: any edit to this notice
-  // changes planHash and invalidates the old confirmCode/ack. The id list is
-  // derived from the SAME `managed` flags apply writes to the ledger, so a
-  // user-modified `update` row is never advertised as managed.
+  // changes planHash and invalidates the old confirmCode/ack. The id list comes
+  // from `managedIdsAfterApply`, the SAME simulation apply uses for the ledger,
+  // so a user-modified `update` row or a move onto a different-valued target is
+  // never advertised as managed.
+  const managedByRoute = managedIdsAfterApply({ routes: plannedRoutes, idActions }, input.descriptor)
+  // N2: no row may claim management on paper if the simulation shows apply
+  // will not actually write/adopt that id. Normalise the per-id `managed`
+  // flags to the simulated set so even the printed `[managed]` marker cannot
+  // disagree with the ledger. (Turning a flag OFF cannot change the simulation
+  // that produced `managedByRoute`, so plan ↔ apply stay deterministic.)
+  for (const action of idActions) {
+    if (action.managed !== true) continue
+    const targetRoute = action.op === 'move' ? action.to : action.route
+    if (targetRoute === undefined || !(managedByRoute[targetRoute] ?? []).includes(action.id)) {
+      action.managed = false
+    }
+  }
   const managedAfterMigration = [
     '[managed-after-migration] 以下模型将交由插件管理：',
-    `  ${scopedRoutes.map((s) => `${s.route}: ${managedIdsForRoute(s.route, idActions).join(', ') || '(none)'}`).join('；')}`,
+    `  ${scopedRoutes.map((s) => `${s.route}: ${managedByRoute[s.route]?.join(', ') || '(none)'}`).join('；')}`,
     '官方下架时，这些模型会在满足「归属账本 + 现值哈希 + 无 override/pin」三闸门且连续 2 轮确认后自动从列表移除。',
   ].join('\n')
 
@@ -753,6 +799,10 @@ export interface MigrateDeps {
   /** Capability flag: `--adopt` is refused at the command layer when the per-id
    *  action table cannot be executed verbatim (design §14.2 fallback). */
   adoptDisabled?: boolean
+  /** TEST FAULT INJECTION ONLY. When set, `applyMigration` appends one bogus
+   *  action with this op to the rebuilt table so the fail-closed gate can be
+   *  exercised. Production callers never set it. */
+  faultInjectOp?: string
   now: number
   /** M-5: true when a go sync round currently holds the single-flight lock. */
   isSyncInFlight?: () => boolean
@@ -853,20 +903,29 @@ interface RouteWriteState {
  * `merged = [...desired]` re-derivation anywhere (31 B2). Every row yields
  * exactly one result, in table order, so plan ↔ apply is checkable row by row.
  *
+ * This same function powers plan-time simulation (`managedIdsAfterApply`) and
+ * apply-time execution, so "will be managed" and "was managed" use ONE source.
+ *
  * Semantics (user rulings + §14.2/§14.3):
- *   keep   → untouched; adopted only when the row is flagged `managed`.
- *   add    → write the official profile unless the id is already present.
+ *   keep   → untouched; adopted only when the row is flagged `managed` AND the
+ *            id is actually present on the route.
+ *   add    → write the official profile unless the id is already present; an
+ *            already-present id is only adopted (managed) if its value matches.
  *   update → NOTHING written, never managed (user-edited value is preserved).
- *   move   → remove from source route, add official profile to destination.
+ *   move   → remove from source route; on the destination, write/adopt the
+ *            official profile ONLY if the target is empty or already holds the
+ *            same value. A different-valued target is a user edit: never
+ *            overwritten, never claimed, and reported as `skipped`.
  *   delete → remove from the route (only rows explicitly listed in the plan).
  *   pinned → expressed by keep (+ add on the target) rows; never moved/deleted.
+ *   default → FAIL-CLOSED: an unknown op throws, it is never silently skipped.
  */
-function buildRouteWriteStates(
-  plan: MigrationPlan,
-  desc: SettingsDescriptor,
+export function buildRouteWriteStates(
+  table: MigrationActionTable,
+  desc: SettingsDescriptor | undefined,
 ): { byRoute: Map<string, RouteWriteState>; results: MigrateApplyActionResult[] } {
   const byRoute = new Map<string, RouteWriteState>()
-  for (const planned of plan.routes) {
+  for (const planned of table.routes) {
     byRoute.set(planned.route, {
       models: new Map(rawModels(desc, planned.route).map((profile) => [profile.id, structuredClone(profile)])),
       managed: {},
@@ -877,10 +936,12 @@ function buildRouteWriteStates(
 
   const claim = (state: RouteWriteState | undefined, action: MigrationIdPlan): void => {
     if (action.managed !== true || state === undefined || action.profile === undefined) return
+    // Never claim an id that is not actually on the route after this action.
+    if (!state.models.has(action.id)) return
     state.managed[action.id] = { hash: profileHash(action.profile) }
   }
 
-  for (const action of plan.idActions) {
+  for (const action of table.idActions) {
     const source = byRoute.get(action.route)
     const result = (status: MigrateApplyActionResult['status'], reason: string): void => {
       results.push({ id: action.id, op: action.op, route: action.route, ...(action.to !== undefined ? { to: action.to } : {}), status, reason })
@@ -915,23 +976,41 @@ function buildRouteWriteStates(
       case 'move': {
         source?.models.delete(action.id)
         const dest = action.to !== undefined ? byRoute.get(action.to) : undefined
-        if (dest !== undefined && action.profile !== undefined) {
-          if (dest.models.has(action.id)) {
-            const existing = dest.models.get(action.id)!
-            if (action.managed === true && profileHash(existing) === profileHash(action.profile)) claim(dest, action)
-          } else {
-            dest.models.set(action.id, structuredClone(action.profile))
-            dest.addedIds.add(action.id)
-            claim(dest, action)
-          }
+        const suffix = action.to !== undefined ? ` → ${action.to}` : ''
+        if (dest === undefined || action.profile === undefined) {
+          result('skipped', `${action.reason}${suffix}: destination/profile unavailable; source copy removed, nothing written to target`)
+          break
         }
-        result('applied', `${action.reason}${action.to !== undefined ? ` → ${action.to}` : ''}`)
+        if (dest.models.has(action.id)) {
+          const existing = dest.models.get(action.id)!
+          if (action.managed === true && profileHash(existing) === profileHash(action.profile)) {
+            claim(dest, action)
+            result('kept', `${action.reason}${suffix}: target already holds the official value; adopted into ledger`)
+          } else {
+            // Different value = user edit on the target. Do not overwrite and
+            // do NOT claim as managed — truthful result + ledger + notice.
+            result('skipped', `${action.reason}${suffix}: target holds a user-modified value; not overwritten, not managed`)
+          }
+        } else {
+          dest.models.set(action.id, structuredClone(action.profile))
+          dest.addedIds.add(action.id)
+          claim(dest, action)
+          result('applied', `${action.reason}${suffix}`)
+        }
         break
       }
       case 'delete':
         source?.models.delete(action.id)
         result('applied', action.reason)
         break
+      default: {
+        // Fail-closed (N4): an unknown op must never silently disappear. Throwing
+        // here means neither plan simulation nor apply can report success on a
+        // table it did not fully execute. `applyMigration` rejects earlier with a
+        // typed reason; this is the last line of defence.
+        const bad = action as MigrationIdPlan
+        throw new Error(`unknown migration action op '${String(bad.op)}' on id ${bad.id}; refusing (adopt-disabled: action table not executable)`)
+      }
     }
   }
   return { byRoute, results }
@@ -966,6 +1045,7 @@ export type MigrateApplyReason =
   | 'confirm-code-mismatch'
   | 'ack-required'
   | 'adopt-disabled'
+  | 'unknown-action'
   | 'nothing-to-apply'
   | 'sync-in-flight'
   | 'write-failed'
@@ -1008,6 +1088,23 @@ export async function applyMigration(
   const consent = verifyConsent(plan, args.planHash, args.confirmCode, args.ackManaged)
   if (!consent.ok) return applyFailure(consent.reason, plan.planHash, plan.confirmCode, `${consent.reason}`)
 
+  // N4 fail-closed: an op outside the closed union can never be executed
+  // verbatim. Reject BEFORE the applying flag, any settings write, or any
+  // ledger write. `faultInjectOp` is a test-only seam; production uses only
+  // plan.idActions (which the builder always keeps inside the union).
+  const actionsToRun: MigrationIdPlan[] = deps.faultInjectOp === undefined
+    ? [...plan.idActions]
+    : [...plan.idActions, {
+      id: '__fault-injected__', op: deps.faultInjectOp as MigrationIdPlan['op'],
+      route: plan.routes[0]?.route ?? 'opencode-go', kind: 'user-extra', pinned: false,
+      reason: 'fault-injected unknown action op',
+    }]
+  const unknown = findUnknownAction(actionsToRun)
+  if (unknown !== undefined) {
+    return applyFailure('unknown-action', plan.planHash, plan.confirmCode,
+      `unknown action op '${unknown.op}' on id '${unknown.id}'; refusing (adopt-disabled: action table not executable)`)
+  }
+
   // Fail-closed fallback (§14.2): if the executor cannot guarantee verbatim
   // table execution, adopt is refused here as well as at the command layer.
   if (deps.adopt === true && (deps.adoptDisabled === true || plan.adoptDisabled)) {
@@ -1034,6 +1131,13 @@ export async function applyMigration(
     return applyFailure('write-failed', plan.planHash, plan.confirmCode, 'settings/llm-pi-ai unavailable')
   }
 
+  // Simulate the action table BEFORE any write. It is pure, and its fail-closed
+  // default throws on an unknown op — doing it here guarantees such a throw
+  // cannot leave a persisted `applying` flag with no restore snapshot.
+  const { byRoute, results: actionResults } = buildRouteWriteStates(
+    { routes: plan.routes, idActions: actionsToRun }, desc,
+  )
+
   // 3. Capture the audit backup and persist `applying` BEFORE the first mutate.
   //    If we crash mid-apply, the record still carries the restore snapshot.
   const backup = captureBackup(plan, desc, deps.now)
@@ -1056,11 +1160,10 @@ export async function applyMigration(
   const managedByRoute: Record<string, string[]> = {}
   let failure: string | undefined
 
-  // The action table is the ONLY write source (31 B2): translate it once into
-  // per-route desired states, then write exactly those states — never re-derive
-  // from `planned.desired`. `actionResults` mirrors idActions row by row.
-  const { byRoute, results: actionResults } = buildRouteWriteStates(plan, desc)
-
+  // The action table is the ONLY write source (31 B2): apply writes exactly the
+  // simulated states above, never re-deriving from `planned.desired`. The SAME
+  // simulation drives the plan's informed text (`managedIdsAfterApply`), so
+  // "will manage" and "did manage" are one computation.
   try {
     for (const planned of plan.routes) {
       const state = byRoute.get(planned.route)
@@ -1068,20 +1171,24 @@ export async function applyMigration(
         routesResult.push({ route: planned.route, status: 'skipped', reason: 'no write state' })
         continue
       }
-      const touched = plan.idActions.some((action) => action.route === planned.route || action.to === planned.route)
+      const touched = actionsToRun.some((action) => action.route === planned.route || action.to === planned.route)
       if (planned.action === 'keep' && !touched) {
-        routesResult.push({ route: planned.route, status: 'skipped', reason: 'already-applied' })
-        managedByRoute[planned.route] = managedIdsForRoute(planned.route, plan.idActions)
+        // No row touches this route: do not write settings, do not write a
+        // ledger entry, and do not list it in appliedManagedIds. Listing it
+        // here used to fabricate a "+route: []" entry never backed by a ledger.
+        routesResult.push({ route: planned.route, status: 'skipped', reason: 'already-applied (no rows touched this route)' })
         continue
       }
       const current = rawModels(desc, planned.route)
-      // Write only ids the table actually changed; keep/update/delete-no rows
-      // leave their models byte-identical.
+      // Write only ops that actually change fields/models. keep/update/delete-no
+      // rows leave the section byte-identical, so no mutate happens for them.
       const ops = routeOps(desc, planned.route, planned.fields, [...state.models.values()])
+      let wroteThisRoute = false
       if (ops.length > 0) {
         try {
           await mutateWithRetry(deps, ops)
           writtenRoutes.push(planned.route)
+          wroteThisRoute = true
         } catch (err) {
           failure = `${planned.route}: settings mutate failed (${errorText(err)})`
           routesResult.push({ route: planned.route, status: 'failed', reason: errorText(err) })
@@ -1089,9 +1196,10 @@ export async function applyMigration(
         }
       }
 
-      // B6: ledger `managed` is exactly the set of ids this apply wrote or
-      // adopted on this route (flagged by the same action rows as the plan's
-      // managed notice). User-owned keeps and user-edited updates are absent.
+      // B6: ledger `managed` is EXACTLY the set of ids this simulation claimed
+      // on this route — the same set the plan advertised. Ids not written or
+      // adopted (user-edited `update`, different-valued `move` target) are
+      // absent. `managedByRoute` is the sole source for `appliedManagedIds`.
       const managed = state.managed
       managedByRoute[planned.route] = Object.keys(managed).sort((a, b) => a.localeCompare(b))
       const ledgerKey = goOwnershipKey(planned.route, deps.keyFingerprint)
@@ -1114,7 +1222,14 @@ export async function applyMigration(
         routesResult.push({ route: planned.route, status: 'failed', reason: errorText(err) })
         break
       }
-      routesResult.push({ route: planned.route, status: 'wrote' })
+      // N1: a route is "wrote" only when settings actually changed. A pure
+      // ledger adoption (keep row, zero ops) is a no-op on settings and must
+      // not inflate the success count.
+      routesResult.push({
+        route: planned.route,
+        status: wroteThisRoute ? 'wrote' : 'skipped',
+        ...(wroteThisRoute ? {} : { reason: 'no-op: route already matches the plan (no settings write)' }),
+      })
     }
   } catch (err) {
     failure = errorText(err)
@@ -1125,10 +1240,11 @@ export async function applyMigration(
     const identityRoutes = Object.keys(readGoProviderSections(llmDescriptor(deps.settings), Object.values(routesOf(deps))) ?? {})
     const liveSections = readGoProviderSections(llmDescriptor(deps.settings), Object.values(routesOf(deps)))
     const identity = fingerprintGoIdentity(liveSections, identityRoutes)
-    // `appliedManagedIds` mirrors the ledger entries actually written above.
-    const managedIds = Object.fromEntries(Object.values(routesOf(deps)).map((route) => [
-      route, managedByRoute[route] ?? managedIdsForRoute(route, plan.idActions),
-    ]))
+    // N3: `appliedManagedIds` mirrors ONLY the ledger entries actually written
+    // above. No fallback to `managedIdsForRoute` for routes skipped by the plan
+    // (e.g. an empty google slot): that used to fabricate a route -> [] entry
+    // with no backing ledger record.
+    const managedIds: Record<string, string[]> = { ...managedByRoute }
     const applied: MigrationRecord = {
       ...(prior ?? {}),
       applying: false,
@@ -1174,8 +1290,15 @@ export async function applyMigration(
     return applyFailure('write-failed', plan.planHash, plan.confirmCode, failure)
   }
 
+  // N1: count the settings writes that actually happened (`writtenRoutes`),
+  // not the per-route result rows (which now include truthful no-op `skipped`
+  // routes). Zero writes must say so explicitly instead of "N routes written".
+  const writtenCount = writtenRoutes.length
+  const headline = writtenCount === 0
+    ? 'migrate apply: 0 routes written (no settings writes; all routes already match / ledger-only adoptions), fingerprint persisted'
+    : `migrate apply: ${writtenCount} routes written, fingerprint persisted`
   const text = [
-    `migrate apply: ${routesResult.filter((r) => r.status === 'wrote').length} routes written, fingerprint persisted`,
+    headline,
     ...routesResult.map((r) => `  ${r.route}: ${r.status}${r.reason !== undefined ? ` (${r.reason})` : ''}`),
     'Per-id results (one per plan action row):',
     ...actionResults.map((a) => `  ${a.status.toUpperCase().padEnd(7)} ${a.op.toUpperCase().padEnd(6)} ${a.route}/${a.id}${a.to !== undefined ? ` → ${a.to}` : ''} — ${a.reason}`),

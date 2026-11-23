@@ -15,7 +15,13 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { apply } from '../lib/index.js'
 import { parseGoModelsPayload } from '../lib/opencode-go-source.js'
-import { buildMigrationPlanFromDeps, applyMigration } from '../lib/opencode-go-migrate.js'
+import {
+  buildMigrationPlanFromDeps,
+  applyMigration,
+  buildRouteWriteStates,
+  findUnknownAction,
+} from '../lib/opencode-go-migrate.js'
+import { goOwnershipKey } from '../lib/opencode-go-planner.js'
 import {
   GO_MIGRATION_STORE_SERVICE,
 } from '../lib/opencode-go-migration.js'
@@ -457,6 +463,295 @@ await checkAsync('9. adopt-disabled: plan labelled, --adopt refused with zero wr
   const direct = await applyPlan(deps, buildPlan(deps))
   assert.equal(direct.ok, false)
   assert.equal(direct.reason, 'adopt-disabled')
+  h.dispose()
+})
+
+// ---------------------------------------------------------------------------
+// N1-N4 — B2/B6 truthfulness fixes (41-b2-verification.md §4)
+// ---------------------------------------------------------------------------
+
+// Shared fixtures derived from the real plan builder (no hand-guessed fields).
+const _seed = createHarness({ initialRoutes: { 'opencode-go': structuredClone(LEGACY_CHAT) } })
+const SEED_PLAN = buildPlan(directDeps(_seed))
+_seed.dispose()
+const FIELDS = Object.fromEntries(SEED_PLAN.routes.map((r) => [r.route, r.fields]))
+const OFFICIAL_PROFILE = Object.fromEntries(SEED_PLAN.routes.map((r) => [r.route, r.desired[0]]))
+const CUSTOM = { id: 'custom-test-model', name: 'custom-test-model', input: ['text'] }
+const routeOf = (route, models) => ({ ...FIELDS[route], models: structuredClone(models) })
+
+/** Parse the per-route managed id lists out of the informed-consent text. */
+function parseManagedNotice(plan) {
+  const out = {}
+  // The notice packs all routes onto one line separated by fullwidth '；'.
+  for (const part of plan.managedAfterMigration.split(/[\n；]/)) {
+    const m = /^\s*([^:]+):\s*(.*)$/.exec(part.trim())
+    if (m === null) continue
+    out[m[1].trim()] = m[2].trim() === '(none)' ? [] : m[2].split(',').map((s) => s.trim()).filter(Boolean)
+  }
+  return out
+}
+
+/** The four surfaces must agree: plan notice, ledger managed, appliedManagedIds
+ *  (plus the per-route route result checked in each scenario below). */
+function assertManagedSurfaces(plan, result, h, expected) {
+  const notice = parseManagedNotice(plan)
+  for (const [route, ids] of Object.entries(expected)) {
+    assert.deepEqual(notice[route] ?? [], ids, `plan notice managed ids on ${route}`)
+    const entry = h.ownership.data.get(goOwnershipKey(route, 'fp'))
+    assert.ok(entry !== undefined, `ledger entry exists for ${route}`)
+    assert.deepEqual(Object.keys(entry.managed).sort(), ids, `ledger managed ids on ${route}`)
+    assert.deepEqual(h.migrationStore.record.appliedManagedIds[route], ids, `appliedManagedIds on ${route}`)
+  }
+  for (const [route, ids] of Object.entries(h.migrationStore.record.appliedManagedIds ?? {})) {
+    assert.deepEqual(ids, expected[route] ?? [], `no extra appliedManagedIds route ${route}`)
+  }
+  for (const [key, entry] of h.ownership.data) {
+    const route = key.split('#')[0]
+    assert.deepEqual(Object.keys(entry.managed).sort(), expected[route] ?? [], `no extra ledger managed ids on ${route}`)
+  }
+  assert.equal(result.ok, true, result.text)
+}
+
+async function runManagedScenario({ initialRoutes, adopt, pinnedModels, expected, extraAssert }) {
+  const h = createHarness({ initialRoutes })
+  const deps = directDeps(h, { adopt, pinnedModels })
+  const plan = buildPlan(deps)
+  const result = await applyPlan(deps, plan)
+  assertManagedSurfaces(plan, result, h, expected)
+  if (extraAssert !== undefined) extraAssert({ h, plan, result, deps })
+  const snapshot = {
+    plan,
+    result,
+    h,
+    appliedManagedIds: structuredClone(h.migrationStore.record.appliedManagedIds ?? {}),
+  }
+  h.dispose()
+  return snapshot
+}
+
+// N1 — zero settings writes must be reported as 0, not "N routes written".
+await checkAsync('N1. zero-write apply (all routes already match) reports 0 routes written, byte-identical settings (command path)', async () => {
+  const initial = {}
+  for (const route of SEED_PLAN.routes) initial[route.route] = routeOf(route.route, route.desired)
+  const h = createHarness({ initialRoutes: initial })
+  const planText = (await h.invoke('migrate plan')).text
+  assert.match(planText, /KEEP\s+opencode-go\/deepseek-v4\.1-flash.*\[managed\]/, 'desired id is already kept, not added')
+  const plan = parsePlan(planText)
+  const beforeBytes = JSON.stringify([...h.settings.state])
+  const beforeMutations = h.settings.mutations.length
+
+  const applied = await h.invoke(`migrate apply --plan ${plan.planHash} --confirm ${plan.confirmCode} --ack-managed`)
+  assert.equal(applied.kind, 'success', applied.text)
+  assert.equal(h.settings.mutations.length, beforeMutations, 'zero settings mutations')
+  assert.equal(JSON.stringify([...h.settings.state]), beforeBytes, 'settings bytes unchanged')
+  assert.match(applied.text, /0 routes written/, 'headline reports zero writes explicitly')
+  assert.doesNotMatch(applied.text, /[1-9]\d* routes written/, 'no inflated success count')
+  const wroteRows = applied.text.split('\n').filter((line) => /^\s{2}\S+: wrote$/.test(line))
+  assert.equal(wroteRows.length, 0, 'no route row claims wrote')
+  h.dispose()
+})
+
+await checkAsync('N1b. non-zero apply count equals the actual number of written routes (command path)', async () => {
+  const h = createHarness({ initialRoutes: { 'opencode-go': structuredClone(LEGACY_CHAT) } })
+  const plan = parsePlan((await h.invoke('migrate plan')).text)
+  const applied = await h.invoke(`migrate apply --plan ${plan.planHash} --confirm ${plan.confirmCode} --ack-managed`)
+  assert.equal(applied.kind, 'success', applied.text)
+  const count = Number(/migrate apply: (\d+) routes written/.exec(applied.text)?.[1])
+  const wroteRows = applied.text.split('\n').filter((line) => /^\s{2}\S+: wrote$/.test(line)).length
+  assert.equal(count, wroteRows, 'headline count == number of wrote rows')
+  assert.equal(count, 3, 'three routes actually written')
+  assert.equal(h.settings.mutations.length, count, 'headline count == actual settings mutations')
+  h.dispose()
+})
+
+// N2 — one managed set drives plan text, apply result, ledger and appliedManagedIds.
+await checkAsync('N2a. add to empty route: managed in all four surfaces', async () => {
+  await runManagedScenario({
+    initialRoutes: { 'opencode-go': structuredClone(LEGACY_CHAT) },
+    expected: {
+      'opencode-go': ['deepseek-v4.1-flash'],
+      'opencode-go-msg': ['qwen4-max'],
+      'opencode-go-resp': ['grok-4.7'],
+    },
+    extraAssert: ({ result }) => {
+      for (const a of result.actions.filter((x) => x.op === 'add')) {
+        assert.equal(a.status, 'applied', `${a.id} add result applied`)
+      }
+    },
+  })
+})
+
+await checkAsync('N2b. move to empty target: destination manages the id in all four surfaces', async () => {
+  await runManagedScenario({
+    initialRoutes: { 'opencode-go': routeOf('opencode-go', [structuredClone(OFFICIAL_PROFILE['opencode-go-msg']), CUSTOM]) },
+    adopt: true,
+    expected: {
+      'opencode-go': ['deepseek-v4.1-flash'],
+      'opencode-go-msg': ['qwen4-max'],
+      'opencode-go-resp': ['grok-4.7'],
+    },
+    extraAssert: ({ h, result }) => {
+      const move = result.actions.find((a) => a.op === 'move' && a.to === 'opencode-go-msg')
+      assert.equal(move?.status, 'applied', 'move onto empty target applied')
+      assert.ok(idsOf(h, 'opencode-go-msg').includes('qwen4-max'), 'target holds the moved id')
+      assert.ok(!idsOf(h, 'opencode-go').includes('qwen4-max'), 'source copy removed')
+    },
+  })
+})
+
+await checkAsync('N2c. move to existing same value: id adopted into ledger, four surfaces agree', async () => {
+  await runManagedScenario({
+    initialRoutes: {
+      'opencode-go': routeOf('opencode-go', [structuredClone(OFFICIAL_PROFILE['opencode-go-msg']), CUSTOM]),
+      'opencode-go-msg': routeOf('opencode-go-msg', [structuredClone(OFFICIAL_PROFILE['opencode-go-msg'])]),
+    },
+    adopt: true,
+    expected: {
+      'opencode-go': ['deepseek-v4.1-flash'],
+      'opencode-go-msg': ['qwen4-max'],
+      'opencode-go-resp': ['grok-4.7'],
+    },
+    extraAssert: ({ result }) => {
+      const move = result.actions.find((a) => a.op === 'move' && a.to === 'opencode-go-msg')
+      assert.equal(move?.status, 'kept', 'move onto identical target is an adoption, not a write')
+      assert.match(move?.reason ?? '', /adopted into ledger/)
+    },
+  })
+})
+
+await checkAsync('N2d. move to existing DIFFERENT value: NOT managed in plan text, result, ledger or appliedManagedIds', async () => {
+  const userEdited = { ...structuredClone(OFFICIAL_PROFILE['opencode-go-msg']), name: 'USER-MODIFIED-COPY' }
+  const { plan, result, appliedManagedIds } = await runManagedScenario({
+    initialRoutes: {
+      'opencode-go': routeOf('opencode-go', [structuredClone(OFFICIAL_PROFILE['opencode-go-msg']), CUSTOM]),
+      'opencode-go-msg': routeOf('opencode-go-msg', [userEdited]),
+    },
+    adopt: true,
+    expected: {
+      'opencode-go': ['deepseek-v4.1-flash'],
+      'opencode-go-msg': [],
+      'opencode-go-resp': ['grok-4.7'],
+    },
+    extraAssert: ({ h }) => {
+      assert.ok(idsOf(h, 'opencode-go-msg').includes('qwen4-max'), 'target still has the id')
+      const kept = h.settings.state.get('opencode-go-msg').models.find((m) => m.id === 'qwen4-max')
+      assert.equal(kept.name, 'USER-MODIFIED-COPY', 'user value not overwritten')
+      assert.ok(!idsOf(h, 'opencode-go').includes('qwen4-max'), 'source copy still removed')
+    },
+  })
+
+  // The plan must NOT advertise the id as managed even though its move row is
+  // flagged managed:true at plan-build time — apply cannot claim it.
+  assert.ok(!((parseManagedNotice(plan)['opencode-go-msg'] ?? []).includes('qwen4-max')),
+    'plan notice excludes the differently-valued target id')
+  assert.ok(plan.idActions.some((a) => a.op === 'update' && a.id === 'qwen4-max' && a.route === 'opencode-go-msg'),
+    'update row exists for the user-edited target')
+  const moveRow = plan.idActions.find((a) => a.op === 'move' && a.id === 'qwen4-max' && a.to === 'opencode-go-msg')
+  assert.ok(moveRow !== undefined)
+  assert.notEqual(moveRow.managed, true, 'per-id move row no longer claims [managed]')
+  const update = result.actions.find((a) => a.op === 'update' && a.id === 'qwen4-max')
+  assert.equal(update?.status, 'skipped', 'update row is a no-op')
+  const move = result.actions.find((a) => a.op === 'move' && a.id === 'qwen4-max' && a.to === 'opencode-go-msg')
+  assert.equal(move?.status, 'skipped', 'move onto a different-valued target is not applied')
+  assert.match(move?.reason ?? '', /not managed/)
+  assert.ok(!Object.values(appliedManagedIds).some((ids) => ids.includes('qwen4-max')),
+    'appliedManagedIds never claims the differently-valued id')
+})
+
+await checkAsync('N2e. pinned: old copy kept as user-owned, target copy managed in all four surfaces', async () => {
+  await runManagedScenario({
+    initialRoutes: {
+      'opencode-go': routeOf('opencode-go', [{ ...structuredClone(OFFICIAL_PROFILE['opencode-go-msg']), name: 'USER-PINNED' }, CUSTOM]),
+    },
+    pinnedModels: ['qwen4-max'],
+    expected: {
+      'opencode-go': ['deepseek-v4.1-flash'],
+      'opencode-go-msg': ['qwen4-max'],
+      'opencode-go-resp': ['grok-4.7'],
+    },
+    extraAssert: ({ h }) => {
+      const oldCopy = h.settings.state.get('opencode-go').models.find((m) => m.id === 'qwen4-max')
+      assert.equal(oldCopy?.name, 'USER-PINNED', 'pinned old copy kept as-is')
+      const newCopy = h.settings.state.get('opencode-go-msg').models.find((m) => m.id === 'qwen4-max')
+      assert.equal(newCopy?.name, OFFICIAL_PROFILE['opencode-go-msg'].name, 'target copy is the official value')
+    },
+  })
+})
+
+await checkAsync('N2f. keep (already official): id adopted into ledger even with zero settings ops on that route', async () => {
+  await runManagedScenario({
+    initialRoutes: {
+      'opencode-go': routeOf('opencode-go', [structuredClone(OFFICIAL_PROFILE['opencode-go']), CUSTOM]),
+    },
+    expected: {
+      'opencode-go': ['deepseek-v4.1-flash'],
+      'opencode-go-msg': ['qwen4-max'],
+      'opencode-go-resp': ['grok-4.7'],
+    },
+    extraAssert: ({ plan, result }) => {
+      const keep = plan.idActions.find((a) => a.op === 'keep' && a.id === 'deepseek-v4.1-flash')
+      assert.equal(keep?.managed, true, 'keep row managed:true')
+      const keepResult = result.actions.find((a) => a.op === 'keep' && a.id === 'deepseek-v4.1-flash')
+      assert.equal(keepResult?.status, 'kept')
+      assert.equal(result.routes.find((r) => r.route === 'opencode-go')?.status, 'skipped', 'no settings write on chat')
+    },
+  })
+})
+
+// N3 — a route skipped by the plan must not create an empty route key anywhere.
+await checkAsync('N3. skipped google route: no empty route key in settings or appliedManagedIds (byte-level)', async () => {
+  const h = createHarness({ initialRoutes: { 'opencode-go': structuredClone(LEGACY_CHAT) } })
+  const beforeBytes = JSON.stringify([...h.settings.state])
+  const plan = parsePlan((await h.invoke('migrate plan')).text)
+  assert.doesNotMatch(plan.text, /^\s{2}opencode-go-google \[/m, 'google route is skipped by plan')
+  const applied = await h.invoke(`migrate apply --plan ${plan.planHash} --confirm ${plan.confirmCode} --ack-managed`)
+  assert.equal(applied.kind, 'success', applied.text)
+  const afterBytes = JSON.stringify([...h.settings.state])
+  assert.ok(!afterBytes.includes('opencode-go-google'), 'settings bytes contain no google route key')
+  assert.equal(afterBytes.includes('opencode-go-google'), beforeBytes.includes('opencode-go-google'),
+    'skipped route did not introduce a settings key')
+  assert.equal(h.settings.state.has('opencode-go-google'), false, 'no google route in settings')
+  const record = h.migrationStore.record
+  assert.equal(Object.hasOwn(record.appliedManagedIds, 'opencode-go-google'), false,
+    'no fabricated "opencode-go-google": [] entry')
+  for (const key of h.ownership.data.keys()) {
+    assert.ok(!key.startsWith('opencode-go-google#'), 'no google ledger entry')
+  }
+  h.dispose()
+})
+
+// N4 — unknown op fails closed: typed refusal, zero partial writes, switch throws.
+await checkAsync('N4. injected unknown op: apply refuses with recognizable reason and zero writes', async () => {
+  const h = createHarness({ initialRoutes: { 'opencode-go': structuredClone(LEGACY_CHAT) } })
+  const plan = buildPlan(directDeps(h))
+  const deps = directDeps(h)
+  deps.faultInjectOp = 'frobnicate'
+  const beforeBytes = JSON.stringify([...h.settings.state])
+  const beforeMutations = h.settings.mutations.length
+  const beforeLedger = h.counters.ledgerWrites
+  const beforeMigrationWrites = h.counters.migrationWrites
+
+  const result = await applyMigration({ planHash: plan.planHash, confirmCode: plan.confirmCode, ackManaged: true }, deps)
+  assert.equal(result.ok, false)
+  assert.equal(result.reason, 'unknown-action', 'recognizable refusal reason')
+  assert.match(result.text, /unknown-action/)
+  assert.match(result.text, /frobnicate/)
+  assert.equal(h.settings.mutations.length, beforeMutations, 'zero settings writes')
+  assert.equal(h.counters.ledgerWrites, beforeLedger, 'zero ledger writes')
+  assert.equal(h.counters.migrationWrites, beforeMigrationWrites, 'zero migration-store writes (no applying flag)')
+  assert.equal(JSON.stringify([...h.settings.state]), beforeBytes, 'settings bytes unchanged')
+
+  assert.deepEqual(findUnknownAction([{ id: 'x', op: 'frobnicate' }]), { id: 'x', op: 'frobnicate' })
+  assert.equal(findUnknownAction(plan.idActions), undefined, 'the builder only emits known ops')
+  const desc = h.settings.describe().find((d) => d.ns === 'llm-pi-ai')
+  assert.throws(
+    () => buildRouteWriteStates(
+      { routes: plan.routes, idActions: [...plan.idActions, { id: 'x', op: 'frobnicate', route: 'opencode-go', kind: 'user-extra', pinned: false, reason: 'bad' }] },
+      desc,
+    ),
+    /unknown migration action op 'frobnicate'/,
+    'switch default throws (no silent skip)',
+  )
   h.dispose()
 })
 
