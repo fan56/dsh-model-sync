@@ -1333,7 +1333,13 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
               // the actionable reason is carried in `text`. Skips (disabled,
               // already-in-flight, migration-applying, disposed) stay success,
               // byte-identical to before.
-              const failed = outcome.reason === 'source-failed' || outcome.reason === 'scheduler-error'
+              const failed = outcome.reason === 'source-failed'
+                || outcome.reason === 'scheduler-error'
+                // B4: an abandoned round must be visible as a failure at the
+                // command surface too (it is not a successful sync). The reason
+                // text carries the actionable "settings changed, next round
+                // retries" guidance; no backoff is scheduled for it.
+                || outcome.reason === 'settings-changed-during-sync'
               return {
                 kind: failed ? 'error' : 'success',
                 text: outcome.text,

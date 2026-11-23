@@ -79,13 +79,28 @@ export interface GoRoundDeps {
   onOwnWrite?: (route: string, managedIds: string[]) => Promise<void>
 }
 
-export type GoRoundReason = 'disabled' | 'settings-unavailable' | 'no-key' | 'source-failed' | 'aborted' | 'migration-gate' | 'completed'
+export type GoRoundReason =
+  | 'disabled'
+  | 'settings-unavailable'
+  | 'no-key'
+  | 'source-failed'
+  | 'aborted'
+  | 'migration-gate'
+  | 'settings-changed-during-sync'
+  | 'completed'
 
 export interface GoSyncRoundResult {
   ok: boolean
   reason: GoRoundReason
   source?: GoSourceResult
   write?: GoWriteResult
+  /**
+   * B4 (31, design §14.7.5): set only when the host settings document revision
+   * moved while the official catalog request was in flight, i.e. the round was
+   * abandoned before building a plan/writing anything. Machine-readable
+   * companion to the user-visible `text` (no write, no ledger/fingerprint).
+   */
+  settingsChanged?: { beforeRevision: number; afterRevision: number }
   /** Human-readable lines for `/model-sync` and the auto-round logger. */
   text: string
 }
@@ -120,6 +135,26 @@ function abortedResult(source: GoSourceResult): GoSyncRoundResult {
     reason: 'aborted',
     source,
     text: 'opencode-go: round aborted (plugin unload); kept last-good, no settings write',
+  }
+}
+
+/**
+ * B4: the user edited settings while the /v1/models request was in flight.
+ * The pre-fetch descriptor is stale, so the round is discarded in full — no
+ * settings mutate, no ledger commit, no fingerprint update — and a later round
+ * re-reads current settings and retries. Never reuse the stale plan here.
+ */
+function settingsChangedResult(source: GoSourceResult, beforeRevision: number, afterRevision: number): GoSyncRoundResult {
+  return {
+    ok: false,
+    reason: 'settings-changed-during-sync',
+    source,
+    settingsChanged: { beforeRevision, afterRevision },
+    text: [
+      `opencode-go: settings changed during the /v1/models fetch (llm-pi-ai revision ${beforeRevision} -> ${afterRevision}); discarding this round`,
+      '  user edits were kept as-is: no settings write, no ownership ledger change, no fingerprint update',
+      '  the next round re-reads the current settings and retries normally',
+    ].join('\n'),
   }
 }
 
@@ -197,6 +232,11 @@ export async function runGoSyncRound(deps: GoRoundDeps): Promise<GoSyncRoundResu
     }
   }
 
+  // B4 (31, design §14.7.5): snapshot the host settings document revision
+  // BEFORE the network wait. This is only a baseline for the post-fetch
+  // freshness check below — never a source for the write plan itself.
+  const preFetchRevision = desc.revision
+
   let source: GoSourceResult
   try {
     source = await fetchGoOfficialModels({
@@ -225,8 +265,30 @@ export async function runGoSyncRound(deps: GoRoundDeps): Promise<GoSyncRoundResu
   // reads below) is in flight. Never reach the writer after unload (§6.3 卸载).
   if (deps.signal?.aborted) return abortedResult(source)
 
+  // B4: re-read the descriptor AFTER the fetch. The plan must describe the
+  // settings we are about to write, not the snapshot used to build the
+  // request. If the host revision moved during the request window a user edit
+  // landed here; writing the pre-fetch plan would silently drop it (no even
+  // SETTINGS_CONFLICT, because the writer's own re-read only sees the new
+  // revision, not the stale merged models). Discard the whole round instead.
+  const freshDesc = llmDescriptor(settings)
+  if (freshDesc === undefined) {
+    return {
+      ok: false,
+      reason: 'settings-unavailable',
+      source,
+      text: 'opencode-go: llm-pi-ai descriptor disappeared during the fetch; no settings write',
+    }
+  }
+  if (freshDesc.revision !== preFetchRevision) {
+    return settingsChangedResult(source, preFetchRevision, freshDesc.revision)
+  }
+
+  // Plan from the post-fetch descriptor so the write target and the plan are
+  // the same object (design §14.7.5). No revision bump → no user edit in the
+  // window → the freshly read state is the correct planning input.
   const currentRoutes = Object.fromEntries(
-    Object.values(routes).map((route) => [route, readRouteState(desc, route)]),
+    Object.values(routes).map((route) => [route, readRouteState(freshDesc, route)]),
   )
   const ownership = await readOwnership(ownershipStore, source.keyFingerprint, Object.values(routes))
   const plan = planGoRoutes({

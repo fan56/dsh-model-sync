@@ -16,6 +16,7 @@ import {
   GO_FETCH_SERVICE,
   GO_OWNERSHIP_STORE_SERVICE,
   GO_OVERRIDE_STORER_SERVICE,
+  runGoSyncRound,
 } from '../lib/opencode-go-sync.js'
 import {
   GO_MIGRATION_STORE_SERVICE,
@@ -66,6 +67,15 @@ function mockSettings(initialRoutes = {}) {
       revision,
       user: { providers: Object.fromEntries([...state].map(([route, data]) => [route, structuredClone(data)])) },
     }],
+    /**
+     * B4 seam: a user saving models in the host settings while a fetch is in
+     * flight. Bumps the document revision exactly like a real settings edit.
+     */
+    userEdit(route, models) {
+      state.set(route, { ...(state.get(route) ?? {}), models: structuredClone(models) })
+      revision += 1
+      return revision
+    },
     async mutate(ns, ops, expectedRevision) {
       assert.equal(ns, 'llm-pi-ai')
       if (expectedRevision !== revision) {
@@ -128,7 +138,7 @@ function makeConfig(overrides = {}) {
   return config
 }
 
-async function withHarness(fn, { initialRoutes = {}, configOverrides = {}, payload = officialPayload, apiKey = KEY, migrationRecord } = {}) {
+async function withHarness(fn, { initialRoutes = {}, configOverrides = {}, payload = officialPayload, apiKey = KEY, migrationRecord, onFetch } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-go-round-'))
   const storeFile = join(dir, 'models-store.json')
   const settings = mockSettings(initialRoutes)
@@ -136,6 +146,9 @@ async function withHarness(fn, { initialRoutes = {}, configOverrides = {}, paylo
   const credentialWrites = []
   const fetchImpl = async (url, init) => {
     fetchCalls.push({ url, headers: init.headers })
+    // B4 seam: mutate the document/revision before the fetch resolves, so the
+    // round sees a stale pre-fetch descriptor but a fresh post-fetch one.
+    if (onFetch !== undefined) await onFetch(settings)
     return { status: 200, json: async () => structuredClone(payload) }
   }
   const tempAccessor = loadModelsStore(storeFile)
@@ -282,6 +295,131 @@ await checkAsync('eject go: retired command is rejected with zero writes and no 
   assert.deepEqual(fetchCalls, [], 'retired eject never triggers a sync round')
   assert.deepEqual(settings.state.size, 0, 'no routes created by the retired command')
 }))
+
+// ---------------------------------------------------------------------------
+// B4 (31): fetch-window settings edits must never be silently overwritten.
+// Direct runGoSyncRound calls give structured assertions on reason/write;
+// the harness case checks the user-visible command surface.
+// ---------------------------------------------------------------------------
+
+function memoryOwnershipStore() {
+  const map = new Map()
+  return {
+    map,
+    async read(key) { return map.get(key) },
+    async write(key, entry) { map.set(key, entry) },
+    async delete(key) { map.delete(key) },
+  }
+}
+
+function directGoRound(settings, { ownershipStore = memoryOwnershipStore(), onFetch, onOwnWrite } = {}) {
+  return runGoSyncRound({
+    settings,
+    ownershipStore,
+    logger: { info() {}, warn() {}, debug() {} },
+    config: {
+      enabled: true,
+      ref: 'OPENCODE_GO_API_KEY',
+      modelsUrl: 'https://opencode.ai/inference/go/v1/models',
+      routes: { chat: 'opencode-go', msg: 'opencode-go-msg', resp: 'opencode-go-resp' },
+      pinnedModels: [],
+      confirmRemovals: 2,
+      adoptExisting: false,
+    },
+    apiKey: KEY,
+    observedAt: 0,
+    fetchImpl: async () => {
+      if (onFetch !== undefined) await onFetch()
+      return { status: 200, json: async () => structuredClone(officialPayload) }
+    },
+    onOwnWrite,
+  })
+}
+
+await checkAsync('B4: settings edit during fetch → zero writes, reason settings-changed-during-sync, user edit kept', async () => {
+  const settings = mockSettings()
+  const store = memoryOwnershipStore()
+  let owned = 0
+  const userModel = { id: 'user-saved-model', name: 'user' }
+  const result = await directGoRound(settings, {
+    ownershipStore: store,
+    onOwnWrite: () => { owned += 1 },
+    onFetch: () => { settings.userEdit('opencode-go', [userModel]) },
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.reason, 'settings-changed-during-sync')
+  assert.deepEqual(result.settingsChanged, { beforeRevision: 1, afterRevision: 2 })
+  assert.equal(result.write, undefined, 'writer was never reached — no half-written round')
+  assert.deepEqual(settings.mutations, [], 'zero settings mutations')
+  assert.deepEqual(settings.state.get('opencode-go').models, [userModel], 'the user edit is preserved verbatim')
+  assert.deepEqual([...store.map.keys()], [], 'no ownership ledger change')
+  assert.equal(owned, 0, 'no appliedFingerprint update')
+  assert.match(result.text, /settings changed during the \/v1\/models fetch/)
+  assert.match(result.text, /no settings write, no ownership ledger change, no fingerprint update/)
+})
+
+await checkAsync('B4: unchanged settings → normal write, then a second idempotent round', async () => {
+  const settings = mockSettings()
+  const store = memoryOwnershipStore()
+  let owned = 0
+  const onOwnWrite = () => { owned += 1 }
+  const first = await directGoRound(settings, { ownershipStore: store, onOwnWrite })
+  assert.equal(first.reason, 'completed')
+  assert.equal(first.ok, true)
+  assert.deepEqual(first.write.writtenRoutes.sort(), ['opencode-go', 'opencode-go-msg', 'opencode-go-resp'])
+  assert.deepEqual(first.write.failedRoutes, [])
+  assert.equal(settings.mutations.length, 3)
+  assert.equal(owned, 3)
+
+  const second = await directGoRound(settings, { ownershipStore: store, onOwnWrite })
+  assert.equal(second.reason, 'completed')
+  assert.deepEqual(second.write.writtenRoutes, [], 'second round is a no-change round')
+  assert.equal(settings.mutations.length, 3, 'no extra mutation on the second round')
+  assert.equal(owned, 3, 'no fingerprint update on a no-change round')
+  assert.equal(second.settingsChanged, undefined)
+})
+
+await checkAsync('B4: store lock timeout and fetch-window edit are distinct failures, both with zero writes', async () => {
+  // A) the cross-process store lock is held → the per-route ledger read fails
+  // closed; the writer reports store-lock-timeout and never mutates settings.
+  const lockedSettings = mockSettings()
+  const lockError = Object.assign(new Error('store lock timeout'), {
+    code: 'DSH_STORE_LOCK_TIMEOUT',
+    name: 'StoreLockTimeoutError',
+  })
+  const lockedStore = {
+    async read() { throw lockError },
+    async write() { throw lockError },
+    async delete() { throw lockError },
+  }
+  const locked = await directGoRound(lockedSettings, { ownershipStore: lockedStore })
+  assert.deepEqual(locked.write.failedRoutes.map((f) => f.reason), [
+    'store-lock-timeout', 'store-lock-timeout', 'store-lock-timeout',
+  ])
+  assert.deepEqual(locked.write.writtenRoutes, [])
+  assert.deepEqual(lockedSettings.mutations, [], 'lock timeout produces zero settings writes')
+
+  // B) no lock problem, but the user edits settings inside the fetch window →
+  // the whole round is abandoned before the writer, with a different reason.
+  const changedSettings = mockSettings()
+  const changed = await directGoRound(changedSettings, {
+    onFetch: () => { changedSettings.userEdit('opencode-go', [{ id: 'user-2', name: 'u2' }]) },
+  })
+  assert.equal(changed.reason, 'settings-changed-during-sync')
+  assert.equal(changed.write, undefined)
+  assert.deepEqual(changedSettings.mutations, [])
+
+  assert.notEqual(locked.write.failedRoutes[0].reason, changed.reason, 'the two failure causes are distinguishable')
+})
+
+await checkAsync('B4 command surface: fetch-window edit returns kind=error with the user-visible reason', () => withHarness(async ({ invoke, settings, fetchCalls }) => {
+  const result = await invoke('go')
+  assert.equal(result.kind, 'error')
+  assert.match(result.text, /settings changed during the \/v1\/models fetch/)
+  assert.equal(fetchCalls.length, 1, 'the request itself still happened')
+  assert.deepEqual(settings.mutations, [], 'no settings write')
+  assert.deepEqual(settings.state.get('opencode-go').models, [{ id: 'user-saved-model', name: 'user' }])
+}, { onFetch: (settings) => settings.userEdit('opencode-go', [{ id: 'user-saved-model', name: 'user' }]) }))
 
 if (failed > 0) {
   console.error(`\n${failed} test(s) failed, ${passed} passed`)
