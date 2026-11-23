@@ -19,7 +19,7 @@ export const OPENCODE_GO_MODELS_URL = 'https://opencode.ai/inference/go/v1/model
 export const OPENCODE_GO_DEFAULT_INTERVAL_MINUTES = 60
 
 /** Explicit UA — the gateway bans default library UAs with CF 1010 (05 §1). */
-export const GO_USER_AGENT = 'dsh-model-sync/0.9.0'
+export const GO_USER_AGENT = 'dsh-model-sync/0.10.0'
 
 /** Auth states carried by the diagnostic report (design §6.1 SourceSnapshot). */
 export type GoAuthStatus = 'unknown' | 'ok' | 'invalid' | 'not-entitled' | 'unreachable'

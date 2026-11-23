@@ -30,7 +30,9 @@ https://github.com/user-attachments/assets/c3f9c8b1-ea5e-470c-b8a8-60a81fc5c20a
 - **定时刷新。** `intervalMinutes` 周期轮（默认 240，即 4 小时）加 `startupDelaySeconds` 启动延迟（默认 5 秒）；每轮自动刷新输出的报告与手动刷新完全相同。`0` 表示关闭周期（仅启动时刷一次）。配置变更时周期会实时重新挂载（`src/index.ts`）。
 - **变更报告 / diff。** 每轮报告新增/移除的模型 id（`diffModelIds`）；`settings` 模式下还会对照当前原始 settings 报告新增/移除/变更的条目（`diffEntries`，`diff.ts`）。被丢弃（dropped）与降级（degraded）的条目连同原因一并报告。
 - **`modelSync` 服务。** 对外暴露 `modelSync` 服务（`syncNow()`），UI 调用它即可强制跑一轮刷新并读取报告。
-- **`/model-sync` 命令。** 插件自行通过共享的 dsh 命令注册表（`@deepseek-ai/dsh-commands`）注册 `/model-sync` 斜杠命令，所有交互式 UI 自动发现并列出——UI 侧零配合。执行它当场强制跑一轮刷新，输出的报告与定时轮完全相同；同步范围由 `managedRoutes` 决定（参数会被忽略）。命令注册表是可选 peer：没有命令注册服务的宿主照常降级，定时刷新与 `modelSync` 服务不受影响。
+- **`/model-sync` 命令。** 插件自行通过共享的 dsh 命令注册表（`@deepseek-ai/dsh-commands`）注册 `/model-sync` 斜杠命令，所有交互式 UI 自动发现并列出——UI 侧零配合。执行它当场强制跑一轮刷新，输出的报告与定时轮完全相同；同步范围由 `managedRoutes` 决定（裸命令后附带的额外参数会被忽略）。命令注册表是可选 peer：没有命令注册服务的宿主照常降级，定时刷新与 `modelSync` 服务不受影响。其子命令为 `go`/`status`（跑一整轮 opencode-go 同步）、`adopt go`（带采纳跑同一轮）、`migrate plan|apply|rollback|status`（唯一的显式同意配置写入路径；`plan` 只读，`apply` 需要 plan hash、6 位确认码与 `--ack-managed`）。`eject` 已下线——回退只用 `migrate rollback`。
+- **opencode-go 同步（需显式开启）。** 设 `opencode.go.enabled: true` 后，三条路由——`opencode-go`（chat-completions）、`opencode-go-msg`（messages）、`opencode-go-resp`（responses）——改为从官方公开 `/v1/models` 清单同步，而非 pi.dev。默认关闭，因此现存手写的 opencode-go 列表在开启前保持冻结。这三条 go 路由与上文的默认 pi.dev `managedRoutes` 相互独立。
+- **`/opencode-status` 只读诊断。** 对照官方 opencode-go `/v1/models` 清单与当前 profile 的路由（零写入、不改 settings）。
 - **翻译规则。** pi.dev 条目被翻译成 settings 可写的模型 profile（`translate.ts`）：base-matching 与 base-less 分类、`reasoningEfforts` 推导（S2 gate）、`compat` 门控到 `openai-completions`（S5 gate）、`maxTokens` 处理，以及混合协议路由的丢弃逻辑。容量值另有卫生门：非正整数的 `contextWindow`，或不是「严格小于 contextWindow 的正整数」的 `maxTokens`（有的列表会把 context window 回声填进 maxTokens），一律跳过不写，并在报告中以降级警告说明。
 - **你的覆盖不会被吃掉。** `modelOverrides` 是你自己的按模型调整通道（think level、收窄 context window 等）。dsh 拒绝 models 列表与非空 modelOverrides 并存，因此同步会把覆盖字段折叠进写入的 models、在同一次写入中清掉该键，并把原值存进 `~/.dsh/models-store.json` 逐轮回放——只要路由仍被托管，覆盖就持续压过同步值。
 - **默认安全的开关：**
@@ -82,6 +84,7 @@ dsh plugin remove @aiwayds/dsh-model-sync
 | `forceMaxReasoningEffort` | `false` | 对 `thinkingFormat` 非空的模型强制 max reasoning effort |
 | `providerNativeFetch` | `true` | 把各厂商自家的 `/models` 列表并入 pi.dev 结果（只增不减） |
 | `keepDeprecatedBuiltin` | `false` | 重新同步官方默认列表已移除的内置 id（dsh 0.1.7 移除了 `deepseek-v4-flash` / `deepseek-v4-flash-vision-exp`；dsh 0.2.0 移除了 opencode-go 的 `omen-alpha` 与 zai-coding-cn 的 `glm-4.7` / `glm-5-turbo` / `glm-5.1` / `glm-5.2` / `glm-5.2-highspeed` / `glm-5v-turbo`；快照保留数据但默认不再同步） |
+| `opencode.go.enabled` | `false` | 开启则对三条 `opencode-go*` 路由改用官方清单同步；默认关闭使现存手写 opencode-go 列表保持冻结（需要同步时显式设 `true`） |
 
 示例：
 
@@ -114,9 +117,11 @@ providers:
 
 另外列表数据本身可能有噪声：容量值有卫生门（正整数；`maxTokens` 必须严格小于 `contextWindow`），被剥离的值会在同步报告里以 `DEGRADED` 行连同原因出现。
 
-### 手动刷新：`/model-sync` 命令
+### 手动刷新：`/model-sync` 与 `/opencode-status`
 
-在任意交互式 UI 里输入 `/model-sync` 即可当场强制跑一轮同步。命令由插件自己注册进共享命令注册表（`@deepseek-ai/dsh-commands`），UI 自动发现。它返回与定时轮相同的报告；同步范围由 `managedRoutes` 决定，命令后面的参数一律忽略。没有命令注册服务的宿主会平滑降级——定时刷新与 `modelSync` 服务照常工作。
+在任意交互式 UI 里输入 `/model-sync` 即可当场强制跑一轮同步。命令由插件自己注册进共享命令注册表（`@deepseek-ai/dsh-commands`），UI 自动发现。它返回与定时轮相同的报告；同步范围由 `managedRoutes` 决定，裸命令后附带的额外参数会被忽略。没有命令注册服务的宿主会平滑降级——定时刷新与 `modelSync` 服务照常工作。
+
+opencode-go 增加了子命令：`/model-sync go`（或 `status`）跑一整轮 go 同步，`/model-sync adopt go` 带采纳跑同一轮，`/model-sync migrate plan|apply|rollback|status` 是唯一的显式同意配置写入路径——`plan` 只读，`apply` 需要 plan hash、6 位确认码与 `--ack-managed`。`eject` 已下线，回退请用 `migrate rollback`。`/opencode-status` 是另一条只读诊断命令，对照官方清单与当前 profile 路由，从不写入 settings 或凭据。
 
 ## 开发
 

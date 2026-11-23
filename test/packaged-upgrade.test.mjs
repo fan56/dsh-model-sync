@@ -23,7 +23,7 @@ const pkgName = '@aiwayds/dsh-model-sync'
 const registry = 'https://registry.npmjs.org'
 const installHooks = ['preinstall', 'install', 'postinstall']
 const baselineVersion = '0.9.0'
-const repoVersion = '0.9.0'
+const repoVersion = '0.10.0'
 const bundlePatch = './cordis.patch.yml'
 
 if (!existsSync(join(repoRoot, 'lib', 'index.js'))) {

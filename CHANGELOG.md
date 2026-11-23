@@ -14,6 +14,93 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **Rides the dsh 0.2.2-rc.2 dev closure; peer floors stay `>= 0.2.0-rc.2`.** The devDependency pins plus the pnpm overrides (`dsh-system-prompt`, `dsh-session-projection`) re-pin `0.2.2-rc.1` → `0.2.2-rc.2` exactly (the wave is complete on npm: every closure package publishes `0.2.2-rc.2`); `@deepseek-ai/dsh-invariants` stays `0.2.0-rc.2` (no `0.2.2` line of it exists on npm and the plugin never imports it). The dev-only `@deepseek-ai/cordis` (`4.1.0`) and `@deepseek-ai/schemastery` (`3.19.0`) pins already match what the rc.2 closure ships (`~4.1.0` / `~3.19.0`) — zero action there. The `>= 0.2.0-rc.2` peer floors are intentionally unchanged: no 0.2.2-only API is used and the host preflight satisfies ranges with `includePrerelease`, so the floor already matches the new rc. ci.yml and release.yml already resolve the host newest-of(latest/next) at runtime with the prerelease-aware node comparator — zero action. Mechanical dependency ride, no source changes. Re-verified: the full test suite passes with 0 failures against the 0.2.2-rc.2 scratch closure; real-host boot smoke PASS on the scratch `0.2.2-rc.2` host (composed, 25s boot window survived, removal restored the stock tree).
 
+## [0.10.0] - 2026-11-23
+
+本版为 opencode-go 增加 3 条路由的动态同步能力（以官方公开清单为权威源），并提供从手写配置到托管配置的合法迁移与回退路径。措辞取自发布说明草稿；每条已知限制标注依据报告编号。
+
+### Added
+
+- **官方 `/v1/models` 权威源**：以 `GET https://opencode.ai/inference/go/v1/models` 的公开清单为模型来源。无鉴权请求返回 200 条清单（30 个 id），携带凭据时返回收窄后的 11 个 id（entitlement）。凭据仅通过环境变量注入，不打印、不落盘。（依据：交接单「易丢的关键技术事实」、报告 58 §2.7）
+- **3 条 opencode-go 路由**：
+  - `opencode-go`：chat-completions 协议，承载官方 chat 模型。
+  - `opencode-go-msg`：messages 协议，承载 `qwen4-max`；其 baseURL 必须去掉尾部 `/v1`，否则会拼出 `/v1/v1/messages` 导致 404。
+  - `opencode-go-resp`：responses 协议，承载 `grok-4.7`。
+  （依据：交接单「易丢的关键技术事实」、报告 58 §2.1）
+- **`/opencode-status` 只读诊断**：查询当前 profile 的迁移状态与路由写权；只读、零外呼、零写入。（依据：交接单 P0 行、报告 60 B-8）
+- **`migrate plan/apply/rollback/status`**：
+  - `plan` 为只读，输出逐 id 动作表与迁移后模型清单，不写 settings 或 store。
+  - `apply` 受三重显式同意门保护：`planHash`、6 位确认码、`--ack-managed` 知情门；未带 `--ack-managed` 时拒绝并零写。
+  - `rollback` 依据整段快照按原键序逐字段还原 settings，清除账本与指纹并收回落权重锁。
+  - `status` 查询迁移状态（含 absent / legacy-inherit / legacy-store / foreign-profile / applied 等标签）。
+  （依据：交接单 P1d-2 行、报告 58 §2.2、报告 60 B-7）
+
+### Changed
+
+- **`eject go` 已下线**：命令保留为墓碑拒绝（返回 retired 提示、零写、不触发同步轮）。`migrate rollback` 是唯一回退入口。（依据：交接单「用户拍板」、报告 60 B-8）
+- **跨进程锁超时改为 fail-closed**：锁只覆盖 models-store（2s 超时）。超时报 `DSH_STORE_LOCK_TIMEOUT`，含锁路径与建议动作；陈旧锁需校验 owner 存活，不盲目破除。旧版「降级继续写」语义已不存在。（依据：报告 35/37 D2/D3、报告 61 §6.2）
+- **锁超时与账本失败不再静默**：提供可识别 code，包括 `settings-written-unaccounted`（settings 已写但账本未记，保留锁路径诊断）、`journal-unavailable`（journal 写失败按路由拒绝、零写）、`journal-list-failed`（列举失败）、以及 `journal-descriptor-unavailable`、`ledger-write-failed`、`writer-error`（后两项为最终提交新增）。写入失败路由令命令返回 `kind:'error'`。旧文案 `store NOT modified` / `Retry the operation` 只在零写入路径保留。（依据：报告 53 §6、57 §2.7、60 A-2/A-3、62、63）
+- **无宿主 profile 身份时迁移与账本 fail-closed**：拿不到宿主身份时，四个 migrate 入口全部报身份错误，零 settings 写、零外呼、不创建 store 文件，不再塌缩到 `default` 键。（依据：报告 58 §2.6 U2、报告 60 B-7）
+- **`go.enabled` 默认仍为 `false`**：保持评审建议的默认关闭，避免开启后冻结现存带 opencode-go 的手写列表；需要同步时显式打开。（依据：交接单「评审建议」）
+
+### Known limitations
+
+12 条，逐条对应报告 61 §6。L12 已于最终提交 `685fab4` 关闭，在限制清单中保留并标注「已修复」。
+
+1. **migrate apply/rollback/restore 的冲突重试复用旧 ops（61 §6.1）**：受 planHash + 6 位确认码 + `--ack-managed` 三重显式同意门保护；但同意之后、写入之前的窄缝内，用户编辑仍可能被已同意的计划覆盖。这与自动同步轮的「冲突即整轮放弃」语义不同，属有意取舍（`mutateWithRetry` 旧 ops 复用有意保留）。影响：极窄窗口内用户编辑可能被计划覆盖。规避：plan 之后、apply/rollback 之前不要编辑相关模型；若已被覆盖，用 `migrate rollback` 回到计划前状态（settings 逐字节还原）。（依据：报告 61 §6.1、§5；报告 62 残余 4）
+2. **跨进程锁不保护 `settings.mutate`（61 §6.2）**：锁只覆盖 models-store（2s fail-closed）。settings 已落地后账本失败会留下 journal 供下轮对账；journal 写本身失败（含撞锁）按路由 fail-closed（`journal-unavailable`，零写、下轮重试），不再降级继续 mutate。影响：锁不覆盖 settings 写入本身；撞锁时本轮该路由不写，需下轮重试。规避：看到 `journal-unavailable` 后等待下轮自动重试；不要把跨进程锁当作 settings 写入的保护。（依据：报告 61 §6.2、报告 60 A-3、报告 63）
+3. **journal 内容哈希只覆盖 `models` 数组（61 §6.3）**：用户仅改 api/baseURL/apiKeyEnv 时哈希仍相等，对账会补账本；随后 planner 冲突检测会拦截覆盖、要求人工裁决，无静默丢失。另：最终提交把哈希排序改为确定性字节序；若旧版在大小写混排 id 的路由上留下 journal，升级后首轮可能因规则变化判 `journal-stale` 丢弃（方向安全：保留用户值、下轮重规划），典型小写 id 不受影响。影响：身份字段改动不会使 journal 失效，会补账本并可能触发人工裁决；跨版本极端情形可能丢弃旧 journal。规避：改身份字段后跑一次同步并查看冲突提示，按提示人工裁决或 `migrate plan/apply` 重新确认。（依据：报告 61 §6.3、报告 57 §6.1、报告 62 残余 5、报告 63 残余 5）
+4. **多路由轮的原子性边界（61 §6.4）**：用户编辑落在路由 A 已写、路由 B 复检之前时，A 保持落地，报表如实列出 already written / discarded，不回滚（S7 口径）。影响：一次同步轮不是跨路由原子；编辑撞在中间会出现部分路由已写。规避：以报表中的 written/discarded 为准；需要一致状态时 `migrate rollback` 后重跑。（依据：报告 61 §6.4、报告 53 S7、报告 57 §2.6、报告 60 B-7）
+5. **崩溃窗口验证边界（61 §6.5）**：K1 等中断点以 seam 模拟 + `writeRaw` tmp+rename 原子性论证验证，未做真实 SIGKILL 复现。影响：真实进程被强杀的极端情形未实测。规避：依赖原子写与 journal 对账收敛；强杀后重跑同步让对账完成。（依据：报告 61 §6.5、报告 57 §1/§6、报告 60 遗留 3、报告 62 残余 6）
+6. **revision 机制依赖宿主（61 §6.6）**：窗口保护依赖宿主在用户编辑时推进 `llm-pi-ai` revision（真机 dsh 0.2.2-rc.5 已核实）；宿主语义变更时退化为 mutate 后内容哈希一道校验。影响：更换或升级宿主后，若不再推进 revision，保护弱化。规避：宿主升级后复验 fetch 窗口场景，关注 `settings-changed-during-sync` 报表。（依据：报告 61 §6.6、报告 58 §6、报告 60 B-7）
+7. **孤儿 journal 无定时清扫（61 §6.7）**：换 Key / profile 改名后产生的孤儿 journal，下次同步遇到即丢弃；migrate apply/rollback 会清本 profile journal。长期不跑同步时 store 有残留槽（无害）。影响：store 中长期残留无用槽。规避：定期跑同步；或执行 migrate apply/rollback 清理本 profile journal。（依据：报告 61 §6.7、报告 57 §6.4、报告 53 C2 实施要点）
+8. **公开清单不可用时删除暂停（61 §6.8）**：公开清单无法获取时，未知 id 全部按 unclassified 保守处理（fail-safe），删除功能随之暂停。影响：清单不可达期间，托管模型的自动删除不执行。规避：网络恢复、清单重新可用后重跑同步，删除功能恢复。（依据：报告 61 §6.8、报告 53 方案 D）
+9. **多 profile 并发写未真机压测（61 §6.9）**：顺序双 profile 已隔离验证；真实 `~/.dsh/models-store.json` 可能被其他 dsh 进程随时重写（报告 58 观测到一次，非本插件所为）。影响：两个进程同时写同一 store 未做真机并发压测；外部进程可能改写 store。规避：避免并发进程写同一 store；以跨进程锁的 fail-closed 报表为准；外部改写属环境行为。（依据：报告 61 §6.9、报告 58 W2/§6、报告 60）
+10. **V21 限界（61 §6.10）**：web / opentui 未启动真实客户端 UI 进程；仅证明全局命令注册面可被两种客户端身份经真实注册表调用。影响：未做两客户端 UI 的端到端验证。规避：需要 UI 端到端结论时另行验证；命令注册面已验证可用。（依据：报告 61 §6.10、报告 58 §2.5/§6）
+11. **依赖环境（61 §6.11）**：主工作区 node_modules 存在 `@deepseek-ai/*` 断链，断链环境下 `check`/`test` 无法运行（TS2307）。CI / 发布环境需保证依赖可解析。影响：依赖不可解析时无法构建与测试。规避：发布/CI 环境安装完整依赖，确保 `@deepseek-ai/*` 可解析；本报告所属提交未改任何 import。（依据：报告 61 §6.11、报告 60 §0/遗留 1、报告 57 §1、报告 63 §1/残余 1）
+12. **no-change 路径账本写失败（61 §6.12，已修复）**：报告 61（HEAD `7a2aa90`）为条件披露——若其建议 1 不修，则需按本条披露：no-change 路径账本非锁写失败仅 warn，本轮报表显示 no-change、账本未落地、下轮自愈。最终提交 `685fab4` 已修此问题：该类失败计入 `failedRoutes`（`ledger-write-failed`），`level:'error'`，文案改为如实「no settings writes were made」，轮 `kind:'error'`；并经独立复核为 PASS。因此在发布版本上本条不再成立，限制已关闭。影响：无（已修复）。但按 reason 统计时需注意 `writer-error` 与 `write-failed` 现为两个独立 reason，均映射 `kind:'error'` 且不触发退避。规避：无需规避；运维按新 code/reason 更新统计白名单即可。（依据：报告 61 §6.12/§4 建议 1、报告 62、报告 63 §0/§2/残余 2）
+
+### Not included
+
+- **P2（5 入口登录页）**：未在本次范围，尚未开工。（依据：交接单「一句话现状」「P2 前置事实」）
+- **R-11 历史脏账本清理**：不在本分支清理范围，未做。（依据：报告 61 §5、报告 41 §5.2、报告 47 §6.4）
+
+### Verification evidence
+
+报告 34–63，一行一条，只写类型不写内部 agent 名。类型：复核 = 独立验证/评审；真机 = 真实宿主 boot；变异 = 定点回退变异证伪；实现记录非独立验证。
+
+| 报告 | 类型 |
+|---|---|
+| 34 | 复核 + 变异 |
+| 35 | 实现记录 |
+| 36 | 实现记录 |
+| 37 | 复核 |
+| 38 | 实现记录 |
+| 39 | 复核 + 变异 |
+| 40 | 实现记录 |
+| 41 | 复核 |
+| 42 | 实现记录 |
+| 43 | 实现记录 |
+| 44 | 复核 |
+| 45 | 实现记录 |
+| 46 | 实现记录 |
+| 47 | 复核 |
+| 48 | 实现记录 |
+| 49 | 实现记录 |
+| 50 | 实现记录 |
+| 51 | 复核 |
+| 52 | 实现记录 + 变异 |
+| 53 | 复核 |
+| 54 | 实现记录 |
+| 55 | 实现记录 |
+| 56 | 实现记录 |
+| 57 | 复核 + 变异 |
+| 58 | 真机 |
+| 59 | 实现记录 |
+| 60 | 复核 + 变异 |
+| 61 | 复核 |
+| 62 | 实现记录 + 变异 |
+| 63 | 复核 + 变异 |
+
 ## [0.9.0] - 2026-11-06
 
 ### Added
