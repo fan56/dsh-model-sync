@@ -156,6 +156,21 @@ export interface GoOwnershipEntry {
    */
   preManagedSnapshot?: SettingsModelProfile[]
   /**
+   * P1d-2: the COMPLETE raw provider section captured before `migrate apply`
+   * (all fields — api/baseURL/displayName/apiKeyEnv/models — exactly as found).
+   * `null` means the route did not exist before the migration. This is the
+   * authoritative rollback target (design §14.3 whole-section snapshot) and is
+   * persisted on the same models-store queue as the rest of the ledger entry;
+   * unlike the in-progress backup it is NOT released when apply succeeds.
+   */
+  preManagedSection?: Record<string, unknown> | null
+  /**
+   * P1d-2: ids `migrate apply` newly introduced on this route (merged desired
+   * ids absent from the pre-apply section). Rollback removes these, while ids
+   * the user adds after apply are left untouched.
+   */
+  appliedAddedIds?: string[]
+  /**
    * Consecutive successful rounds an id has been absent from the desired set.
    * The planner only flags a deletion-candidate; the writer owns this counter
    * and deletes only once it reaches `confirmRemovals` (design §6.2.4 / V5).

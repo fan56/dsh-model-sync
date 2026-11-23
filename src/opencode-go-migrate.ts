@@ -713,10 +713,17 @@ export async function applyMigration(
         for (const profile of planned.desired) managed[profile.id] = { hash: profileHash(profile) }
       }
       const ledgerKey = goOwnershipKey(planned.route, deps.keyFingerprint)
+      const preManagedSection = backup.routes[planned.route]?.section
       const entry: GoOwnershipEntry = {
         routeFields: planned.fields,
         managed,
+        // Legacy audit fields, still used by the P1b eject path.
         preManagedSnapshot: current.map((profile) => ({ ...profile })),
+        // §14.3 whole-section snapshot: the exact pre-apply section (null when
+        // the route did not exist) plus the ids this apply introduced. Both ride
+        // the ledger's models-store queue and survive a successful apply.
+        preManagedSection: preManagedSection === undefined ? null : structuredClone(preManagedSection),
+        appliedAddedIds: merged.map((profile) => profile.id).filter((id) => !currentIds.has(id)).sort(),
       }
       try {
         await deps.ownershipStore.write(ledgerKey, entry)
@@ -741,7 +748,10 @@ export async function applyMigration(
     const applied: MigrationRecord = {
       ...(prior ?? {}),
       applying: false,
-      backup: undefined, // release the in-progress backup; rollback uses ledger preManagedSnapshot
+      // Keep the captured whole-section backup: it is the audit copy and the
+      // crash-window fallback for rollback. The authoritative copy also lives
+      // on each ledger entry (preManagedSection), so neither is discarded.
+      backup,
       planHash: plan.planHash,
       backupPath: plan.backupPath,
       appliedAt: deps.now,
@@ -921,47 +931,63 @@ export async function rollbackMigration(
     }
   }
 
-  // Reconstruct each route: keep user-added ids, restore the pre-managed snapshot
-  // ids (including ids the plan deleted/moved), drop plugin-managed ids not in snapshot.
+  // Reconstruct each route from the WHOLE pre-apply section (§14.3), not from a
+  // models-only list. Restore its exact fields/values/order, remove ids this
+  // migration introduced, and keep ids the user added after apply.
   const rollbackOps: { route: string; ops: SettingsMutationOp[] }[] = []
   for (const route of routeIds) {
     const entry = await deps.ownershipStore.read(goOwnershipKey(route, deps.keyFingerprint)).catch(() => undefined)
-    const backupSection = record.backup?.routes[route]?.section
-    if (entry === undefined && backupSection === undefined) continue
-    // Prefer the ledger's preManagedSnapshot; fall back to the captured backup
-    // (crash before the ledger commit). A post-apply user id is still kept.
-    const snapshot: SettingsModelProfile[] | undefined = entry?.preManagedSnapshot
-      ?? (Array.isArray(backupSection?.models) ? backupSection.models as SettingsModelProfile[] : undefined)
-    if (snapshot === undefined) return refuse('snapshot-missing', `${route} has no preManagedSnapshot`)
+    const backupRoute = record.backup?.routes[route]
+    if (entry === undefined && backupRoute === undefined) continue
+    // Authoritative snapshot: the ledger copy written by apply, or the captured
+    // backup for a crash before the ledger commit. `null`/`undefined` section
+    // means the route did not exist before the migration; a written-but-missing
+    // field is the snapshot-missing refusal below.
+    const hasSectionSnapshot = entry !== undefined
+      ? entry.preManagedSection !== undefined
+      : backupRoute !== undefined
+    if (!hasSectionSnapshot) return refuse('snapshot-missing', `${route} has no preManagedSection`)
+    const originalSection = entry !== undefined ? entry.preManagedSection : backupRoute?.section
 
-    const writtenFields: Record<string, unknown> | undefined = entry?.routeFields
-      ?? (backupSection !== undefined
-        ? Object.fromEntries(OWNED_FIELDS.filter((field) => backupSection[field] !== undefined).map((field) => [field, backupSection[field]]))
-        : undefined)
+    const originalModels: SettingsModelProfile[] = Array.isArray(originalSection?.models)
+      ? originalSection.models as SettingsModelProfile[]
+      : []
+    const originalIds = new Set(originalModels.map((profile) => profile.id))
     const current = rawModels(desc, route)
-    // No ledger (crash before commit): any id not in the captured snapshot was
-    // added by the half-finished apply, so treat it as plugin-managed and drop
-    // it. With a ledger, only its recorded managed ids may be removed.
-    const managedIds = entry !== undefined
-      ? new Set(Object.keys(entry.managed ?? {}))
-      : new Set(current.filter((profile) => !snapshot.some((seed) => seed.id === profile.id)).map((profile) => profile.id))
-    const userKept = current.filter((profile) => !managedIds.has(profile.id))
-    const userKeptIds = new Set(userKept.map((profile) => profile.id))
-    const restored = snapshot.filter((profile) => !userKeptIds.has(profile.id))
-    const merged = [...userKept, ...restored].sort((a, b) => a.id.localeCompare(b.id))
+    // Ids introduced by the migration itself: recorded at apply time when a
+    // ledger exists. For a crash-window rollback every current id absent from
+    // the captured snapshot was written by the half-finished apply.
+    const addedIds = entry !== undefined
+      ? new Set(entry.appliedAddedIds ?? [])
+      : new Set(current.filter((profile) => !originalIds.has(profile.id)).map((profile) => profile.id))
+    // A post-apply id is neither in the original section nor one of ours — keep
+    // it (never clobber user edits, even if it sits on a plugin-created route).
+    const userAdded = current.filter((profile) => !originalIds.has(profile.id) && !addedIds.has(profile.id))
+    const finalModels = [...originalModels, ...userAdded]
 
     const ops: SettingsMutationOp[] = []
-    if (merged.length === 0) {
-      const data = rawRoute(desc, route)
-      const foreign = OWNED_FIELDS.some((field) => data?.[field] !== undefined
-        && writtenFields?.[field] === undefined)
-      if (!foreign) ops.push({ op: 'unset', path: ['providers', route] })
-    }
-    if (ops.length === 0 && merged.length > 0) ops.push({ op: 'set', path: ['providers', route, 'models'], value: merged })
-    for (const field of OWNED_FIELDS) {
-      const written = writtenFields?.[field]
-      if (written !== undefined && rawRoute(desc, route)?.[field] === written) {
-        ops.push({ op: 'unset', path: ['providers', route, field] })
+    if (originalSection === null || originalSection === undefined) {
+      // Route did not exist before apply: drop everything the plugin created,
+      // keeping only models the user added afterwards.
+      ops.push({ op: 'unset', path: ['providers', route] })
+      if (finalModels.length > 0) ops.push({ op: 'set', path: ['providers', route, 'models'], value: finalModels })
+    } else {
+      // Rebuild field-by-field in the ORIGINAL key order with the ORIGINAL values
+      // so the restored bytes match the pre-apply section exactly: fields that
+      // existed before are restored (never unset), fields apply wrote that were
+      // absent before disappear with the whole-section reset, and the models
+      // array keeps its original order with user-added ids appended.
+      ops.push({ op: 'unset', path: ['providers', route] })
+      const hasModelsKey = Object.prototype.hasOwnProperty.call(originalSection, 'models')
+      for (const [field, value] of Object.entries(originalSection)) {
+        if (field === 'models') {
+          if (hasModelsKey) ops.push({ op: 'set', path: ['providers', route, 'models'], value: finalModels })
+        } else {
+          ops.push({ op: 'set', path: ['providers', route, field], value: structuredClone(value) })
+        }
+      }
+      if (!hasModelsKey && finalModels.length > 0) {
+        ops.push({ op: 'set', path: ['providers', route, 'models'], value: finalModels })
       }
     }
     if (ops.length > 0) rollbackOps.push({ route, ops })

@@ -441,14 +441,14 @@ await checkAsync('V20: adopt apply deletes a legacy id; rollback restores it and
   h.dispose()
 })
 
-await checkAsync('V20: rollback refuses when preManagedSnapshot is missing (zero writes)', async () => {
+await checkAsync('V20: rollback refuses when the full preManagedSection snapshot is missing (zero writes)', async () => {
   const h = createHarness({ initialRoutes: { 'opencode-go': LEGACY_CHAT } })
   const plan = parsePlan((await h.invoke('migrate plan --adopt')).text)
   await h.invoke(`migrate apply --adopt --plan ${plan.planHash} --confirm ${plan.confirmCode}`)
-  // Corrupt the snapshot on purpose.
+  // Corrupt the authoritative whole-section snapshot on purpose.
   const key = [...h.ownership.data.keys()][0]
   const entry = structuredClone(h.ownership.data.get(key))
-  delete entry.preManagedSnapshot
+  delete entry.preManagedSection
   h.ownership.data.set(key, entry)
   const before = h.settings.mutations.length
   const result = await h.invoke(`migrate rollback --plan ${plan.planHash}`)
@@ -553,6 +553,93 @@ await checkAsync('V20: rollback from the pre-apply backup works when apply crash
   const result = await h.invoke(`migrate rollback --plan ${plan.planHash}`)
   assert.equal(result.kind, 'success', result.text)
   assert.deepEqual(idsOf(h.settings, 'opencode-go'), ['custom-test-model'])
+  assert.equal(h.migrationStore.record.applying, false)
+  h.dispose()
+})
+
+// ---------------------------------------------------------------------------
+// P2 (P1d-2 verification 6a/6b): byte-exact whole-section rollback. These turn
+// red both when the snapshot stores only models and when rollback leaves
+// migration-introduced ids behind.
+// ---------------------------------------------------------------------------
+
+const chatLedger = (h) => h.ownership.data.get([...h.ownership.data.keys()].find((k) => k.startsWith('opencode-go#')))
+
+await checkAsync('P2-1: default apply→rollback restores the exact pre-apply section (all fields + order)', async () => {
+  const before = structuredClone(LEGACY_CHAT)
+  const expected = JSON.stringify(before)
+  const h = createHarness({ initialRoutes: { 'opencode-go': structuredClone(before) } })
+  const plan = parsePlan((await h.invoke('migrate plan')).text)
+  const applied = await h.invoke(`migrate apply --plan ${plan.planHash} --confirm ${plan.confirmCode}`)
+  assert.equal(applied.kind, 'success', applied.text)
+  assert.ok(idsOf(h.settings, 'opencode-go').includes('deepseek-v4.1-flash'), 'apply added a desired id')
+
+  // The whole section (not just models) is persisted on the ledger queue, and
+  // the captured backup is retained on the applied record.
+  const entry = chatLedger(h)
+  assert.ok(entry, 'chat ledger entry written')
+  assert.equal(entry.preManagedSection.apiKeyEnv, 'OPENCODE_GO_API_KEY', 'route fields in snapshot')
+  assert.equal(entry.preManagedSection.api, 'openai-completions')
+  assert.equal(entry.preManagedSection.baseURL, before.baseURL)
+  assert.equal(entry.preManagedSection.displayName, 'OpenCode Go')
+  assert.deepEqual(entry.appliedAddedIds, ['deepseek-v4.1-flash'])
+  assert.equal(entry.preManagedSection.models.length, 1)
+  assert.ok(h.migrationStore.record.backup?.routes['opencode-go']?.section, 'backup retained after success')
+
+  const rolled = await h.invoke(`migrate rollback --plan ${plan.planHash}`)
+  assert.equal(rolled.kind, 'success', rolled.text)
+  assert.equal(JSON.stringify(h.settings.state.get('opencode-go')), expected, 'byte-identical section after rollback')
+  assert.equal(idsOf(h.settings, 'opencode-go').includes('deepseek-v4.1-flash'), false, 'apply-added id removed')
+  assert.equal(h.settings.state.has('opencode-go-msg'), false, 'plugin-created route removed')
+  assert.equal(h.settings.state.has('opencode-go-resp'), false, 'plugin-created route removed')
+  h.dispose()
+})
+
+await checkAsync('P2-2: adopt apply→rollback restores the exact pre-apply section (all fields + order)', async () => {
+  const before = structuredClone(LEGACY_CHAT)
+  const expected = JSON.stringify(before)
+  const h = createHarness({ initialRoutes: { 'opencode-go': structuredClone(before) } })
+  const plan = parsePlan((await h.invoke('migrate plan --adopt')).text)
+  const applied = await h.invoke(`migrate apply --adopt --plan ${plan.planHash} --confirm ${plan.confirmCode}`)
+  assert.equal(applied.kind, 'success', applied.text)
+  const rolled = await h.invoke(`migrate rollback --plan ${plan.planHash}`)
+  assert.equal(rolled.kind, 'success', rolled.text)
+  assert.equal(JSON.stringify(h.settings.state.get('opencode-go')), expected, 'byte-identical section after adopt rollback')
+  assert.deepEqual(idsOf(h.settings, 'opencode-go'), ['custom-test-model'], 'adopt-added id removed, legacy id restored')
+  h.dispose()
+})
+
+await checkAsync('P2-3: rollback removes apply-added ids but keeps ids the user added after apply', async () => {
+  const h = createHarness({ initialRoutes: { 'opencode-go': structuredClone(LEGACY_CHAT) } })
+  const plan = parsePlan((await h.invoke('migrate plan')).text)
+  const applied = await h.invoke(`migrate apply --plan ${plan.planHash} --confirm ${plan.confirmCode}`)
+  assert.equal(applied.kind, 'success', applied.text)
+  h.settings.state.get('opencode-go').models.push({ id: 'my-new-note', name: 'my-new-note' })
+  const rolled = await h.invoke(`migrate rollback --plan ${plan.planHash}`)
+  assert.equal(rolled.kind, 'success', rolled.text)
+  const ids = idsOf(h.settings, 'opencode-go')
+  assert.ok(ids.includes('custom-test-model'), 'pre-existing id restored')
+  assert.ok(!ids.includes('deepseek-v4.1-flash'), 'migration-added id gone')
+  assert.ok(ids.includes('my-new-note'), 'post-apply user id preserved')
+  h.dispose()
+})
+
+await checkAsync('P2-4: crash-window rollback restores exact section incl. fields that never existed', async () => {
+  const original = { apiKeyEnv: 'OPENCODE_GO_API_KEY' }
+  const expected = JSON.stringify(original)
+  const h = createHarness({ initialRoutes: { 'opencode-go': structuredClone(original) } })
+  const plan = parsePlan((await h.invoke('migrate plan')).text)
+  h.migrationStore.record = {
+    applying: true,
+    planHash: plan.planHash,
+    backup: { planHash: plan.planHash, capturedAt: 1, routes: { 'opencode-go': { section: structuredClone(original) } } },
+  }
+  // Half-finished apply: a field + a model the crash introduced.
+  h.settings.state.get('opencode-go').api = 'openai-completions'
+  h.settings.state.get('opencode-go').models = [{ id: 'deepseek-v4.1-flash', name: 'x' }]
+  const result = await h.invoke(`migrate rollback --plan ${plan.planHash}`)
+  assert.equal(result.kind, 'success', result.text)
+  assert.equal(JSON.stringify(h.settings.state.get('opencode-go')), expected, 'exact original section; missing fields stay missing')
   assert.equal(h.migrationStore.record.applying, false)
   h.dispose()
 })
