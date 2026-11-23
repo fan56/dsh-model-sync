@@ -55,7 +55,7 @@ import {
 import { BUILTIN_CATALOG_SNAPSHOT } from './builtin-catalog-snapshot.ts'
 import { refreshLiveCatalog, getLiveBuiltinCatalogForRoute } from './live-catalog.ts'
 import { checkRouteCredential, deriveKeyRef, type RouteCredentialContext } from './route-credential.ts'
-import { OPENCODE_GO_MODELS_URL, OPENCODE_GO_DEFAULT_INTERVAL_MINUTES, fetchGoOfficialModels, fingerprintKey, type GoFetchLike, type GoModelRecord } from './opencode-go-source.ts'
+import { OPENCODE_GO_MODELS_URL, OPENCODE_GO_DEFAULT_INTERVAL_MINUTES, fetchGoOfficialModels, fetchGoPublicCatalogIds, fingerprintKey, type GoFetchLike, type GoModelRecord } from './opencode-go-source.ts'
 import { GO_SLOT_ROUTES, type GoRouteSlot } from './opencode-go-grouping.ts'
 import { createModelsStoreOwnershipStore } from './opencode-go-store.ts'
 import {
@@ -109,7 +109,7 @@ import {
 import { goOwnershipKey } from './opencode-go-planner.ts'
 import {
   applyMigration,
-  buildMigrationPlan,
+  buildMigrationPlanFromDeps,
   formatMigrationPlan,
   migrationStatusReport,
   rollbackMigration,
@@ -126,6 +126,11 @@ export const inject = ['settings']
 /** P1d-2 seams: injected official entries (plan/apply) and optional reference writer. */
 export const GO_MIGRATION_ENTRIES_SERVICE = 'goMigrationEntries'
 export const GO_MIGRATION_REF_WRITER_SERVICE = 'goMigrationRefWriter'
+/** Public (unauthenticated) official catalog ids for id classification (design §14.2).
+ *  `undefined` ⇒ fail-closed `unclassified`. Tests inject an array/function. */
+export const GO_MIGRATION_PUBLIC_CATALOG_SERVICE = 'goMigrationPublicCatalog'
+/** Capability flag: when true, `--adopt` is refused and plan mode is adopt-disabled. */
+export const GO_MIGRATION_ADOPT_DISABLED_SERVICE = 'goMigrationAdoptDisabled'
 /** Optional override for the single-flight check (tests inject an in-flight mutex). */
 export const GO_MIGRATION_MUTEX_SERVICE = 'goMigrationMutex'
 
@@ -294,8 +299,8 @@ interface CatalogSeam {
 export interface ModelSyncService {
   syncNow(): Promise<string>
   /** P1d-2: host-service mirrors of the migrate commands (design §14.5). */
-  migratePlan?(options?: { adopt?: boolean; rewriteRefs?: RewriteRefMode }): Promise<string>
-  migrateApply?(args: { planHash?: string; confirmCode?: string }): Promise<string>
+  migratePlan?(options?: { adopt?: boolean; rewriteRefs?: RewriteRefMode; pruneUserExtra?: boolean }): Promise<string>
+  migrateApply?(args: { planHash?: string; confirmCode?: string; ackManaged?: boolean }): Promise<string>
   migrateRollback?(args: { planHash?: string }): Promise<string>
   migrateStatus?(): Promise<string>
 }
@@ -978,6 +983,7 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
   // mutex against goScheduler. No auto/startup path reaches any of these.
   // -----------------------------------------------------------------------
   type MigrateEntries = readonly GoModelRecord[] | (() => Promise<readonly GoModelRecord[]> | readonly GoModelRecord[])
+  type PublicCatalog = readonly string[] | (() => Promise<readonly string[]> | readonly string[])
 
   /** Resolve the official listing through an injectable seam (tests: a fixture array). */
   const resolveMigrateEntries = async (
@@ -999,9 +1005,34 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
     return source.entries
   }
 
+  /**
+   * Public-catalog producer for id classification (§14.2): ids the current key
+   * cannot serve but that are still official are `unknown-retired`, everything
+   * else is `user-extra`. When the public list cannot be fetched the result is
+   * `undefined`, which makes the plan mark such ids `unclassified` (never
+   * deleted) instead of defaulting them to deletable `user-extra`.
+   */
+  const resolvePublicCatalogIds = async (
+    value: GoSyncRuntimeConfig,
+    entries: readonly GoModelRecord[],
+  ): Promise<readonly string[] | undefined> => {
+    const injected = ctx.get(GO_MIGRATION_PUBLIC_CATALOG_SERVICE) as PublicCatalog | undefined
+    if (Array.isArray(injected)) return injected
+    if (typeof injected === 'function') return await injected()
+    // Offline fixture mode: the injected authorized entries are the only catalog
+    // available; deriving ids from them keeps `migrate plan` zero-fetch (V16).
+    if (ctx.get(GO_MIGRATION_ENTRIES_SERVICE) !== undefined) return entries.map((entry) => entry.id)
+    const result = await fetchGoPublicCatalogIds({
+      url: value.modelsUrl,
+      fetchImpl: ctx.get(GO_FETCH_SERVICE) as GoFetchLike | undefined,
+      timeoutMs: config.refreshTimeoutMs.get(),
+    })
+    return result.ok ? result.ids : undefined
+  }
+
   const migrateDeps = async (
     target: Context,
-    opts: { adopt?: boolean; rewriteRefs?: RewriteRefMode } = {},
+    opts: { adopt?: boolean; rewriteRefs?: RewriteRefMode; pruneUserExtra?: boolean } = {},
     needsEntries = true,
   ): Promise<MigrateDeps> => {
     const { value } = readGoRuntimeConfig(config)
@@ -1015,19 +1046,28 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
     )
     const refWriter = target.get(GO_MIGRATION_REF_WRITER_SERVICE) as
       | ((rewrite: ReferenceRewrite) => Promise<void>) | undefined
+    // status/rollback never need the official listing: no fetch, no extra I/O.
+    const entries = needsEntries ? await resolveMigrateEntries(value, apiKey) : []
+    const publicCatalogIds = needsEntries ? await resolvePublicCatalogIds(value, entries) : undefined
+    const adoptDisabled = ctx.get(GO_MIGRATION_ADOPT_DISABLED_SERVICE) === true
+      || settings === undefined || typeof settings.mutate !== 'function'
     return {
       settings,
       ownershipStore: (target.get(GO_OWNERSHIP_STORE_SERVICE) as GoOwnershipStore | undefined)
         ?? ownershipStoreForRound(),
       migrationStore: migrationStore(),
       logger: target.logger as unknown as Logger,
-      // status/rollback never need the official listing: no fetch, no extra I/O.
-      entries: needsEntries ? await resolveMigrateEntries(value, apiKey) : [],
+      entries,
+      publicCatalogIds,
       routes: value.routes,
       ref: value.ref,
       keyFingerprint: fingerprintKey(typeof apiKey === 'string' ? apiKey.trim() : ''),
       adopt: opts.adopt,
+      adoptDisabled,
       rewriteRefs: opts.rewriteRefs,
+      // Config path: go.pinnedModels (readGoRuntimeConfig:361) now reaches plan.
+      pinnedModels: value.pinnedModels,
+      pruneUserExtra: opts.pruneUserExtra,
       now: Date.now(),
       isSyncInFlight: (ctx.get(GO_MIGRATION_MUTEX_SERVICE) as (() => boolean) | undefined)
         ?? (() => goScheduler.isInFlight),
@@ -1041,8 +1081,8 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
     target: Context,
   ): Promise<{ kind: 'success' | 'error'; text: string }> => {
     const usage = [
-      'usage: /model-sync migrate plan [--adopt] [--rewrite-refs=default-model|config]',
-      '       /model-sync migrate apply --plan <planHash> --confirm <6-digit-code>',
+      'usage: /model-sync migrate plan [--adopt] [--prune-user-extra] [--rewrite-refs=default-model|config]',
+      '       /model-sync migrate apply --plan <planHash> --confirm <6-digit-code> --ack-managed',
       '       /model-sync migrate rollback --plan <planHash>',
       '       /model-sync migrate status',
     ].join('\n')
@@ -1064,6 +1104,8 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
     const planHash = flagValue('--plan')
     const confirmCode = flagValue('--confirm')
     const adopt = rest.includes('--adopt')
+    const ackManaged = rest.includes('--ack-managed')
+    const pruneUserExtra = rest.includes('--prune-user-extra')
     const rewriteRefsRaw = rest.find((token) => token.startsWith('--rewrite-refs='))?.slice('--rewrite-refs='.length)
     const rewriteRefs = rewriteRefsRaw === 'default-model' || rewriteRefsRaw === 'config'
       ? rewriteRefsRaw as RewriteRefMode
@@ -1076,27 +1118,25 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
         return { kind: 'success', text: report.text }
       }
       if (action === 'plan') {
-        const deps = await migrateDeps(target, { adopt, rewriteRefs })
-        const descriptor = deps.settings?.describe().find((d) => d.ns === 'llm-pi-ai')
+        const deps = await migrateDeps(target, { adopt, rewriteRefs, pruneUserExtra })
         const record = await deps.migrationStore.read().catch(() => undefined)
-        // The plan builder is pure — no settings/store write, no outbound call
-        // beyond the already-injected official listing used to describe intent.
-        const plan = buildMigrationPlan({
-          descriptor,
-          entries: deps.entries,
-          routes: deps.routes,
-          ref: deps.ref,
-          keyFingerprint: deps.keyFingerprint,
-          adopt,
-          rewriteRefs,
-          record,
-          now: deps.now,
-        })
+        // Same pure builder apply uses — the printed table IS the consented one.
+        // When adopt is disabled the mode is reported as adopt-disabled and the
+        // rows stay conservative; no adopt action can be printed as executable.
+        const plan = buildMigrationPlanFromDeps(deps, record)
         return { kind: 'success', text: formatMigrationPlan(plan) }
       }
       if (action === 'apply') {
-        const deps = await migrateDeps(target, { adopt, rewriteRefs })
-        const result = await applyMigration({ planHash, confirmCode }, deps)
+        const deps = await migrateDeps(target, { adopt, rewriteRefs, pruneUserExtra })
+        // Fail-closed fallback (§14.2): reject at the command layer before any
+        // write when the per-id action table cannot be executed verbatim.
+        if (adopt && deps.adoptDisabled === true) {
+          return {
+            kind: 'error',
+            text: 'migrate apply refused (adopt-disabled): --adopt cannot execute the per-id action table verbatim; use conservative mode; zero writes',
+          }
+        }
+        const result = await applyMigration({ planHash, confirmCode, ackManaged }, deps)
         return { kind: result.ok ? 'success' : 'error', text: result.text }
       }
       // rollback
@@ -1173,12 +1213,14 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
     syncNow: () => syncNow(true),
     migratePlan: (options) => runMigrate(
       ['plan', ...(options?.adopt === true ? ['--adopt'] : []),
+        ...(options?.pruneUserExtra === true ? ['--prune-user-extra'] : []),
         ...(options?.rewriteRefs !== undefined ? [`--rewrite-refs=${options.rewriteRefs}`] : [])],
       ctx,
     ).then((result) => result.text),
     migrateApply: (args) => runMigrate(
       ['apply', ...(args.planHash !== undefined ? ['--plan', args.planHash] : []),
-        ...(args.confirmCode !== undefined ? ['--confirm', args.confirmCode] : [])],
+        ...(args.confirmCode !== undefined ? ['--confirm', args.confirmCode] : []),
+        ...(args.ackManaged === true ? ['--ack-managed'] : [])],
       ctx,
     ).then((result) => result.text),
     migrateRollback: (args) => runMigrate(

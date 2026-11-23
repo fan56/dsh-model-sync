@@ -252,9 +252,19 @@ await checkAsync('planHash is canonical + changes with the plan; confirmCode is 
 await checkAsync('verifyConsent: missing / wrong hash / wrong code never pass', async () => {
   const plan = { planHash: 'a'.repeat(64), confirmCode: '123456' }
   assert.deepEqual(verifyConsent(plan, undefined, undefined), { ok: false, reason: 'consent-required' })
-  assert.deepEqual(verifyConsent(plan, 'b'.repeat(64), '123456'), { ok: false, reason: 'plan-hash-mismatch' })
-  assert.deepEqual(verifyConsent(plan, plan.planHash, '000000'), { ok: false, reason: 'confirm-code-mismatch' })
-  assert.deepEqual(verifyConsent(plan, plan.planHash, plan.confirmCode), { ok: true })
+  assert.deepEqual(verifyConsent(plan, 'b'.repeat(64), '123456', true), { ok: false, reason: 'plan-hash-mismatch' })
+  assert.deepEqual(verifyConsent(plan, plan.planHash, '000000', true), { ok: false, reason: 'confirm-code-mismatch' })
+  assert.deepEqual(verifyConsent(plan, plan.planHash, plan.confirmCode, true), { ok: true })
+})
+
+// B6: --ack-managed is a mandatory third consent token (tri-state).
+await checkAsync('B6 ack tri-state: absent / non-true → ack-required; true → ok', async () => {
+  const plan = { planHash: 'a'.repeat(64), confirmCode: '123456' }
+  assert.deepEqual(verifyConsent(plan, plan.planHash, plan.confirmCode), { ok: false, reason: 'ack-required' })
+  assert.deepEqual(verifyConsent(plan, plan.planHash, plan.confirmCode, undefined), { ok: false, reason: 'ack-required' })
+  assert.deepEqual(verifyConsent(plan, plan.planHash, plan.confirmCode, false), { ok: false, reason: 'ack-required' })
+  assert.deepEqual(verifyConsent(plan, plan.planHash, plan.confirmCode, 'true'), { ok: false, reason: 'ack-required' })
+  assert.deepEqual(verifyConsent(plan, plan.planHash, plan.confirmCode, true), { ok: true })
 })
 
 // ---------------------------------------------------------------------------
@@ -285,7 +295,7 @@ await checkAsync('V16: migrate plan writes nothing (settings/store/ledger) and m
 await checkAsync('V17 MUTATION-KILLER: wrong planHash → refused, zero writes', async () => {
   const h = createHarness({ initialRoutes: { 'opencode-go': LEGACY_CHAT } })
   const plan = parsePlan((await h.invoke('migrate plan')).text)
-  const result = await h.invoke(`migrate apply --plan ${'0'.repeat(64)} --confirm ${plan.confirmCode}`)
+  const result = await h.invoke(`migrate apply --plan ${'0'.repeat(64)} --confirm ${plan.confirmCode} --ack-managed`)
   assert.equal(result.kind, 'error')
   assert.match(result.text, /plan-hash-mismatch/)
   assert.deepEqual(h.settings.mutations, [])
@@ -298,7 +308,7 @@ await checkAsync('V17 MUTATION-KILLER: wrong confirm code → refused, zero writ
   const h = createHarness({ initialRoutes: { 'opencode-go': LEGACY_CHAT } })
   const plan = parsePlan((await h.invoke('migrate plan')).text)
   const wrong = plan.confirmCode === '000000' ? '111111' : '000000'
-  const result = await h.invoke(`migrate apply --plan ${plan.planHash} --confirm ${wrong}`)
+  const result = await h.invoke(`migrate apply --plan ${plan.planHash} --confirm ${wrong} --ack-managed`)
   assert.equal(result.kind, 'error')
   assert.match(result.text, /confirm-code-mismatch/)
   assert.deepEqual(h.settings.mutations, [])
@@ -330,7 +340,7 @@ await checkAsync('V17: apply refuses when the plan has drifted (settings changed
   const plan = parsePlan((await h.invoke('migrate plan')).text)
   // External edit after the plan → the rebuilt planHash no longer matches.
   h.settings.state.get('opencode-go').models.push({ id: 'user-added', name: 'user-added' })
-  const result = await h.invoke(`migrate apply --plan ${plan.planHash} --confirm ${plan.confirmCode}`)
+  const result = await h.invoke(`migrate apply --plan ${plan.planHash} --confirm ${plan.confirmCode} --ack-managed`)
   assert.equal(result.kind, 'error')
   assert.match(result.text, /plan-hash-mismatch/)
   assert.deepEqual(h.settings.mutations, [])
@@ -349,7 +359,7 @@ await checkAsync('V19: apply writes three routes + ledger + fingerprint; next go
   }]
   const h = createHarness({ initialRoutes: { 'opencode-go': LEGACY_CHAT }, roundEntries: withNew })
   const plan = parsePlan((await h.invoke('migrate plan')).text)
-  const applied = await h.invoke(`migrate apply --plan ${plan.planHash} --confirm ${plan.confirmCode}`)
+  const applied = await h.invoke(`migrate apply --plan ${plan.planHash} --confirm ${plan.confirmCode} --ack-managed`)
   assert.equal(applied.kind, 'success', applied.text)
   assert.match(applied.text, /fingerprint persisted/)
   assert.deepEqual(h.settings.mutations.length >= 3, true, 'settings written')
@@ -389,7 +399,7 @@ await checkAsync('V22 MUTATION-KILLER: apply rejected while a go round is in fli
   })
   const plan = parsePlan((await h.invoke('migrate plan')).text)
   const mutationsBefore = h.settings.mutations.length
-  const result = await h.invoke(`migrate apply --plan ${plan.planHash} --confirm ${plan.confirmCode}`)
+  const result = await h.invoke(`migrate apply --plan ${plan.planHash} --confirm ${plan.confirmCode} --ack-managed`)
   assert.equal(result.kind, 'error', result.text)
   assert.match(result.text, /sync-in-flight|retry/)
   assert.equal(h.settings.mutations.length, mutationsBefore, 'apply made zero settings writes')
@@ -414,12 +424,14 @@ await checkAsync('V22: while applying, the go scheduler drops its round (M-5)', 
 // V20: rollback restores the pre-apply snapshot and re-locks; refusal is zero-write
 // ---------------------------------------------------------------------------
 
-await checkAsync('V20: adopt apply deletes a legacy id; rollback restores it and re-locks', async () => {
+// B2/R-11: a user-written id is `user-extra` and is NEVER removed by bare
+// `--adopt` — only `--prune-user-extra` may delete a plan-listed user-extra id.
+await checkAsync('V20: adopt + prune-user-extra deletes a plan-listed user-extra id; rollback restores it', async () => {
   const h = createHarness({ initialRoutes: { 'opencode-go': LEGACY_CHAT } })
-  const plan = parsePlan((await h.invoke('migrate plan --adopt')).text)
-  const applied = await h.invoke(`migrate apply --adopt --plan ${plan.planHash} --confirm ${plan.confirmCode}`)
+  const plan = parsePlan((await h.invoke('migrate plan --adopt --prune-user-extra')).text)
+  const applied = await h.invoke(`migrate apply --adopt --prune-user-extra --plan ${plan.planHash} --confirm ${plan.confirmCode} --ack-managed`)
   assert.equal(applied.kind, 'success', applied.text)
-  assert.deepEqual(idsOf(h.settings, 'opencode-go'), ['deepseek-v4.1-flash'], 'adopt removed the legacy id')
+  assert.deepEqual(idsOf(h.settings, 'opencode-go'), ['deepseek-v4.1-flash'], 'the plan-listed user-extra id was removed')
 
   // Refusal paths first: all zero writes.
   const before = h.settings.mutations.length
@@ -444,7 +456,7 @@ await checkAsync('V20: adopt apply deletes a legacy id; rollback restores it and
 await checkAsync('V20: rollback refuses when the full preManagedSection snapshot is missing (zero writes)', async () => {
   const h = createHarness({ initialRoutes: { 'opencode-go': LEGACY_CHAT } })
   const plan = parsePlan((await h.invoke('migrate plan --adopt')).text)
-  await h.invoke(`migrate apply --adopt --plan ${plan.planHash} --confirm ${plan.confirmCode}`)
+  await h.invoke(`migrate apply --adopt --plan ${plan.planHash} --confirm ${plan.confirmCode} --ack-managed`)
   // Corrupt the authoritative whole-section snapshot on purpose.
   const key = [...h.ownership.data.keys()][0]
   const entry = structuredClone(h.ownership.data.get(key))
@@ -461,7 +473,7 @@ await checkAsync('V20: rollback refuses when the full preManagedSection snapshot
 await checkAsync('V20: rollback refuses on a post-apply managed-hash edit (zero writes)', async () => {
   const h = createHarness({ initialRoutes: { 'opencode-go': LEGACY_CHAT } })
   const plan = parsePlan((await h.invoke('migrate plan --adopt')).text)
-  await h.invoke(`migrate apply --adopt --plan ${plan.planHash} --confirm ${plan.confirmCode}`)
+  await h.invoke(`migrate apply --adopt --plan ${plan.planHash} --confirm ${plan.confirmCode} --ack-managed`)
   h.settings.state.get('opencode-go').models.find((m) => m.id === 'deepseek-v4.1-flash').name = 'user-edited'
   const before = h.settings.mutations.length
   const result = await h.invoke(`migrate rollback --plan ${plan.planHash}`)
@@ -486,7 +498,7 @@ await checkAsync('status: reports per-route state and write authority', async ()
 
   const h2 = createHarness({ initialRoutes: { 'opencode-go': LEGACY_CHAT } })
   const plan = parsePlan((await h2.invoke('migrate plan')).text)
-  await h2.invoke(`migrate apply --plan ${plan.planHash} --confirm ${plan.confirmCode}`)
+  await h2.invoke(`migrate apply --plan ${plan.planHash} --confirm ${plan.confirmCode} --ack-managed`)
   const applied = await h2.invoke('migrate status')
   assert.match(applied.text, /state=applied/)
   assert.match(applied.text, /owner=go/)
@@ -528,7 +540,7 @@ await checkAsync('references: session storage is report-only; opt-in rewrite tou
     references,
     now: 1,
   })
-  const result = await applyMigration({ planHash: plan.planHash, confirmCode: plan.confirmCode }, deps)
+  const result = await applyMigration({ planHash: plan.planHash, confirmCode: plan.confirmCode, ackManaged: true }, deps)
   assert.equal(result.ok, true, result.text)
   assert.equal(h.rewriteLog.length, 1, 'only the verified config key was rewritten')
   assert.equal(h.rewriteLog[0].surface, 'agent-default-model')
@@ -570,7 +582,7 @@ await checkAsync('P2-1: default apply→rollback restores the exact pre-apply se
   const expected = JSON.stringify(before)
   const h = createHarness({ initialRoutes: { 'opencode-go': structuredClone(before) } })
   const plan = parsePlan((await h.invoke('migrate plan')).text)
-  const applied = await h.invoke(`migrate apply --plan ${plan.planHash} --confirm ${plan.confirmCode}`)
+  const applied = await h.invoke(`migrate apply --plan ${plan.planHash} --confirm ${plan.confirmCode} --ack-managed`)
   assert.equal(applied.kind, 'success', applied.text)
   assert.ok(idsOf(h.settings, 'opencode-go').includes('deepseek-v4.1-flash'), 'apply added a desired id')
 
@@ -600,7 +612,7 @@ await checkAsync('P2-2: adopt apply→rollback restores the exact pre-apply sect
   const expected = JSON.stringify(before)
   const h = createHarness({ initialRoutes: { 'opencode-go': structuredClone(before) } })
   const plan = parsePlan((await h.invoke('migrate plan --adopt')).text)
-  const applied = await h.invoke(`migrate apply --adopt --plan ${plan.planHash} --confirm ${plan.confirmCode}`)
+  const applied = await h.invoke(`migrate apply --adopt --plan ${plan.planHash} --confirm ${plan.confirmCode} --ack-managed`)
   assert.equal(applied.kind, 'success', applied.text)
   const rolled = await h.invoke(`migrate rollback --plan ${plan.planHash}`)
   assert.equal(rolled.kind, 'success', rolled.text)
@@ -612,7 +624,7 @@ await checkAsync('P2-2: adopt apply→rollback restores the exact pre-apply sect
 await checkAsync('P2-3: rollback removes apply-added ids but keeps ids the user added after apply', async () => {
   const h = createHarness({ initialRoutes: { 'opencode-go': structuredClone(LEGACY_CHAT) } })
   const plan = parsePlan((await h.invoke('migrate plan')).text)
-  const applied = await h.invoke(`migrate apply --plan ${plan.planHash} --confirm ${plan.confirmCode}`)
+  const applied = await h.invoke(`migrate apply --plan ${plan.planHash} --confirm ${plan.confirmCode} --ack-managed`)
   assert.equal(applied.kind, 'success', applied.text)
   h.settings.state.get('opencode-go').models.push({ id: 'my-new-note', name: 'my-new-note' })
   const rolled = await h.invoke(`migrate rollback --plan ${plan.planHash}`)
@@ -661,7 +673,7 @@ await checkAsync('P2-5: apply → 3 go rounds (no-change + upstream change + rev
     roundEntries,
   })
   const plan = parsePlan((await h.invoke('migrate plan --adopt')).text)
-  const applied = await h.invoke(`migrate apply --adopt --plan ${plan.planHash} --confirm ${plan.confirmCode}`)
+  const applied = await h.invoke(`migrate apply --adopt --plan ${plan.planHash} --confirm ${plan.confirmCode} --ack-managed`)
   assert.equal(applied.kind, 'success', applied.text)
 
   const keys = [...h.ownership.data.keys()].sort()

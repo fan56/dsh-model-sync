@@ -210,7 +210,7 @@ async function withStore(fn) {
 await checkAsync('B1: key format is <profileKey>#<route>#<keyFingerprint> and record is profile-stamped', () => withStore(async ({ accessor, file }) => {
   const a = makeProfile(accessor, 'A', { 'opencode-go': structuredClone(LEGACY_CHAT) })
   const plan = parsePlan((await a.invoke('migrate plan')).text)
-  const applied = await a.invoke(`migrate apply --plan ${plan.planHash} --confirm ${plan.confirmCode}`)
+  const applied = await a.invoke(`migrate apply --plan ${plan.planHash} --confirm ${plan.confirmCode} --ack-managed`)
   assert.equal(applied.kind, 'success', applied.text)
 
   const doc = JSON.parse(await readFile(file, 'utf8'))
@@ -231,7 +231,7 @@ await checkAsync('B1: key format is <profileKey>#<route>#<keyFingerprint> and re
 await checkAsync('B1: A applied + B never migrated → B go round and bare sync are zero-write with skip', () => withStore(async ({ accessor }) => {
   const a = makeProfile(accessor, 'A', { 'opencode-go': structuredClone(LEGACY_CHAT) })
   const plan = parsePlan((await a.invoke('migrate plan')).text)
-  assert.equal((await a.invoke(`migrate apply --plan ${plan.planHash} --confirm ${plan.confirmCode}`)).kind, 'success')
+  assert.equal((await a.invoke(`migrate apply --plan ${plan.planHash} --confirm ${plan.confirmCode} --ack-managed`)).kind, 'success')
 
   const b = makeProfile(accessor, 'B', { 'opencode-go': structuredClone(LEGACY_CHAT) })
   const status = await b.invoke('migrate status')
@@ -266,8 +266,8 @@ await checkAsync('B1: A rollback leaves B ledger + migration record byte-identic
   const b = makeProfile(accessor, 'B', { 'opencode-go': bLegacy })
   const planA = parsePlan((await a.invoke('migrate plan')).text)
   const planB = parsePlan((await b.invoke('migrate plan')).text)
-  assert.equal((await a.invoke(`migrate apply --plan ${planA.planHash} --confirm ${planA.confirmCode}`)).kind, 'success')
-  assert.equal((await b.invoke(`migrate apply --plan ${planB.planHash} --confirm ${planB.confirmCode}`)).kind, 'success')
+  assert.equal((await a.invoke(`migrate apply --plan ${planA.planHash} --confirm ${planA.confirmCode} --ack-managed`)).kind, 'success')
+  assert.equal((await b.invoke(`migrate apply --plan ${planB.planHash} --confirm ${planB.confirmCode} --ack-managed`)).kind, 'success')
 
   const bSettingsBefore = JSON.stringify(b.settings.describe())
   const docBefore = JSON.parse(await readFile(file, 'utf8'))

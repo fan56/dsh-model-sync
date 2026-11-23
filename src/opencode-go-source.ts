@@ -66,6 +66,13 @@ export interface GoSourceResult {
   error?: GoSourceError
 }
 
+/** Outcome of the unauthenticated *public* catalog read (classification only, C2). */
+export interface GoPublicCatalogResult {
+  ok: boolean
+  ids: string[]
+  error?: GoSourceError
+}
+
 /** Minimal response shape the fetch accepts (injected in tests). */
 export interface GoFetchResponse {
   status: number
@@ -274,6 +281,58 @@ function failedResult(
  * status 'unknown'. With a key the request carries Bearer + explicit UA; the
  * key itself is never logged or stored, only its fingerprint.
  */
+/**
+ * Read the official *unauthenticated* public listing for one purpose only:
+ * answering "is this id official?" during migration planning (design §14.2).
+ * Per C2 the public list is NEVER a servable source — no authorization header
+ * is sent, no model is written to settings from it. If the read fails the
+ * caller must fail closed (ids become `unclassified`, never deleted).
+ */
+export async function fetchGoPublicCatalogIds(options: {
+  url?: string
+  timeoutMs?: number
+  fetchImpl?: GoFetchLike
+  signal?: AbortSignal
+} = {}): Promise<GoPublicCatalogResult> {
+  const url = options.url ?? OPENCODE_GO_MODELS_URL
+  const fetchImpl = options.fetchImpl ?? (fetch as unknown as GoFetchLike)
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 30_000)
+  const relayAbort = (): void => controller.abort()
+  if (options.signal !== undefined) {
+    if (options.signal.aborted) controller.abort()
+    else options.signal.addEventListener('abort', relayAbort, { once: true })
+  }
+  try {
+    const response = await fetchImpl(url, {
+      headers: { accept: 'application/json', 'user-agent': GO_USER_AGENT },
+      signal: controller.signal,
+    })
+    if (response.status < 200 || response.status >= 300) {
+      return {
+        ok: false,
+        ids: [],
+        error: {
+          kind: response.status === 401 || response.status === 403 ? 'auth' : 'transport',
+          status: response.status,
+          message: `public opencode-go catalog unavailable (HTTP ${response.status})`,
+        },
+      }
+    }
+    const body = await response.json()
+    return { ok: true, ids: parseGoModelsPayload(body).map((entry) => entry.id) }
+  } catch (error) {
+    return {
+      ok: false,
+      ids: [],
+      error: { kind: 'transport', message: error instanceof Error ? error.message : String(error) },
+    }
+  } finally {
+    clearTimeout(timer)
+    options.signal?.removeEventListener('abort', relayAbort)
+  }
+}
+
 export async function fetchGoOfficialModels(options: FetchGoOfficialOptions = {}): Promise<GoSourceResult> {
   const url = options.url ?? OPENCODE_GO_MODELS_URL
   const observedAt = options.observedAt ?? Date.now()

@@ -69,6 +69,8 @@ export type MigrationIdKind =
   | 'legacy-other-protocol'
   | 'unknown-retired'
   | 'user-extra'
+  /** Public catalog unavailable (offline/401/403) — fail-closed, never deleted (§14.2). */
+  | 'unclassified'
 
 export interface MigrationIdClass {
   id: string
@@ -90,6 +92,34 @@ export interface MigrationDeletion {
   }
   /** Only an explicitly confirmed id in adopt mode is actually deleted. */
   willDelete: boolean
+  reason: string
+}
+
+/**
+ * One row of the plan's per-id action table (design §14.2 / 31 B2). This is the
+ * SINGLE source of truth consumed by apply: it is hashed into planHash, so a
+ * plan and its apply can never disagree. `keep` rows are never destructive.
+ */
+export type MigrationIdActionOp = 'keep' | 'add' | 'update' | 'move' | 'delete'
+
+export interface MigrationIdPlan {
+  id: string
+  op: MigrationIdActionOp
+  /** Route the op operates on (source route for `move`/`delete`). */
+  route: string
+  /** Destination route for `move` (the id is removed from `route`). */
+  to?: string
+  kind: MigrationIdKind
+  /** True when the id is in pinnedModels — forced `keep`, never moved/deleted. */
+  pinned: boolean
+  /** Exact profile to write for add/move. Set on `update` rows as the official
+   *  target only for the plan's before/after report — apply never writes it. */
+  profile?: SettingsModelProfile
+  /** Current profile on an `update` row (user-modified) — for before/after output. */
+  before?: SettingsModelProfile
+  /** True iff applying this row puts the id under plugin ownership (managed ledger).
+   *  `update` and user-owned `keep` rows are false by construction (B6 + user ruling). */
+  managed?: boolean
   reason: string
 }
 
@@ -127,6 +157,16 @@ export interface MigrationPlanBody {
   stateByRoute: Record<string, MigrationState>
   routes: MigrationPlannedRoute[]
   deletions: MigrationDeletion[]
+  /** The complete per-id action table apply executes verbatim (31 B2). */
+  idActions: MigrationIdPlan[]
+  /** Fixed B6 informed-consent text; hashed into planHash so edits invalidate it. */
+  managedAfterMigration: string
+  /** True when the official public catalog was unavailable at plan time. Every
+   *  non-desired id is then `unclassified` and never deleted (fail-closed). */
+  publicCatalogAvailable: boolean
+  /** True when apply cannot guarantee verbatim action-table execution: plan mode
+   *  is `adopt-disabled` and `--adopt` is rejected at the command layer (§14.2). */
+  adoptDisabled: boolean
   references: ReferenceCandidate[]
   pinnedSuggestions: string[]
   backupPath: string
@@ -160,6 +200,18 @@ export interface BuildPlanInput {
   record?: MigrationRecord
   /** Reference candidates from the (offline) reference-surface scan. Report-only by default. */
   references?: ReferenceCandidate[]
+  /** go.pinnedModels: ids forced to `keep` (never moved or deleted, 31 B2). */
+  pinnedModels?: readonly string[]
+  /** Only with this flag may user-extra ids be deleted — and only if plan-listed. */
+  pruneUserExtra?: boolean
+  /** Official *public* catalog ids (may include ids the current key cannot use).
+   *  Ids present here but absent from `entries` are `unknown-retired`; ids in
+   *  neither set are `user-extra` (user-written, never auto-deleted). `undefined`
+   *  means the catalog was unavailable → fail-closed `unclassified`. */
+  publicCatalogIds?: readonly string[]
+  /** Apply cannot execute the per-id table → plan mode `adopt-disabled` and
+   *  `--adopt` rejected at the command layer (design §14.2 fallback). */
+  adoptDisabled?: boolean
   now: number
 }
 
@@ -193,19 +245,38 @@ export function planHashOf(body: MigrationPlanBody): string {
   return hashCanonical(body)
 }
 
+/**
+ * Ids that land under plugin ownership on `route` after applying the table.
+ * Reads the SAME `managed` flags the apply executor writes to the ledger, so the
+ * B6 notice and the ledger can never disagree (user ruling: update rows are
+ * never managed; `move` manages on its destination route only).
+ */
+export function managedIdsForRoute(route: string, actions: readonly MigrationIdPlan[]): string[] {
+  const ids = new Set<string>()
+  for (const action of actions) {
+    if (action.managed !== true) continue
+    const targetRoute = action.op === 'move' ? action.to : action.route
+    if (targetRoute === route) ids.add(action.id)
+  }
+  return [...ids].sort((a, b) => a.localeCompare(b))
+}
+
 export type ConsentResult =
   | { ok: true }
-  | { ok: false; reason: 'consent-required' | 'plan-hash-mismatch' | 'confirm-code-mismatch' }
+  | { ok: false; reason: 'consent-required' | 'plan-hash-mismatch' | 'confirm-code-mismatch' | 'ack-required' }
 
 /**
- * The consent gate (V17). Both values are mandatory and must match a freshly
- * rebuilt plan; a missing/incorrect value never reaches a write. Deliberately
- * there is no accept-anything branch — `--yes`/`--auto` cannot be expressed.
+ * The consent gate (V17 + 31 B6). THREE values are mandatory: the matching
+ * planHash, the 6-digit confirmCode and `--ack-managed` (acknowledgement of the
+ * `[managed-after-migration]` notice). A missing/incorrect value never reaches
+ * a write. Deliberately there is no accept-anything branch — `--yes`/`--auto`
+ * cannot be expressed.
  */
 export function verifyConsent(
   plan: MigrationPlan,
   planHash: string | undefined,
   confirmCode: string | undefined,
+  ackManaged?: boolean,
 ): ConsentResult {
   if (typeof planHash !== 'string' || planHash === ''
     || typeof confirmCode !== 'string' || confirmCode === '') {
@@ -213,6 +284,7 @@ export function verifyConsent(
   }
   if (planHash !== plan.planHash) return { ok: false, reason: 'plan-hash-mismatch' }
   if (confirmCode !== plan.confirmCode) return { ok: false, reason: 'confirm-code-mismatch' }
+  if (ackManaged !== true) return { ok: false, reason: 'ack-required' }
   return { ok: true }
 }
 
@@ -288,7 +360,10 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
   const prior = input.record
   const state = migrationStateForPlan(sections, prior, routes.chat)
   const stateByRoute = detectRouteStates(sections, prior, routeIds, state)
-  const adopt = input.adopt === true
+  // Fail-closed capability gate (§14.2): when the executor cannot guarantee the
+  // action table, adopt is reported as disabled and plan rows stay conservative.
+  const adoptDisabled = input.adoptDisabled === true
+  const adopt = input.adopt === true && !adoptDisabled
   const rewriteRefs = input.rewriteRefs ?? 'none'
 
   const grouping = groupGoModelsByProtocol(input.entries)
@@ -308,12 +383,17 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
   const targets = grouping.slots.msg.concat(grouping.slots.resp)
   const references = input.references ?? defaultReferences(targets, rewriteRefs)
 
-  const plannedRoutes: MigrationPlannedRoute[] = []
-  const deletions: MigrationDeletion[] = []
-  const pinned = new Set<string>()
-
+  // Routes actually in scope for this plan (a conditional, empty google slot
+  // with no pre-existing section is skipped — §9.4).
+  const scopedRoutes: {
+    slot: GoRouteSlot
+    route: string
+    state: MigrationState
+    fields: GoPlannedRouteFields
+    desired: SettingsModelProfile[]
+    currentModels: SettingsModelProfile[]
+  }[] = []
   for (const slot of ['chat', 'msg', 'resp', 'google'] as const) {
-    // Skip an unused conditional slot with no pre-existing section (§9.4).
     if (slot === 'google' && desiredBySlot.get(slot)!.length === 0 && sections?.[routes[slot]] === undefined) continue
     const route = routes[slot]
     const section = sections?.[route]
@@ -323,67 +403,196 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
     const currentModels: SettingsModelProfile[] = isRecord(section) && Array.isArray(section.models)
       ? section.models as SettingsModelProfile[]
       : []
-    const currentById = new Map(currentModels.map((profile) => [profile.id, profile]))
+    scopedRoutes.push({ slot, route, state: routeState, fields, desired, currentModels })
+  }
 
-    const existing: MigrationIdClass[] = []
-    for (const profile of currentModels) {
-      const id = profile.id
-      const inSlot = desiredBySlot.get(slot)!.some((candidate) => candidate.id === id)
-      let kind: MigrationIdKind
-      let action: MigrationIdClass['action']
-      if (inSlot) {
-        kind = `desired-${slot}` as MigrationIdKind
-        action = adopt ? 'adopt' : 'keep'
-      } else if (desiredIds.has(id)) {
-        // Present on a different slot's desired list → candidate to move.
-        kind = 'legacy-other-protocol'
-        action = 'keep'
-      } else {
-        // Not in the official set at all: could be a retired id or user-written.
-        kind = 'unknown-retired'
-        action = 'keep'
-      }
-      existing.push({ id, kind, action, reason: describeId(kind, adopt) })
+  // desired id → its official target route + exact profile.
+  const desiredTarget = new Map<string, { slot: GoRouteSlot; route: string; profile: SettingsModelProfile }>()
+  for (const scope of scopedRoutes) {
+    for (const profile of scope.desired) {
+      desiredTarget.set(profile.id, { slot: scope.slot, route: scope.route, profile })
     }
+  }
 
-    let action: MigrationAction
-    if (routeState === 'absent') action = 'create'
-    else if (routeState === 'applied') action = 'keep'
-    else action = 'update'
+  // Every id currently in settings, with all the routes it occupies.
+  const currentLocations = new Map<string, { route: string; profile: SettingsModelProfile }[]>()
+  for (const scope of scopedRoutes) {
+    for (const profile of scope.currentModels) {
+      const list = currentLocations.get(profile.id) ?? []
+      list.push({ route: scope.route, profile })
+      currentLocations.set(profile.id, list)
+    }
+  }
 
-    plannedRoutes.push({ slot, route, state: routeState, action, fields, desired, existing })
+  const pinnedIds = new Set(input.pinnedModels ?? [])
+  // `undefined` is materially different from an empty list: empty means the
+  // catalog was fetched and truly has no such id (→ user-extra); undefined means
+  // it could not be fetched at all (→ unclassified, never deleted).
+  const publicCatalogAvailable = input.publicCatalogIds !== undefined
+  const publicIds = new Set(input.publicCatalogIds ?? [])
+  const pruneUserExtra = input.pruneUserExtra === true
 
-    // Deletions are reported for every legacy id on the CHAT route (the route
-    // that shrinks), with the three-gate explanation. Only adopt mode with an
-    // explicitly confirmed id sets willDelete=true; conservative mode never deletes.
-    if (slot === 'chat') {
-      for (const entry of existing) {
-        if (entry.action === 'keep' && entry.kind !== 'desired-chat') {
-          const hashMatches = currentById.has(entry.id) // no pre-migration ledger for legacy ids
-          const isPinned = input.entries.some((e) => e.id === entry.id && grouping.slots.resp.includes(e.id))
-            || grouping.slots.msg.includes(entry.id)
-          const willDelete = adopt && entry.kind === 'unknown-retired' && !isPinned
-          deletions.push({
-            route,
-            id: entry.id,
-            kind: entry.kind,
-            gates: {
-              managedHash: hashMatches ? 'legacy id: user-confirmed via plan (no prior ledger)' : 'no hash — never delete',
-              override: 'no modelOverrides on legacy section',
-              pinned: isPinned ? 'pinned target id — kept' : 'not pinned',
-            },
-            willDelete,
-            reason: willDelete
-              ? 'adopt mode: unknown/retired id explicitly listed in this plan'
-              : 'conservative mode: kept as user-owned',
+  const kindOf = (id: string): MigrationIdKind => {
+    const target = desiredTarget.get(id)
+    if (target !== undefined) return `desired-${target.slot}` as MigrationIdKind
+    // Fail-closed (§14.2): no public catalog → never guess "user-written".
+    if (!publicCatalogAvailable) return 'unclassified'
+    // Ids in the official public catalog but not in the current key's authorized
+    // list are unknown-retired; ids in neither set are user-written extras.
+    return publicIds.has(id) ? 'unknown-retired' : 'user-extra'
+  }
+
+  // ---- The per-id action table: the SINGLE source of truth for apply (31 B2) ----
+  const idActions: MigrationIdPlan[] = []
+  const idsInScope = new Set<string>([...currentLocations.keys(), ...desiredTarget.keys()])
+  for (const id of [...idsInScope].sort((a, b) => a.localeCompare(b))) {
+    const kind = kindOf(id)
+    const target = desiredTarget.get(id)
+    const locations = currentLocations.get(id) ?? []
+    const isPinned = pinnedIds.has(id)
+
+    if (isPinned) {
+      // User ruling "pinned = 两边都放": every existing copy is kept in place AND
+      // a copy is added to the official target route (duplicate display allowed).
+      // A pinned desired id is never moved/deleted, even in adopt mode.
+      if (locations.length === 0) {
+        if (target !== undefined) idActions.push({
+          id, op: 'add', route: target.route, kind, pinned: true, profile: target.profile, managed: true,
+          reason: 'pinnedModels: added to its official route (never moved/deleted)',
+        })
+      } else {
+        for (const loc of locations) idActions.push({
+          id, op: 'keep', route: loc.route, kind, pinned: true, profile: loc.profile,
+          reason: 'pinnedModels: forced keep (not moved, not deleted)',
+        })
+        if (target !== undefined && !locations.some((loc) => loc.route === target.route)) {
+          idActions.push({
+            id, op: 'add', route: target.route, kind, pinned: true, profile: target.profile, managed: true,
+            reason: 'pinnedModels: old copy kept; also added to its official route (duplicate display allowed)',
           })
         }
+      }
+      continue
+    }
+
+    if (target !== undefined) {
+      // Official desired id: make sure it ends up on its target route.
+      const targetLoc = locations.find((loc) => loc.route === target.route)
+      if (targetLoc === undefined) {
+        if (locations.length === 0) {
+          idActions.push({ id, op: 'add', route: target.route, kind, pinned: false, profile: target.profile, managed: true,
+            reason: 'desired id missing from its official route' })
+        } else if (adopt) {
+          for (const loc of locations) idActions.push({
+            id, op: 'move', route: loc.route, to: target.route, kind, pinned: false, profile: target.profile, managed: true,
+            reason: 'adopt: move desired id from its legacy route (old copy removed)',
+          })
+        } else {
+          idActions.push({ id, op: 'add', route: target.route, kind, pinned: false, profile: target.profile, managed: true,
+            reason: 'conservative: keep existing copy, add desired id to its official route' })
+          for (const loc of locations) idActions.push({
+            id, op: 'keep', route: loc.route, kind, pinned: false, profile: loc.profile,
+            reason: 'conservative: existing copy kept as user-owned',
+          })
+        }
+      } else {
+        // Already on the target route. A user-edited profile is reported as an
+        // UPDATE/drift row with before→after, but apply NEVER overwrites it and
+        // NEVER claims it as managed (user ruling).
+        if (profileHash(targetLoc.profile) !== profileHash(target.profile)) {
+          idActions.push({ id, op: 'update', route: target.route, kind, pinned: false,
+            profile: target.profile, before: targetLoc.profile,
+            reason: 'user-modified desired value: plan shows before→after; apply leaves it untouched and unmanaged' })
+        } else {
+          idActions.push({ id, op: 'keep', route: target.route, kind, pinned: false, profile: target.profile, managed: true,
+            reason: 'desired id already matches the official value (adopted into ledger)' })
+        }
+        if (adopt) {
+          for (const loc of locations) {
+            if (loc.route === target.route) continue
+            idActions.push({ id, op: 'move', route: loc.route, to: target.route, kind, pinned: false, profile: target.profile, managed: true,
+              reason: 'adopt: remove duplicate desired id from the wrong route' })
+          }
+        }
+      }
+      continue
+    }
+
+    // Non-desired id: user-extra / unknown-retired / unclassified. Default keep.
+    // Delete only when the classification's own flag is set AND the row is in
+    // this plan. `unclassified` (no public catalog) is never deletable.
+    const mayDelete = kind === 'user-extra' ? pruneUserExtra : kind === 'unknown-retired' ? adopt : false
+    for (const loc of locations) {
+      if (mayDelete) {
+        idActions.push({ id, op: 'delete', route: loc.route, kind, pinned: false, profile: loc.profile,
+          reason: kind === 'user-extra'
+            ? '--prune-user-extra: explicitly listed for deletion in this plan'
+            : 'adopt: unknown-retired id explicitly listed for deletion in this plan' })
+      } else {
+        idActions.push({ id, op: 'keep', route: loc.route, kind, pinned: false, profile: loc.profile,
+          reason: kind === 'unclassified'
+            ? 'public catalog unavailable (unclassified): never deleted (fail-closed)'
+            : describeId(kind, adopt) })
       }
     }
   }
 
+  // Deletions are reported with the three-gate explanation, driven from the
+  // SAME action table (so the report cannot disagree with apply). `move` rows
+  // are NOT deletions — they are listed in the per-id table with a destination.
+  const deletions: MigrationDeletion[] = idActions
+    .filter((action) => action.op === 'delete')
+    .map((action) => ({
+      route: action.route,
+      id: action.id,
+      kind: action.kind,
+      gates: {
+        managedHash: 'plan-confirmed: id removed by this migration',
+        override: 'no modelOverrides on legacy section',
+        pinned: action.pinned ? 'pinned — never removed' : 'not pinned',
+      },
+      willDelete: true,
+      reason: action.reason,
+    }))
+
+  const plannedRoutes: MigrationPlannedRoute[] = scopedRoutes.map((scope) => {
+    const seen = new Set<string>()
+    const existing: MigrationIdClass[] = []
+    for (const profile of scope.currentModels) {
+      if (seen.has(profile.id)) continue
+      seen.add(profile.id)
+      const row = idActions.find((action) => action.route === scope.route && action.id === profile.id)
+      const legacyAction: MigrationIdClass['action'] = row?.op === 'move' ? 'move'
+        : row?.op === 'delete' ? 'delete'
+          : row?.op === 'keep' ? 'keep' : 'adopt'
+      existing.push({
+        id: profile.id,
+        kind: row?.kind ?? 'user-extra',
+        action: legacyAction,
+        reason: row?.reason ?? describeId('user-extra', adopt),
+      })
+    }
+    let action: MigrationAction
+    if (scope.state === 'absent') action = 'create'
+    else if (scope.state === 'applied') action = 'keep'
+    else action = 'update'
+    return { slot: scope.slot, route: scope.route, state: scope.state, action, fields: scope.fields, desired: scope.desired, existing }
+  })
+
+  const pinnedSuggestions = new Set<string>()
   const reversibleTargets = targets.filter((id) => !grouping.slots.chat.includes(id))
-  for (const id of reversibleTargets) pinned.add(id)
+  for (const id of reversibleTargets) pinnedSuggestions.add(id)
+  for (const id of pinnedIds) pinnedSuggestions.add(id)
+
+  // B6 informed-consent text — part of the hashed body: any edit to this notice
+  // changes planHash and invalidates the old confirmCode/ack. The id list is
+  // derived from the SAME `managed` flags apply writes to the ledger, so a
+  // user-modified `update` row is never advertised as managed.
+  const managedAfterMigration = [
+    '[managed-after-migration] 以下模型将交由插件管理：',
+    `  ${scopedRoutes.map((s) => `${s.route}: ${managedIdsForRoute(s.route, idActions).join(', ') || '(none)'}`).join('；')}`,
+    '官方下架时，这些模型会在满足「归属账本 + 现值哈希 + 无 override/pin」三闸门且连续 2 轮确认后自动从列表移除。',
+  ].join('\n')
 
   const preFingerprint = fingerprintSection(sections ?? {})
   const body: MigrationPlanBody = {
@@ -396,8 +605,12 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
     stateByRoute,
     routes: plannedRoutes,
     deletions,
+    idActions,
+    managedAfterMigration,
+    publicCatalogAvailable,
+    adoptDisabled,
     references,
-    pinnedSuggestions: [...pinned].sort(),
+    pinnedSuggestions: [...pinnedSuggestions].sort(),
     backupPath: `models-store:migration:backup:${input.keyFingerprint}`,
     rollbackCommand: `/model-sync migrate rollback --plan <planHash>`,
     unverified: [
@@ -418,6 +631,7 @@ function describeId(kind: MigrationIdKind, adopt: boolean): string {
     case 'legacy-other-protocol': return adopt ? 'legacy id on the wrong protocol route' : 'legacy id kept in conservative mode'
     case 'unknown-retired': return adopt ? 'unknown/retired id, delete only if confirmed in plan' : 'unknown/retired id kept as user-owned'
     case 'user-extra': return 'user-written id, never auto-deleted'
+    case 'unclassified': return 'public catalog unavailable (unclassified): never deleted'
   }
 }
 
@@ -448,11 +662,20 @@ function migrationStateForPlan(
 // Human-readable reports (V16 / V19)
 // ---------------------------------------------------------------------------
 
+function profileLabel(profile: SettingsModelProfile | undefined): string {
+  if (profile === undefined) return '(none)'
+  return `${profile.name ?? profile.id} [${profileHash(profile).slice(0, 8)}]`
+}
+
 export function formatMigrationPlan(plan: MigrationPlan): string {
+  const mode = plan.adoptDisabled
+    ? 'adopt-disabled (--adopt rejected: apply cannot guarantee the action table)'
+    : plan.adopt ? 'adopt' : 'conservative'
   const lines: string[] = [
     `model-sync migrate plan (v${plan.version}) — ${plan.state} (read-only, nothing written)`,
-    `  mode: ${plan.adopt ? 'adopt' : 'conservative'}  rewrite-refs: ${plan.rewriteRefs}`,
+    `  mode: ${mode}  rewrite-refs: ${plan.rewriteRefs}`,
     `  sections fingerprint: ${plan.preFingerprint.slice(0, 16)}…`,
+    `  public catalog: ${plan.publicCatalogAvailable ? 'available (ids classified)' : 'UNAVAILABLE — unclassified ids are never deleted (fail-closed)'}`,
     '',
     'Routes:',
   ]
@@ -472,6 +695,17 @@ export function formatMigrationPlan(plan: MigrationPlan): string {
     lines.push(`    gates: managedHash=${del.gates.managedHash}; override=${del.gates.override}; pinned=${del.gates.pinned}`)
     lines.push(`    why: ${del.reason}`)
   }
+  lines.push('', 'Per-id actions (apply consumes this table verbatim; keep/update/pin are non-destructive):')
+  if (plan.idActions.length === 0) lines.push('  (none)')
+  for (const action of plan.idActions) {
+    const dest = action.to !== undefined ? ` → ${action.to}` : ''
+    const beforeAfter = action.op === 'update'
+      ? ` before=${profileLabel(action.before)} → official=${profileLabel(action.profile)} (apply keeps current value, not managed)`
+      : ''
+    lines.push(`  ${action.op.toUpperCase().padEnd(6)} ${action.route}/${action.id}${dest} [${action.kind}]${action.pinned ? ' [pinned]' : ''}${action.managed === true ? ' [managed]' : ''}${beforeAfter}`)
+    lines.push(`      why: ${action.reason}`)
+  }
+  lines.push('', plan.managedAfterMigration)
   lines.push('', 'Reference rewrites (report-only by default; sessions are NEVER rewritten):')
   for (const ref of plan.references) {
     lines.push(`  ${ref.verified ? 'verified' : 'unverified'}/${ref.reportOnly ? 'report-only' : 'rewritable'} ${ref.surface} @ ${ref.location}`)
@@ -488,7 +722,7 @@ export function formatMigrationPlan(plan: MigrationPlan): string {
   }
   lines.push('', `planHash: ${plan.planHash}`)
   lines.push(`confirmCode: ${plan.confirmCode}`)
-  lines.push('apply: /model-sync migrate apply  --plan <planHash>  --confirm <confirmCode>')
+  lines.push('apply: /model-sync migrate apply  --plan <planHash>  --confirm <confirmCode>  --ack-managed')
   return lines.join('\n')
 }
 
@@ -509,6 +743,16 @@ export interface MigrateDeps {
   adopt?: boolean
   rewriteRefs?: RewriteRefMode
   references?: ReferenceCandidate[]
+  /** go.pinnedModels: forced `keep` (31 B2). */
+  pinnedModels?: readonly string[]
+  /** Only with this flag may user-extra ids be deleted — and only if plan-listed. */
+  pruneUserExtra?: boolean
+  /** Official public catalog ids, used to distinguish unknown-retired from user-extra.
+   *  `undefined` → fail-closed `unclassified` (never deleted). */
+  publicCatalogIds?: readonly string[]
+  /** Capability flag: `--adopt` is refused at the command layer when the per-id
+   *  action table cannot be executed verbatim (design §14.2 fallback). */
+  adoptDisabled?: boolean
   now: number
   /** M-5: true when a go sync round currently holds the single-flight lock. */
   isSyncInFlight?: () => boolean
@@ -516,7 +760,12 @@ export interface MigrateDeps {
   applyReferenceRewrite?: (rewrite: ReferenceRewrite) => Promise<void>
 }
 
-function buildFromDeps(deps: MigrateDeps, record: MigrationRecord | undefined): MigrationPlan {
+/**
+ * The ONE plan-construction path used by both `/migrate plan` and `apply`.
+ * Sharing it is what makes the printed plan and the plan apply re-builds
+ * byte-identical — a prerequisite for the consent gate (V17) and V19.
+ */
+export function buildMigrationPlanFromDeps(deps: MigrateDeps, record: MigrationRecord | undefined): MigrationPlan {
   return buildMigrationPlan({
     descriptor: deps.settings?.describe().find((desc) => desc.ns === 'llm-pi-ai'),
     entries: deps.entries,
@@ -527,6 +776,10 @@ function buildFromDeps(deps: MigrateDeps, record: MigrationRecord | undefined): 
     rewriteRefs: deps.rewriteRefs,
     record,
     references: deps.references,
+    pinnedModels: deps.pinnedModels,
+    pruneUserExtra: deps.pruneUserExtra,
+    publicCatalogIds: deps.publicCatalogIds,
+    adoptDisabled: deps.adoptDisabled,
     now: deps.now,
   })
 }
@@ -585,6 +838,105 @@ function routeOps(
   return ops
 }
 
+interface RouteWriteState {
+  /** Desired end state of this route's models, seeded from the live section. */
+  models: Map<string, SettingsModelProfile>
+  /** ids under plugin ownership after this apply (B6 ledger `managed`). */
+  managed: Record<string, GoManagedModel>
+  /** ids this apply actually created on this route (ledger `appliedAddedIds`). */
+  addedIds: Set<string>
+}
+
+/**
+ * Translate the plan's per-id action table into per-route desired states. This
+ * is the ONLY place that decides what apply writes: there is no
+ * `merged = [...desired]` re-derivation anywhere (31 B2). Every row yields
+ * exactly one result, in table order, so plan ↔ apply is checkable row by row.
+ *
+ * Semantics (user rulings + §14.2/§14.3):
+ *   keep   → untouched; adopted only when the row is flagged `managed`.
+ *   add    → write the official profile unless the id is already present.
+ *   update → NOTHING written, never managed (user-edited value is preserved).
+ *   move   → remove from source route, add official profile to destination.
+ *   delete → remove from the route (only rows explicitly listed in the plan).
+ *   pinned → expressed by keep (+ add on the target) rows; never moved/deleted.
+ */
+function buildRouteWriteStates(
+  plan: MigrationPlan,
+  desc: SettingsDescriptor,
+): { byRoute: Map<string, RouteWriteState>; results: MigrateApplyActionResult[] } {
+  const byRoute = new Map<string, RouteWriteState>()
+  for (const planned of plan.routes) {
+    byRoute.set(planned.route, {
+      models: new Map(rawModels(desc, planned.route).map((profile) => [profile.id, structuredClone(profile)])),
+      managed: {},
+      addedIds: new Set(),
+    })
+  }
+  const results: MigrateApplyActionResult[] = []
+
+  const claim = (state: RouteWriteState | undefined, action: MigrationIdPlan): void => {
+    if (action.managed !== true || state === undefined || action.profile === undefined) return
+    state.managed[action.id] = { hash: profileHash(action.profile) }
+  }
+
+  for (const action of plan.idActions) {
+    const source = byRoute.get(action.route)
+    const result = (status: MigrateApplyActionResult['status'], reason: string): void => {
+      results.push({ id: action.id, op: action.op, route: action.route, ...(action.to !== undefined ? { to: action.to } : {}), status, reason })
+    }
+    switch (action.op) {
+      case 'keep':
+        claim(source, action)
+        result('kept', action.reason)
+        break
+      case 'add': {
+        if (source === undefined || action.profile === undefined) {
+          result('skipped', 'route or profile unavailable; nothing written')
+          break
+        }
+        if (source.models.has(action.id)) {
+          // Idempotent: never overwrite an existing value (C4 / update ruling).
+          const existing = source.models.get(action.id)!
+          if (action.managed === true && profileHash(existing) === profileHash(action.profile)) claim(source, action)
+          result('kept', `already present on ${action.route}; not overwritten`)
+        } else {
+          source.models.set(action.id, structuredClone(action.profile))
+          source.addedIds.add(action.id)
+          claim(source, action)
+          result('applied', action.reason)
+        }
+        break
+      }
+      case 'update':
+        // User ruling: report before→after, but write nothing and claim nothing.
+        result('skipped', `${action.reason} (before=${profileLabel(action.before)}; official=${profileLabel(action.profile)})`)
+        break
+      case 'move': {
+        source?.models.delete(action.id)
+        const dest = action.to !== undefined ? byRoute.get(action.to) : undefined
+        if (dest !== undefined && action.profile !== undefined) {
+          if (dest.models.has(action.id)) {
+            const existing = dest.models.get(action.id)!
+            if (action.managed === true && profileHash(existing) === profileHash(action.profile)) claim(dest, action)
+          } else {
+            dest.models.set(action.id, structuredClone(action.profile))
+            dest.addedIds.add(action.id)
+            claim(dest, action)
+          }
+        }
+        result('applied', `${action.reason}${action.to !== undefined ? ` → ${action.to}` : ''}`)
+        break
+      }
+      case 'delete':
+        source?.models.delete(action.id)
+        result('applied', action.reason)
+        break
+    }
+  }
+  return { byRoute, results }
+}
+
 async function mutateWithRetry(
   deps: MigrateDeps,
   ops: SettingsMutationOp[],
@@ -612,9 +964,21 @@ export type MigrateApplyReason =
   | 'consent-required'
   | 'plan-hash-mismatch'
   | 'confirm-code-mismatch'
+  | 'ack-required'
+  | 'adopt-disabled'
   | 'nothing-to-apply'
   | 'sync-in-flight'
   | 'write-failed'
+
+/** Result of ONE row of the plan's action table — mirrors it one-to-one (V19). */
+export interface MigrateApplyActionResult {
+  id: string
+  op: MigrationIdActionOp
+  route: string
+  to?: string
+  status: 'applied' | 'kept' | 'skipped' | 'failed'
+  reason: string
+}
 
 export interface MigrateApplyResult {
   ok: boolean
@@ -622,24 +986,34 @@ export interface MigrateApplyResult {
   planHash: string
   confirmCode: string
   routes: { route: string; status: 'wrote' | 'failed' | 'skipped'; reason?: string }[]
+  /** One entry per `plan.idActions` row, in the same order. */
+  actions: MigrateApplyActionResult[]
   backupPath?: string
   text: string
 }
 
 function applyFailure(reason: MigrateApplyReason, planHash: string, confirmCode: string, detail: string): MigrateApplyResult {
-  return { ok: false, reason, planHash, confirmCode, routes: [], text: `migrate apply refused (${reason}): ${detail}; zero writes` }
+  return { ok: false, reason, planHash, confirmCode, routes: [], actions: [], text: `migrate apply refused (${reason}): ${detail}; zero writes` }
 }
 
 export async function applyMigration(
-  args: { planHash?: string; confirmCode?: string },
+  args: { planHash?: string; confirmCode?: string; ackManaged?: boolean },
   deps: MigrateDeps,
 ): Promise<MigrateApplyResult> {
   const prior = await readRecord(deps)
-  const plan = buildFromDeps(deps, prior)
+  const plan = buildMigrationPlanFromDeps(deps, prior)
 
-  // 1. Consent — every rejection below is ZERO writes.
-  const consent = verifyConsent(plan, args.planHash, args.confirmCode)
+  // 1. Consent — every rejection below is ZERO writes. `--ack-managed` is a
+  //    mandatory third token (B6); no bypass flag exists.
+  const consent = verifyConsent(plan, args.planHash, args.confirmCode, args.ackManaged)
   if (!consent.ok) return applyFailure(consent.reason, plan.planHash, plan.confirmCode, `${consent.reason}`)
+
+  // Fail-closed fallback (§14.2): if the executor cannot guarantee verbatim
+  // table execution, adopt is refused here as well as at the command layer.
+  if (deps.adopt === true && (deps.adoptDisabled === true || plan.adoptDisabled)) {
+    return applyFailure('adopt-disabled', plan.planHash, plan.confirmCode,
+      '--adopt disabled: apply cannot execute the per-id action table; use conservative mode')
+  }
 
   if (plan.state !== 'legacy-inherit' && plan.state !== 'legacy-inline' && plan.state !== 'drifted') {
     return applyFailure('nothing-to-apply', plan.planHash, plan.confirmCode, `state=${plan.state} (nothing needs migration)`)
@@ -679,23 +1053,31 @@ export async function applyMigration(
   const routesResult: MigrateApplyResult['routes'] = []
   const committedLedgerKeys: string[] = []
   const writtenRoutes: string[] = []
+  const managedByRoute: Record<string, string[]> = {}
   let failure: string | undefined
+
+  // The action table is the ONLY write source (31 B2): translate it once into
+  // per-route desired states, then write exactly those states — never re-derive
+  // from `planned.desired`. `actionResults` mirrors idActions row by row.
+  const { byRoute, results: actionResults } = buildRouteWriteStates(plan, desc)
 
   try {
     for (const planned of plan.routes) {
-      if (planned.action === 'keep') {
+      const state = byRoute.get(planned.route)
+      if (state === undefined) {
+        routesResult.push({ route: planned.route, status: 'skipped', reason: 'no write state' })
+        continue
+      }
+      const touched = plan.idActions.some((action) => action.route === planned.route || action.to === planned.route)
+      if (planned.action === 'keep' && !touched) {
         routesResult.push({ route: planned.route, status: 'skipped', reason: 'already-applied' })
+        managedByRoute[planned.route] = managedIdsForRoute(planned.route, plan.idActions)
         continue
       }
       const current = rawModels(desc, planned.route)
-      const currentIds = new Set(current.map((model) => model.id))
-      // Conservative: keep every existing id and add only missing desired ones.
-      // Adopt: the plan's desired set (+ already-present pinned targets) is canonical.
-      const merged = deps.adopt === true
-        ? [...planned.desired]
-        : [...current, ...planned.desired.filter((profile) => !currentIds.has(profile.id))]
-
-      const ops = routeOps(desc, planned.route, planned.fields, merged)
+      // Write only ids the table actually changed; keep/update/delete-no rows
+      // leave their models byte-identical.
+      const ops = routeOps(desc, planned.route, planned.fields, [...state.models.values()])
       if (ops.length > 0) {
         try {
           await mutateWithRetry(deps, ops)
@@ -707,11 +1089,11 @@ export async function applyMigration(
         }
       }
 
-      // Ledger: conservative mode keeps user ids unclaimed; adopt claims desired.
-      const managed: Record<string, GoManagedModel> = {}
-      if (deps.adopt === true) {
-        for (const profile of planned.desired) managed[profile.id] = { hash: profileHash(profile) }
-      }
+      // B6: ledger `managed` is exactly the set of ids this apply wrote or
+      // adopted on this route (flagged by the same action rows as the plan's
+      // managed notice). User-owned keeps and user-edited updates are absent.
+      const managed = state.managed
+      managedByRoute[planned.route] = Object.keys(managed).sort((a, b) => a.localeCompare(b))
       const ledgerKey = goOwnershipKey(planned.route, deps.keyFingerprint)
       const preManagedSection = backup.routes[planned.route]?.section
       const entry: GoOwnershipEntry = {
@@ -720,10 +1102,9 @@ export async function applyMigration(
         // Legacy audit fields, still used by the P1b eject path.
         preManagedSnapshot: current.map((profile) => ({ ...profile })),
         // §14.3 whole-section snapshot: the exact pre-apply section (null when
-        // the route did not exist) plus the ids this apply introduced. Both ride
-        // the ledger's models-store queue and survive a successful apply.
+        // the route did not exist) plus the ids this apply introduced.
         preManagedSection: preManagedSection === undefined ? null : structuredClone(preManagedSection),
-        appliedAddedIds: merged.map((profile) => profile.id).filter((id) => !currentIds.has(id)).sort(),
+        appliedAddedIds: [...state.addedIds].sort((a, b) => a.localeCompare(b)),
       }
       try {
         await deps.ownershipStore.write(ledgerKey, entry)
@@ -744,7 +1125,10 @@ export async function applyMigration(
     const identityRoutes = Object.keys(readGoProviderSections(llmDescriptor(deps.settings), Object.values(routesOf(deps))) ?? {})
     const liveSections = readGoProviderSections(llmDescriptor(deps.settings), Object.values(routesOf(deps)))
     const identity = fingerprintGoIdentity(liveSections, identityRoutes)
-    const managedIds = Object.fromEntries(Object.values(routesOf(deps)).map((route) => [route, plannedManagedIds(plan, route, deps)]))
+    // `appliedManagedIds` mirrors the ledger entries actually written above.
+    const managedIds = Object.fromEntries(Object.values(routesOf(deps)).map((route) => [
+      route, managedByRoute[route] ?? managedIdsForRoute(route, plan.idActions),
+    ]))
     const applied: MigrationRecord = {
       ...(prior ?? {}),
       applying: false,
@@ -759,7 +1143,9 @@ export async function applyMigration(
       appliedIdentityRoutes: identityRoutes,
       appliedManagedIds: managedIds,
       appliedFingerprint: appliedFingerprintOf(identity, managedIds),
-      movedIds: plan.deletions.filter((del) => del.willDelete).map((del) => del.id),
+      // Moves are relocations, not deletions: report them separately from the
+      // delete rows so rollback/audit can tell the two apart (V19).
+      movedIds: [...new Set(plan.idActions.filter((action) => action.op === 'move').map((action) => action.id))],
       legacyFingerprint: undefined,
     }
     try {
@@ -791,6 +1177,8 @@ export async function applyMigration(
   const text = [
     `migrate apply: ${routesResult.filter((r) => r.status === 'wrote').length} routes written, fingerprint persisted`,
     ...routesResult.map((r) => `  ${r.route}: ${r.status}${r.reason !== undefined ? ` (${r.reason})` : ''}`),
+    'Per-id results (one per plan action row):',
+    ...actionResults.map((a) => `  ${a.status.toUpperCase().padEnd(7)} ${a.op.toUpperCase().padEnd(6)} ${a.route}/${a.id}${a.to !== undefined ? ` → ${a.to}` : ''} — ${a.reason}`),
     `  backup: ${plan.backupPath}`,
     `  rollback: /model-sync migrate rollback --plan ${plan.planHash}`,
   ].join('\n')
@@ -800,6 +1188,7 @@ export async function applyMigration(
     planHash: plan.planHash,
     confirmCode: plan.confirmCode,
     routes: routesResult,
+    actions: actionResults,
     backupPath: plan.backupPath,
     text,
   }
@@ -807,12 +1196,6 @@ export async function applyMigration(
 
 function routesOf(deps: MigrateDeps): Partial<Record<GoRouteSlot, string>> {
   return { ...GO_SLOT_ROUTES, ...deps.routes }
-}
-
-function plannedManagedIds(plan: MigrationPlan, route: string, deps: MigrateDeps): string[] {
-  if (deps.adopt !== true) return []
-  const planned = plan.routes.find((entry) => entry.route === route)
-  return (planned?.desired ?? []).map((profile) => profile.id).sort()
 }
 
 function captureBackup(plan: MigrationPlan, desc: SettingsDescriptor, now: number): MigrationBackup {
