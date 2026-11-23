@@ -197,7 +197,52 @@ function isConflictError(err: unknown): boolean {
 }
 
 function errorText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
+  // Prefer a structured `message` so re-wrapped plain-object errors still carry
+  // the actionable text (lock path / retry advice) instead of "[object Object]".
+  // Error instances already expose `message`; everything else falls back to
+  // String(err) exactly as before.
+  const message = (err as { message?: unknown } | null | undefined)?.message
+  return typeof message === 'string' ? message : String(err)
+}
+
+/** Structural check for a store lock timeout (survives re-wrapping / module boundaries). */
+function isStoreLockTimeout(err: unknown): boolean {
+  if (err === null || typeof err !== 'object') return false
+  const value = err as { code?: unknown; name?: unknown }
+  return value.code === 'DSH_STORE_LOCK_TIMEOUT' || value.name === 'StoreLockTimeoutError'
+}
+
+/**
+ * Record a route whose write hit a store lock timeout. The original error
+ * message carries the lock path and the retry / check-other-processes advice:
+ * keep it verbatim in the report and in the failed-route reason so the user
+ * sees an actionable cause instead of a generic failure. The route is marked
+ * `failed` and deliberately NOT added to `writtenRoutes`.
+ */
+function recordLockTimeout(
+  result: GoWriteResult,
+  report: GoPlanReportEntry[],
+  planned: GoPlannedRoute,
+  err: unknown,
+  phase: string,
+): void {
+  const reason = 'store-lock-timeout'
+  const detail = errorText(err)
+  result.routes.push({ route: planned.route, slot: planned.slot, status: 'failed', reason })
+  result.failedRoutes.push({ route: planned.route, reason })
+  report.push({
+    level: 'error',
+    code: 'store-lock-timeout',
+    route: planned.route,
+    slot: planned.slot,
+    message: `route ${planned.route} ${phase} hit a store lock timeout: ${detail}`,
+  })
+}
+
+/** Outcome of a ledger commit: `lockTimeout` is the original error when it was a lock wait timeout. */
+interface LedgerCommitResult {
+  committed: boolean
+  lockTimeout?: unknown
 }
 
 /** Normalize the second-gate seam (boolean shorthand or structured decision). */
@@ -226,11 +271,28 @@ function skipByCanWrite(
 }
 
 /** §14.7.4: persist the new applied fingerprint only after settings+ledger success. */
-async function recordOwnWrite(deps: GoWriterDeps, route: string, managedIds: string[]): Promise<void> {
+async function recordOwnWrite(
+  deps: GoWriterDeps,
+  route: string,
+  managedIds: string[],
+  report: GoPlanReportEntry[],
+): Promise<void> {
   if (deps.onOwnWrite === undefined) return
   try {
     await deps.onOwnWrite(route, managedIds)
   } catch (err) {
+    if (isStoreLockTimeout(err)) {
+      // Settings + ledger already landed, so this is not a failed route, but a
+      // lock timeout here must still be visible with its actionable message.
+      deps.logger.warn('appliedFingerprint lock timeout for %s: %s', route, errorText(err))
+      report.push({
+        level: 'warn',
+        code: 'store-lock-timeout',
+        route,
+        message: `route ${route} appliedFingerprint re-persist hit a store lock timeout: ${errorText(err)}`,
+      })
+      return
+    }
     // Settings + ledger already landed; a failed fingerprint write is healed at
     // the next round (§14.7.4 fingerprint-healed), never a failed route.
     deps.logger.warn('appliedFingerprint update failed for %s: %s', route, errorText(err))
@@ -363,6 +425,11 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
     try {
       prior = await ownershipStore.read(key)
     } catch (err) {
+      if (isStoreLockTimeout(err)) {
+        logger.warn('ownership store read lock timeout for %s: %s', key, errorText(err))
+        recordLockTimeout(result, report, planned, err, 'ledger read')
+        continue
+      }
       // Fail closed: with no ledger we cannot verify hashes, so do not write.
       logger.warn('ownership store read failed for %s: %s', key, errorText(err))
       result.routes.push({ route: planned.route, slot: planned.slot, status: 'failed', reason: 'store-unavailable' })
@@ -473,6 +540,11 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
     try {
       built = await buildRouteOps(planned, desc, sortedFinal, deps.overrideStorer)
     } catch (err) {
+      if (isStoreLockTimeout(err)) {
+        logger.warn('override resolve lock timeout for %s: %s', planned.route, errorText(err))
+        recordLockTimeout(result, report, planned, err, 'override resolve')
+        continue
+      }
       const reason = 'store-unavailable'
       logger.warn('override resolve failed for %s: %s', planned.route, errorText(err))
       result.routes.push({ route: planned.route, slot: planned.slot, status: 'failed', reason })
@@ -481,12 +553,20 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
     }
 
     if (built === undefined) {
-      await persistLedger(ownershipStore, key, planned.unset, nextEntry, logger, report, planned.route)
+      const commit = await persistLedger(ownershipStore, key, planned.unset, nextEntry, logger, report, planned.route)
+      if (commit.lockTimeout !== undefined) {
+        recordLockTimeout(result, report, planned, commit.lockTimeout, 'ledger commit')
+        continue
+      }
       result.routes.push({ route: planned.route, slot: planned.slot, status: 'no-change' })
       continue
     }
 
     let failedReason: string | undefined
+    // Settings mutate landing is tracked separately: it is added to
+    // `writtenRoutes` only once the ledger commit also succeeds. A lock
+    // timeout on the ledger must not leave the route counted as a success.
+    let settingsLanded = false
     if (built.settingsOverrides !== undefined && deps.overrideStorer === undefined) {
       // Unsetting a settings key with no store copy is the v0.1.5 data-loss
       // shape — fail closed rather than drop the user's folded values.
@@ -496,6 +576,11 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
       try {
         await stageOverrides(deps.overrideStorer, planned.route, built.settingsOverrides)
       } catch (err) {
+        if (isStoreLockTimeout(err)) {
+          logger.warn('override stage lock timeout for %s: %s', planned.route, errorText(err))
+          recordLockTimeout(result, report, planned, err, 'override stage')
+          continue
+        }
         failedReason = 'store-unavailable'
         logger.warn('override stage failed for %s: %s', planned.route, errorText(err))
       }
@@ -504,7 +589,7 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
     if (failedReason === undefined) {
       try {
         await settings.mutate('llm-pi-ai', built.ops, desc.revision)
-        result.writtenRoutes.push(planned.route)
+        settingsLanded = true
       } catch (err) {
         if (!isConflictError(err)) {
           failedReason = 'mutate-rejected'
@@ -529,15 +614,23 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
             if (retryBuilt === undefined) {
               // Another writer already landed the exact target: no-op success.
               failedReason = undefined
-              await persistLedger(ownershipStore, key, planned.unset, nextEntry, logger, report, planned.route)
+              const retryCommit = await persistLedger(ownershipStore, key, planned.unset, nextEntry, logger, report, planned.route)
+              if (retryCommit.lockTimeout !== undefined) {
+                recordLockTimeout(result, report, planned, retryCommit.lockTimeout, 'ledger commit (conflict retry)')
+                continue
+              }
               result.routes.push({ route: planned.route, slot: planned.slot, status: 'no-change' })
               continue
             }
             await stageOverrides(deps.overrideStorer, planned.route, retryBuilt.settingsOverrides)
             await settings.mutate('llm-pi-ai', retryBuilt.ops, fresh.revision)
-            result.writtenRoutes.push(planned.route)
+            settingsLanded = true
             failedReason = undefined
           } catch (retryErr) {
+            if (isStoreLockTimeout(retryErr)) {
+              recordLockTimeout(result, report, planned, retryErr, 'write (conflict retry)')
+              continue
+            }
             logger.warn('conflict retry failed for %s: %s', planned.route, errorText(retryErr))
           }
         }
@@ -561,10 +654,18 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
     // re-persist the applied fingerprint (same store queue as the ledger), with
     // the managed id set we just committed. Failed/no-change routes never get
     // here, so a partial failure leaves their fingerprint untouched.
-    const ledgerCommitted = await persistLedger(ownershipStore, key, planned.unset, nextEntry, logger, report, planned.route)
-    if (ledgerCommitted) {
-      await recordOwnWrite(deps, planned.route, planned.unset ? [] : Object.keys(nextEntry.managed).sort())
+    const commit = await persistLedger(ownershipStore, key, planned.unset, nextEntry, logger, report, planned.route)
+    if (commit.lockTimeout !== undefined) {
+      // Settings may have landed, but without a committed ledger this round is
+      // NOT a success: report the actionable lock error and exclude the route
+      // from writtenRoutes (and from the fingerprint update).
+      recordLockTimeout(result, report, planned, commit.lockTimeout, 'ledger commit')
+      continue
     }
+    if (commit.committed) {
+      await recordOwnWrite(deps, planned.route, planned.unset ? [] : Object.keys(nextEntry.managed).sort(), report)
+    }
+    if (settingsLanded) result.writtenRoutes.push(planned.route)
     result.routes.push({
       route: planned.route,
       slot: planned.slot,
@@ -576,7 +677,7 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
   return result
 }
 
-/** Returns true only when the ledger commit landed (gates the fingerprint update). */
+/** Commits the ledger; a lock timeout is returned with its original error (not degraded). */
 async function persistLedger(
   store: GoOwnershipStore,
   key: string,
@@ -585,12 +686,18 @@ async function persistLedger(
   logger: Logger,
   report: GoPlanReportEntry[],
   route: string,
-): Promise<boolean> {
+): Promise<LedgerCommitResult> {
   try {
     if (unset) await store.delete(key)
     else await store.write(key, entry)
-    return true
+    return { committed: true }
   } catch (err) {
+    if (isStoreLockTimeout(err)) {
+      // Keep the original error (code / lockPath / actionable message) for the
+      // caller to surface verbatim — do NOT collapse it into a generic warning.
+      logger.warn('ownership store lock timeout for %s: %s', key, errorText(err))
+      return { committed: false, lockTimeout: err }
+    }
     // Settings already landed; a failed ledger write degrades to "no ledger"
     // next round, which is the safe direction (never delete without a hash).
     logger.warn('ownership store write failed for %s: %s', key, errorText(err))
@@ -600,7 +707,7 @@ async function persistLedger(
       route,
       message: `route ${route} written but ownership ledger could not be persisted`,
     })
-    return false
+    return { committed: false }
   }
 }
 
