@@ -149,6 +149,18 @@ export interface GoOwnershipEntry {
   routeFields?: Partial<GoPlannedRouteFields>
   /** Plugin-managed model ids and the hash of their last written profile. */
   managed: Record<string, GoManagedModel>
+  /**
+   * Raw models present in the route before the plugin first claimed it (design
+   * §6.1 / ADR-004). Audit-only for the planner; the P1b writer uses it as the
+   * restore target for eject, never as a whole-route write-back.
+   */
+  preManagedSnapshot?: SettingsModelProfile[]
+  /**
+   * Consecutive successful rounds an id has been absent from the desired set.
+   * The planner only flags a deletion-candidate; the writer owns this counter
+   * and deletes only once it reaches `confirmRemovals` (design §6.2.4 / V5).
+   */
+  missing?: Record<string, number>
 }
 
 export type GoOwnershipLedger = Readonly<Record<string, GoOwnershipEntry>>
@@ -216,6 +228,14 @@ export interface GoPlanResult {
   report: GoPlanReportEntry[]
   /** Shallow copy of the ledger updated only for this key's routes. */
   nextOwnership: Record<string, GoOwnershipEntry>
+  /**
+   * The mapped desired profiles per route BEFORE the merge with current
+   * settings. The writer needs this to do a first-round conservative claim
+   * (official desired ∩ current, never ids outside the desired set) — the
+   * merged `routes[].models` already contains kept user entries and cannot be
+   * used for that distinction.
+   */
+  desiredByRoute: Record<string, SettingsModelProfile[]>
 }
 
 export interface GoPlannerOptions {
@@ -304,6 +324,7 @@ export function planGoRoutes(options: GoPlannerOptions): GoPlanResult {
   const plannedRoutes: GoPlannedRoute[] = []
   const unsetRoutes: string[] = []
   const nextOwnership: Record<string, GoOwnershipEntry> = { ...options.ownership }
+  const desiredByRoute: Record<string, SettingsModelProfile[]> = {}
 
   // Unknown / otherwise unsupported protocols are fail-closed: reported, never
   // written (design §6.2.3, V1).
@@ -324,6 +345,7 @@ export function planGoRoutes(options: GoPlannerOptions): GoPlanResult {
     const current = options.currentRoutes[route]
     const ledgerKey = goOwnershipKey(route, options.keyFingerprint)
     const owned = options.ownership[ledgerKey]
+    desiredByRoute[route] = []
 
     // Google slot is conditional and default-off (design §2.1): materialize it
     // only when it has members, or when there is a previous ledger to clean up.
@@ -387,6 +409,7 @@ export function planGoRoutes(options: GoPlannerOptions): GoPlanResult {
       const entry = entryById.get(id)
       if (entry !== undefined) desiredById.set(id, mapGoModelToProfile(entry))
     }
+    desiredByRoute[route] = [...desiredById.values()]
 
     const currentModels = current?.models ?? []
     const managed = owned?.managed ?? {}
@@ -458,5 +481,5 @@ export function planGoRoutes(options: GoPlannerOptions): GoPlanResult {
     nextOwnership[ledgerKey] = { routeFields: fields, managed: nextManaged }
   }
 
-  return { routes: plannedRoutes, unsetRoutes, conflicts, report, nextOwnership }
+  return { routes: plannedRoutes, unsetRoutes, conflicts, report, nextOwnership, desiredByRoute }
 }

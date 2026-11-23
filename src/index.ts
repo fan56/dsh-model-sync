@@ -135,7 +135,7 @@ export const Config = z.object({
    * OpenCode Go / Zen configuration contract (design §6.2.6). Published in one
    * Config schema in P1: read-only subset (go.enabled/ref/modelsUrl/
    * intervalMinutes, zen.enabled/ref/mode/modelsUrl) plus the write-side subset
-   * (go.routes/adoptExisting/pinnedModels/confirmRemovals/compatEnrichment,
+   * (go.routes/adoptExisting/pinnedModels/confirmRemovals,
    * zen.routes/seedFromBuiltin). Defaults are byte-for-byte the P0 constants —
    * `modelsUrl` and `ref` are imported from the P0 modules so a P0→P1 drift is
    * impossible. Zen stays login-only with no modelsUrl by default (design A5).
@@ -158,7 +158,6 @@ export const Config = z.object({
         google: z.string().default('opencode-go-google').volatile(),
       }).default({}),
       confirmRemovals: z.number().step(1).min(2).default(2).volatile(),
-      compatEnrichment: z.boolean().default(true).volatile(),
     }).default({}),
     zen: z.object({
       enabled: z.boolean().default(true).volatile(),
@@ -210,7 +209,6 @@ interface ModelSyncConfigValue {
       pinnedModels: VolatileRef<readonly string[]>
       routes: Record<'chat' | 'msg' | 'resp' | 'google', VolatileRef<string>>
       confirmRemovals: VolatileRef<number>
-      compatEnrichment: VolatileRef<boolean>
     }
     zen: {
       enabled: VolatileRef<boolean>

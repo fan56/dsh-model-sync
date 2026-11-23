@@ -92,7 +92,10 @@ check('schema: go write-side defaults and route ids', () => {
   assert.equal(config.opencode.go.routes.resp.get(), 'opencode-go-resp')
   assert.equal(config.opencode.go.routes.google.get(), 'opencode-go-google')
   assert.equal(config.opencode.go.confirmRemovals.get(), 2)
-  assert.equal(config.opencode.go.compatEnrichment.get(), true)
+  // compatEnrichment was removed in P1b: the go source has no compat field and
+  // the design's only compat source (pi.dev) is not part of P1 — it was dead
+  // config, not a delayed feature.
+  assert.equal('compatEnrichment' in config.opencode.go, false)
 })
 
 check('schema: zen defaults to login-only with no modelsUrl', () => {
