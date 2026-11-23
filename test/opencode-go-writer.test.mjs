@@ -1094,5 +1094,37 @@ await checkAsync('N2: non-lock ledger error keeps the existing generic handling'
   assert.equal(out.report.some((e) => e.code === 'store-lock-timeout'), false, 'no false lock-timeout')
 })
 
+// ---------------------------------------------------------------------------
+// N4 — plain-object lock errors keep actionable text in the visible report
+// ---------------------------------------------------------------------------
+
+await checkAsync('N4: plain-object lock error is readable (no [object Object]) and stays fail-closed', async () => {
+  const plan = planGoRoutes({
+    keyFingerprint: KEY, entries: [chatEntry('hy4')], currentRoutes: {}, ownership: {},
+  })
+  // A non-Error plain object is still recognized structurally by isStoreLockTimeout;
+  // its `message` must be lifted into the report instead of degrading to String(err).
+  const plainLockError = {
+    name: 'StoreLockTimeoutError',
+    code: 'DSH_STORE_LOCK_TIMEOUT',
+    message: `Timed out after 2000ms waiting for the models-store lock (${LOCK_PATH}). ` +
+      'Retry the operation; if it keeps failing, check other running dsh processes.',
+  }
+  const store = { ...createMockStore(), async write() { throw plainLockError } }
+  const out = await writeGoPlan(plan, deps(createMockSettings(), store))
+
+  assert.equal(out.writtenRoutes.length, 0, 'plain-object lock error must still be fail-closed')
+  assert.deepEqual(out.failedRoutes.map((f) => f.reason), ['store-lock-timeout'])
+  const entry = out.report.find((e) => e.code === 'store-lock-timeout')
+  assert.ok(entry, 'an actionable report entry must be present')
+  assert.equal(entry.message.includes('[object Object]'), false, 'report message must not degrade to [object Object]')
+
+  const text = formatGoRoundReport(asSource(), out)
+  assert.equal(text.includes('[object Object]'), false, 'user-visible text must not degrade to [object Object]')
+  assert.ok(text.includes(LOCK_PATH), 'user-visible text must carry the lock path')
+  assert.ok(text.includes('Retry the operation'), 'user-visible text must carry the retry advice')
+  assert.ok(text.includes('check other running dsh processes'), 'user-visible text must carry the process advice')
+})
+
 console.log(`\n${passed} passed, ${failed} failed`)
 if (failed > 0) process.exitCode = 1
