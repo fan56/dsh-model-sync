@@ -91,6 +91,7 @@ import {
   type SettingsUpdateSeam,
 } from './legacy-import.ts'
 import { runGoDiagnostic, formatGoDiagnosticReport } from './opencode-go-diagnose.ts'
+import { resolveProfileKey } from './opencode-go-profile.ts'
 import {
   GO_MIGRATION_STORE_SERVICE,
   appliedFingerprintOf,
@@ -464,12 +465,17 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
   }
   const settingsForWrite = (): SettingsService | undefined => settingsForWriteFrom(ctx)
 
+  // B1: one stable profile identity per plugin instance, resolved from the
+  // host (profileContext / DSH_PROFILE). Both file-backed stores below scope
+  // every shared models-store key with it so two profiles cannot share a
+  // migration record or ownership ledger entry.
+  const profileKey = resolveProfileKey(ctx)
   const migrationStore = (): MigrationStateStore =>
     (ctx.get(GO_MIGRATION_STORE_SERVICE) as MigrationStateStore | undefined)
-      ?? createModelsStoreMigrationStateStore()
+      ?? createModelsStoreMigrationStateStore(undefined, profileKey)
   const ownershipStoreForRound = (): GoOwnershipStore =>
     (ctx.get(GO_OWNERSHIP_STORE_SERVICE) as GoOwnershipStore | undefined)
-      ?? createModelsStoreOwnershipStore()
+      ?? createModelsStoreOwnershipStore(undefined, profileKey)
 
   /**
    * Read current migration status from the persisted record + live settings +
@@ -1229,7 +1235,7 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
                   return { kind: 'error', text: `model-sync eject go: no credential value for ${value.ref}; cannot derive the ledger key` } satisfies CommandResult
                 }
                 const ownershipStore = (cmdCtx.get(GO_OWNERSHIP_STORE_SERVICE) as GoOwnershipStore | undefined)
-                  ?? createModelsStoreOwnershipStore()
+                  ?? createModelsStoreOwnershipStore(undefined, profileKey)
                 const result = await runGoEject({
                   routes: Object.values(value.routes),
                   keyFingerprint: fingerprintKey(apiKey),

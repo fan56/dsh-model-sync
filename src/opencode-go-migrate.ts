@@ -1074,9 +1074,22 @@ export async function migrationStatusReport(
     const decision = routeWriter(route, authority, stub)
     return { route, state: states[route] ?? 'absent', owner: decision.owner, decision: decision.decision, reason: decision.reason }
   })
-  const text = [
+  const lines = [
     `model-sync migrate status: ${overall}${stub.applying ? ' (applying)' : ''}`,
     ...routes.map((r) => `  ${r.route}: state=${r.state} owner=${r.owner} ${r.decision}${r.reason !== undefined ? ` (${r.reason})` : ''}`),
-  ].join('\n')
-  return { overall, applying: stub.applying, routes, text }
+  ]
+  // B1 compatibility: unscoped legacy keys are reported but NEVER claimed.
+  // A pre-fix record has no profile stamp, so its owner is unknown; adopting
+  // it could open the gate for a profile that never consented. Tell the user
+  // to re-migrate in the owning profile instead of silently using the record.
+  let legacy: string[] = []
+  try {
+    legacy = await deps.migrationStore.legacyKeys?.() ?? []
+  } catch {
+    // Detection is advisory — an unreadable store never changes status.
+  }
+  if (legacy.length > 0) {
+    lines.push(`  警告: 检测到 ${legacy.length} 个无 profile 前缀的旧键（归属未知，未认领）: ${legacy.join(', ')}；请在归属 profile 重新运行 /model-sync migrate plan/apply`)
+  }
+  return { overall, applying: stub.applying, routes, text: lines.join('\n') }
 }

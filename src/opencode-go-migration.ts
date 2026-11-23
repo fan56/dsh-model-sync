@@ -10,12 +10,18 @@
 
 import { createHash } from 'node:crypto'
 import { GO_SLOT_ROUTES } from './opencode-go-grouping.ts'
+import { isUnscopedStoreKey, scopedStoreKey } from './opencode-go-profile.ts'
 import { loadModelsStore, type ModelsStoreAccessor } from './remote-catalog.ts'
 import type { SettingsDescriptor } from './writer.ts'
 
 /** Cordis service seam: tests register a fake record store under this name. */
 export const GO_MIGRATION_STORE_SERVICE = 'goMigrationStore'
-/** Stable models-store raw slot holding the single go migration record (P1d-1). */
+/**
+ * Base name of the models-store raw slot holding the go migration record
+ * (P1d-1). B1: profile-scoped stores persist it as
+ * `<profileKey>#migration:opencode-go`; the unscoped name is kept only for
+ * legacy callers/tests and is never claimed by a scoped store.
+ */
 export const GO_MIGRATION_STORE_KEY = 'migration:opencode-go'
 
 export type MigrationState = 'absent' | 'legacy-inherit' | 'legacy-inline' | 'drifted' | 'applied'
@@ -37,6 +43,13 @@ export interface MigrationBackup {
 
 /** Migration record persisted by `/model-sync migrate apply` (P1d-2). */
 export interface MigrationRecord {
+  /**
+   * B1: profile identity stamped by the scoped store on every write. Reads
+   * reject a record whose `profileKey` differs from the current profile, so a
+   * record written by another profile is never treated as `applied`. Absent on
+   * pre-fix (unscoped) records — those are legacy/unknown-owner and not claimed.
+   */
+  profileKey?: string
   /** Audit backup written with `applying:true` BEFORE the first settings mutate. */
   backup?: MigrationBackup
   legacyFingerprint?: string
@@ -73,11 +86,13 @@ export interface MigrationStatus {
   expectedFingerprint: string
 }
 
-/** Migration record seam. `write` is optional so read-only test stores keep working. */
+/** Migration record seam. `write` / `legacyKeys` are optional so read-only test stores keep working. */
 export interface MigrationStateStore {
   read(): Promise<MigrationRecord | undefined>
   /** Queue-serialized atomic slot replacement (same models-store queue as the ledger). */
   write?(record: MigrationRecord): Promise<void>
+  /** Advisory: unscoped legacy keys found in the shared store (reported, never claimed). */
+  legacyKeys?(): Promise<string[]>
 }
 
 export interface RouteWriterConfig {
@@ -365,28 +380,51 @@ export function routeWriter(
 // Injected store (production adapter reads the same models-store JSON)
 // ---------------------------------------------------------------------------
 
-/** Build a migration store over the models-store raw-slot accessor. */
-export function createFileMigrationStateStore(accessor: ModelsStoreAccessor): MigrationStateStore {
+/**
+ * Build a migration store over the models-store raw-slot accessor.
+ *
+ * `profileKey` scopes the record slot to `<profileKey>#migration:opencode-go`
+ * and stamps the same identity into the record. Reads require the stamp to
+ * match — a record from another profile (or an unscoped legacy record with no
+ * stamp) is treated as "no record", so state detection falls back to
+ * legacy/absent and the migration gate stays closed. Omitting `profileKey`
+ * keeps the pre-fix unscoped behavior for legacy callers/tests only.
+ */
+export function createFileMigrationStateStore(
+  accessor: ModelsStoreAccessor,
+  profileKey?: string,
+): MigrationStateStore {
+  const slot = profileKey === undefined
+    ? GO_MIGRATION_STORE_KEY
+    : scopedStoreKey(profileKey, GO_MIGRATION_STORE_KEY)
   return {
     async read(): Promise<MigrationRecord | undefined> {
       let raw: Record<string, unknown> | undefined
       try {
-        raw = await accessor.readRaw(GO_MIGRATION_STORE_KEY)
+        raw = await accessor.readRaw(slot)
       } catch {
         return undefined // unreadable ⇒ no record ⇒ conservative legacy detection
       }
       if (!isRecord(raw)) return undefined
+      // Read-side ownership check (B1): never adopt a record stamped for a
+      // different profile, and never claim an unstamped legacy record.
+      if (profileKey !== undefined && raw.profileKey !== profileKey) return undefined
       return raw as unknown as MigrationRecord
     },
     async write(record: MigrationRecord): Promise<void> {
       // writeRaw is queue-serialized atomic temp+rename, i.e. the SAME queue
       // that persists the ownership ledger (§14.7.4: settings → ledger → fingerprint).
-      await accessor.writeRaw(GO_MIGRATION_STORE_KEY, record as unknown as Record<string, unknown>)
+      const stamped: MigrationRecord = profileKey === undefined ? record : { ...record, profileKey }
+      await accessor.writeRaw(slot, stamped as unknown as Record<string, unknown>)
+    },
+    async legacyKeys(): Promise<string[]> {
+      const keys = await accessor.listRawKeys()
+      return keys.filter((key) => key === GO_MIGRATION_STORE_KEY || isUnscopedStoreKey(key))
     },
   }
 }
 
 /** Production factory; tests pass a temp-file accessor or inject a fake store. */
-export function createModelsStoreMigrationStateStore(storePath?: string): MigrationStateStore {
-  return createFileMigrationStateStore(loadModelsStore(storePath))
+export function createModelsStoreMigrationStateStore(storePath?: string, profileKey?: string): MigrationStateStore {
+  return createFileMigrationStateStore(loadModelsStore(storePath), profileKey)
 }

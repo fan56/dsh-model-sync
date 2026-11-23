@@ -11,9 +11,10 @@
  * @module dsh-model-sync/remote-catalog
  */
 
-import { homedir } from 'node:os'
+import { createHash } from 'node:crypto'
+import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 
 // ---------------------------------------------------------------------------
 // Constants (ported from docs-dsh-llm-pi-ai.patch:35-36)
@@ -152,6 +153,65 @@ export function parseRemoteCatalog(
 
 let modelsStoreCache: ModelsStoreAccessor | undefined
 
+// --- Minimal cross-process write guard (B1 / R-14) -------------------------
+//
+// The promise queue below serializes writes WITHIN one process only. Two dsh
+// processes (two profiles sharing models-store.json) still race: both read the
+// whole document, both rewrite it, and the last rename wins — silently dropping
+// the other profile's newly written ledger key. Key namespacing alone cannot
+// prevent that whole-document last-writer-wins loss.
+//
+// Guard the read-modify-write+rename critical section with a single lock file
+// via atomic exclusive create (`open(..., 'wx')`). This adds no new service or
+// dependency: it is a sibling of the store file, held only for the few ms of
+// one write and removed in `finally`. A stale lock (holder crashed) is broken
+// after LOCK_STALE_MS; a lock that cannot be acquired within LOCK_WAIT_MS is
+// bypassed (fail-open) so a stuck lock never hangs a sync round — a skipped
+// guard degrades to the pre-fix last-writer-wins behavior (the file itself
+// stays well-formed thanks to the atomic rename). The lock lives in the OS
+// temp dir (name hashed from the absolute store path): two processes derive
+// the same lock, and no transient file is ever created under ~/.dsh.
+const LOCK_STALE_MS = 10_000
+const LOCK_WAIT_MS = 2_000
+const LOCK_RETRY_MS = 8
+
+function lockPathFor(path: string): string {
+  return join(tmpdir(), `${createHash('sha256').update(path).digest('hex')}.dsh-store.lock`)
+}
+
+async function withCrossProcessLock(path: string, task: () => Promise<void>): Promise<void> {
+  const lockPath = lockPathFor(path)
+  const deadline = Date.now() + LOCK_WAIT_MS
+  let handle: Awaited<ReturnType<typeof open>> | undefined
+  try {
+    for (;;) {
+      try {
+        handle = await open(lockPath, 'wx')
+        break
+      } catch (err: unknown) {
+        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
+        try {
+          const info = await stat(lockPath)
+          if (Date.now() - info.mtimeMs > LOCK_STALE_MS) {
+            await rm(lockPath, { force: true })
+            continue
+          }
+        } catch {
+          // Lock vanished between EEXIST and stat — retry acquisition.
+        }
+        if (Date.now() >= deadline) break // fail-open; never hang the round
+        await new Promise<void>((resolve) => setTimeout(resolve, LOCK_RETRY_MS))
+      }
+    }
+    await task()
+  } finally {
+    if (handle !== undefined) {
+      await handle.close().catch(() => {})
+      await rm(lockPath, { force: true }).catch(() => {})
+    }
+  }
+}
+
 /**
  * Serialized read/write accessor for ~/.dsh/models-store.json.
  *
@@ -201,7 +261,8 @@ export interface ModelsStoreAccessor {
   /**
    * Read an opaque top-level slot of the same document. The opencode-go
    * ownership ledger stores its entries under keys shaped
-   * `<route>#<keyFingerprint>` (design §6.1 / ADR-004); those keys never
+   * `<profileKey>#<route>#<keyFingerprint>` (B1); unscoped callers still use
+   * `<route>#<keyFingerprint>` (design §6.1 / ADR-004). These opaque keys never
    * collide with a provider route id. Raw reads stay strict — an unreadable
    * file throws, so callers can decide whether to fail closed or degrade to
    * "no ledger" (store loss degrades to never-delete).
@@ -211,6 +272,8 @@ export interface ModelsStoreAccessor {
   writeRaw(key: string, value: Record<string, unknown>): Promise<void>
   /** Queue-serialized removal of one opaque slot. */
   deleteRaw(key: string): Promise<void>
+  /** All top-level keys currently in the document, for legacy-key detection. */
+  listRawKeys(): Promise<string[]>
 }
 
 /**
@@ -264,7 +327,11 @@ export function loadModelsStore(storePath?: string): ModelsStoreAccessor {
 
   let queue: Promise<void> = Promise.resolve()
   const enqueue = (task: () => Promise<void>): Promise<void> => {
-    const next = queue.then(task, task)
+    // In-process serialization (queue) + cross-process serialization (lock
+    // file) around the same RMW+rename section. Reads stay outside both: the
+    // atomic rename makes every read see a complete pre- or post-write doc.
+    const guarded = (): Promise<void> => withCrossProcessLock(effectivePath, task)
+    const next = queue.then(guarded, guarded)
     queue = next.catch(() => {})
     return next
   }
@@ -411,6 +478,13 @@ export function loadModelsStore(storePath?: string): ModelsStoreAccessor {
         delete (doc as unknown as Record<string, unknown>)[key]
         await writeDoc(doc)
       }),
+    listRawKeys: async (): Promise<string[]> => {
+      try {
+        return Object.keys(await readDoc())
+      } catch {
+        return [] // unreadable store ⇒ nothing to report (advisory only)
+      }
+    },
   }
 
   // Only cache the default-path accessor (singleton)
