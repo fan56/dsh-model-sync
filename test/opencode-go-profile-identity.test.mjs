@@ -109,6 +109,7 @@ function makeInstance({ identity = {}, injectStores = false, initialRoutes = {} 
   const settings = mockSettings(initialRoutes)
   const fetchCalls = []
   const timers = []
+  const logs = []
   const state = { definitions: [], disposers: [], provided: {} }
   const services = {
     settings,
@@ -144,7 +145,11 @@ function makeInstance({ identity = {}, injectStores = false, initialRoutes = {} 
   const ctx = {
     settings,
     get: (name) => services[name],
-    logger: { info() {}, warn() {}, debug() {} },
+    logger: {
+      info(...args) { logs.push(args.map(String).join(' ')) },
+      warn(...args) { logs.push(args.map(String).join(' ')) },
+      debug() {},
+    },
     on() { return () => {} },
     effect(fn) { const d = fn(); if (typeof d === 'function') state.disposers.push(d); return d },
     provide(name, service) { state.provided[name] = service },
@@ -156,7 +161,7 @@ function makeInstance({ identity = {}, injectStores = false, initialRoutes = {} 
     const command = state.definitions.find((d) => d.name === 'model-sync')
     return command.handler({ rawInput: text })
   }
-  return { settings, fetchCalls, invoke, dispose() { for (const d of state.disposers) d() } }
+  return { settings, fetchCalls, invoke, logs, dispose() { for (const d of state.disposers) d() } }
 }
 
 const parsePlan = (text) => ({
@@ -362,6 +367,105 @@ test('regression: a foreign profile stamp in this profile slot is rejected', asy
       profileKey: 'B', appliedIdentity: fingerprintSection({ 'opencode-go': structuredClone(LEGACY_CHAT) }),
     }, 'foreign record untouched')
   } finally {
+    await rm(LOCK_PATH, { force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 6. N1: go command reports failure via `kind` when no identity is available
+// ---------------------------------------------------------------------------
+test('N1: no identity → go command returns kind=error and exposes the identity error (real command path)', async () => {
+  await resetStore({ 'opencode-go': structuredClone(LEGACY_CHAT) })
+  let inst
+  try {
+    inst = makeInstance({ identity: {}, initialRoutes: { 'opencode-go': structuredClone(LEGACY_CHAT) } })
+    const beforeStore = await readFile(STORE_FILE, 'utf8')
+    const beforeSettings = JSON.stringify(inst.settings.describe())
+
+    const go = await inst.invoke('go')
+    // The round throws (ownership store refuses to build) → scheduler-error.
+    // A consumer reading only `kind` must see a failure, not 'success'.
+    assert.equal(go.kind, 'error', `go must report failure via kind: ${go.text}`)
+    assert.match(go.text, /cannot resolve the dsh profile identity/, 'the identity error must be the exposed failure reason')
+    assert.match(go.text, /profileContext\.name|DSH_PROFILE/, 'failure text must say how to fix')
+    assert.equal(inst.fetchCalls.length, 0, 'no source request without identity')
+    assert.equal(inst.settings.mutations.length, 0, 'zero settings writes without identity')
+    assert.equal(await readFile(STORE_FILE, 'utf8'), beforeStore, 'store bytes unchanged')
+    assert.equal(JSON.stringify(inst.settings.describe()), beforeSettings, 'settings bytes unchanged')
+  } finally {
+    inst?.dispose()
+    await rm(LOCK_PATH, { force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 7. N2: non-strict status refresh / status output must surface identity error
+// ---------------------------------------------------------------------------
+test('N2: no identity → status output and non-strict refresh show an actionable identity hint (not silent legacy)', async () => {
+  await resetStore({ 'opencode-go': structuredClone(LEGACY_CHAT) })
+  let inst
+  try {
+    inst = makeInstance({ identity: {}, initialRoutes: { 'opencode-go': structuredClone(LEGACY_CHAT) } })
+    const beforeStore = await readFile(STORE_FILE, 'utf8')
+
+    // Bare /model-sync → syncSettings → single-writer gate → loadMigrationStatus().
+    // This is the status output the report said silently showed 'legacy' before.
+    const report = await inst.invoke('')
+    assert.match(report.text, /opencode-go: skipped/, report.text)
+    assert.match(report.text, /profile 身份不可用/, 'status output must name the identity failure')
+    assert.match(report.text, /fail-closed/, 'status output must state migration/ledger are fail-closed')
+    assert.match(report.text, /DSH_PROFILE|profileContext/, 'status hint must say how to fix')
+    assert.doesNotMatch(report.text, /检测到未迁移配置，已跳过写入/, 'must NOT masquerade as a normal legacy state')
+
+    // The same non-strict read also warns on the background-refresh path (boot /
+    // document-updated have no report line): the actionable error must be logged.
+    assert.ok(
+      inst.logs.some((line) => line.includes('non-strict status refresh degraded')
+        && line.includes('cannot resolve the dsh profile identity')),
+      `background refresh must log the identity failure; logs=${JSON.stringify(inst.logs)}`,
+    )
+
+    // Regression: explicit `migrate status` keeps its original fail-closed behavior.
+    const status = await inst.invoke('migrate status')
+    assert.equal(status.kind, 'error', 'explicit status still fails closed')
+    assert.match(status.text, /cannot resolve the dsh profile identity/, status.text)
+
+    assert.equal(inst.settings.mutations.length, 0, 'zero writes')
+    assert.equal(await readFile(STORE_FILE, 'utf8'), beforeStore, 'store bytes unchanged')
+  } finally {
+    inst?.dispose()
+    await rm(LOCK_PATH, { force: true })
+  }
+})
+
+test('N2: resolved identity → no identity hint (no false positive); legacy hint and go round unchanged', async () => {
+  await resetStore({ 'opencode-go': structuredClone(LEGACY_CHAT) })
+  let inst
+  try {
+    inst = makeInstance({
+      identity: { profileContext: { name: 'OK', dir: '/profiles/OK' } },
+      initialRoutes: { 'opencode-go': structuredClone(LEGACY_CHAT) },
+    })
+
+    const report = await inst.invoke('')
+    assert.match(report.text, /opencode-go: skipped/, report.text)
+    assert.doesNotMatch(report.text, /profile 身份不可用/, 'must not report an identity failure when one is available')
+    assert.match(report.text, /检测到未迁移配置，已跳过写入/, 'normal legacy hint is preserved with identity')
+    assert.ok(
+      !inst.logs.some((line) => line.includes('non-strict status refresh degraded')),
+      'no identity-degradation warning with identity',
+    )
+
+    // Regression: after a normal apply, the go command still succeeds (N1 did
+    // not misclassify success rounds as errors).
+    const plan = parsePlan((await inst.invoke('migrate plan')).text)
+    assert.equal((await inst.invoke(`migrate apply --plan ${plan.planHash} --confirm ${plan.confirmCode} --ack-managed`)).kind, 'success')
+    const go = await inst.invoke('go')
+    assert.equal(go.kind, 'success', go.text)
+    assert.ok(inst.fetchCalls.length > 0, 'go round fetched the official listing')
+    assert.ok(inst.settings.mutations.length > 0, 'go round wrote settings')
+  } finally {
+    inst?.dispose()
     await rm(LOCK_PATH, { force: true })
   }
 })

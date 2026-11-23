@@ -86,6 +86,14 @@ export interface MigrationStatus {
   fingerprintHealed: boolean
   /** Fingerprint the healed record should carry. */
   expectedFingerprint: string
+  /**
+   * Set by the non-strict refresh in index.ts when the file-backed migration
+   * store / ownership ledger could not be built because the host supplied no
+   * profile identity (fail-closed). Status output must surface this instead of
+   * presenting a normal legacy state. Never set on injected-store hosts (they
+   * have a usable ledger even without a resolved identity) or with identity.
+   */
+  identityUnavailable?: boolean
 }
 
 /** Migration record seam. `write` / `legacyKeys` are optional so read-only test stores keep working. */

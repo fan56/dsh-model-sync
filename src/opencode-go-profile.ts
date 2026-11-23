@@ -68,6 +68,17 @@ export const PROFILE_IDENTITY_REQUIRED_MESSAGE = [
   'No migration record or ledger key was read or written.',
 ].join(' ')
 
+/**
+ * Compact, user-visible hint for a non-strict status refresh that degraded
+ * because the file-backed ledger could not be built without a profile identity
+ * (N2). Unlike the normal legacy hint, this states the fail-closed fact and how
+ * to fix it — it must never masquerade as a normal legacy state.
+ */
+export const PROFILE_IDENTITY_STATUS_HINT = [
+  'profile 身份不可用 → opencode-go 迁移记录与账本已 fail-closed（未读未写，同步已跳过）;',
+  '修复：在 dsh profile 内启动插件，或向 ctx.launchEnvironment 暴露 DSH_PROFILE / DSH_PROFILE_DIR',
+].join(' ')
+
 /** Prefix one opaque models-store slot with the profile dimension. */
 export function scopedStoreKey(profileKey: string, key: string): string {
   return `${profileKey}#${key}`

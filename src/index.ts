@@ -91,7 +91,11 @@ import {
   type SettingsUpdateSeam,
 } from './legacy-import.ts'
 import { runGoDiagnostic, formatGoDiagnosticReport } from './opencode-go-diagnose.ts'
-import { PROFILE_IDENTITY_REQUIRED_MESSAGE, resolveProfileKey } from './opencode-go-profile.ts'
+import {
+  PROFILE_IDENTITY_REQUIRED_MESSAGE,
+  PROFILE_IDENTITY_STATUS_HINT,
+  resolveProfileKey,
+} from './opencode-go-profile.ts'
 import {
   GO_MIGRATION_STORE_SERVICE,
   appliedFingerprintOf,
@@ -506,11 +510,18 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
     // zero writes) so boot-time status refreshes / isApplying cannot produce an
     // unhandled rejection; strict reads (the per-mutate second gate) rethrow.
     // Every WRITE path still fails closed when it builds its file-backed store.
+    // N2: remember an identity-refused file-backed store so the (non-strict)
+    // status read can surface it instead of looking like a normal legacy state.
+    // The check is on the thrown identity error, not on `profileKey === undefined`
+    // alone: an injected-store host has a usable ledger even with no host
+    // identity and must NOT get a false "identity unavailable" report.
+    let identityUnavailable = false
     let store: MigrationStateStore | undefined
     try {
       store = migrationStore()
     } catch (err) {
       if (opts.strict === true) throw err
+      if (err instanceof Error && err.message === PROFILE_IDENTITY_REQUIRED_MESSAGE) identityUnavailable = true
     }
     let record: MigrationRecord | undefined
     try {
@@ -527,6 +538,7 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
         ownership = ownershipStoreForRound()
       } catch (err) {
         if (opts.strict === true) throw err
+        if (err instanceof Error && err.message === PROFILE_IDENTITY_REQUIRED_MESSAGE) identityUnavailable = true
       }
       managedIds = {}
       for (const route of goRoutes) {
@@ -539,6 +551,15 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
       }
     }
     const status = migrationStatusOf(desc, record, goRoutes, managedIds)
+    // N2: a non-strict refresh that degraded because no identity was available
+    // must be VISIBLE — log the actionable error (covers boot / document-updated
+    // refresh where there is no report line) and tag the status so sync reports
+    // do not show the normal legacy hint. This changes NO write/fail-closed
+    // behavior: the gate is already closed and no store/settings write occurs.
+    if (identityUnavailable) {
+      status.identityUnavailable = true
+      ctx.logger.warn('model-sync: non-strict status refresh degraded — %s', PROFILE_IDENTITY_REQUIRED_MESSAGE)
+    }
     // §14.7.4 self-heal: identity matches but the stored full fingerprint is
     // stale because the fingerprint persist failed after settings+ledger landed.
     // Rewrite it in the same queue instead of closing the gate forever.
@@ -663,9 +684,13 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
         piDevMigration ??= await loadMigrationStatus()
         const decision = routeWriter(route, piDevAuthority, piDevMigration)
         if (decision.decision === 'skip') {
-          const hint = piDevMigration.state === 'absent' || piDevMigration.state === 'applied'
-            ? ''
-            : `; ${MIGRATION_GATE_HINT}`
+          // N2: an identity-refused ledger is NOT a normal legacy state. Surface
+          // the actionable identity hint instead of the generic migration hint.
+          const hint = piDevMigration.identityUnavailable === true
+            ? `; ${PROFILE_IDENTITY_STATUS_HINT}`
+            : (piDevMigration.state === 'absent' || piDevMigration.state === 'applied'
+              ? ''
+              : `; ${MIGRATION_GATE_HINT}`)
           lines.push(`${route}: skipped — ${decision.reason}${hint}`)
           continue
         }
@@ -1321,8 +1346,16 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
               // §14.6), never queued. The report text is the round's own text,
               // unchanged, for real rounds.
               const outcome = await goScheduler.triggerManual({ adopt: sub === 'adopt' })
+              // N1: a round that threw (e.g. the file-backed ledger refusing to
+              // build without a profile identity) is reported as a scheduler
+              // error. It is a real failure — the command must return
+              // `kind:'error'` so callers that only read `kind` can detect it;
+              // the actionable reason is carried in `text`. Skips (disabled,
+              // already-in-flight, migration-applying, disposed) stay success,
+              // byte-identical to before.
+              const failed = outcome.reason === 'source-failed' || outcome.reason === 'scheduler-error'
               return {
-                kind: outcome.reason === 'source-failed' ? 'error' : 'success',
+                kind: failed ? 'error' : 'success',
                 text: outcome.text,
               } satisfies CommandResult
             } catch (error) {
