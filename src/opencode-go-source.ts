@@ -85,6 +85,8 @@ export interface FetchGoOfficialOptions {
   timeoutMs?: number
   observedAt?: number
   fetchImpl?: GoFetchLike
+  /** Plugin-lifetime signal: aborting it aborts the in-flight fetch (design §6.3 卸载). */
+  signal?: AbortSignal
 }
 
 // ---------------------------------------------------------------------------
@@ -293,6 +295,14 @@ export async function fetchGoOfficialModels(options: FetchGoOfficialOptions = {}
   }
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 30_000)
+  // The plugin-lifetime signal and the network timeout both abort the SAME
+  // controller, so fetchImpl observes a single signal. Never leave the bridge
+  // listener behind: a disposed plugin must not retain the round's signal.
+  const relayAbort = (): void => controller.abort()
+  if (options.signal !== undefined) {
+    if (options.signal.aborted) controller.abort()
+    else options.signal.addEventListener('abort', relayAbort, { once: true })
+  }
 
   try {
     let response: GoFetchResponse
@@ -350,5 +360,6 @@ export async function fetchGoOfficialModels(options: FetchGoOfficialOptions = {}
     }
   } finally {
     clearTimeout(timer)
+    options.signal?.removeEventListener('abort', relayAbort)
   }
 }

@@ -25,6 +25,11 @@ import type { Context } from '@deepseek-ai/cordis'
 // settings service; alpha.3 removed the settingsNamespace() helper this file
 // used to import.
 import type {} from '@deepseek-ai/dsh-settings'
+// Type-only side-effect import: loads dsh-credentials' `declare module
+// '@deepseek-ai/cordis'` Events augmentation, which types the
+// `credentials/reference-updated` listener used for backoff reset. Erased at
+// emit — the host provides the service at runtime.
+import type {} from '@deepseek-ai/dsh-credentials/types'
 // Types only (erased at emit); dsh-commands is an optional peer, so hosts
 // without it still load this plugin — see the guarded registration below.
 import type { CommandDefinition, CommandResult } from '@deepseek-ai/dsh-commands'
@@ -660,7 +665,7 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
   // P1c-2 wraps this in the scheduler below; the round itself still owns no
   // timer and no command registration.
   // -----------------------------------------------------------------------
-  const runGoRound = async (options: { adopt?: boolean } = {}): Promise<GoSyncRoundResult> => {
+  const runGoRound = async (options: { adopt?: boolean; signal?: AbortSignal } = {}): Promise<GoSyncRoundResult> => {
     const { value } = readGoRuntimeConfig(config)
     const settings = ctx.get('settings') as SettingsService | undefined
     const desc = settings?.describe().find((d) => d.ns === 'llm-pi-ai')
@@ -687,6 +692,7 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
       config: options.adopt === true ? { ...value, adoptExisting: true } : value,
       apiKey,
       fetchImpl: ctx.get(GO_FETCH_SERVICE) as GoFetchLike | undefined,
+      signal: options.signal,
     })
   }
 
@@ -706,8 +712,8 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
     config: () => readGoSchedulerConfig(config),
     timers: goTimers,
     random: goRandom,
-    runRound: async ({ adopt }) => {
-      const round = await runGoRound({ adopt })
+    runRound: async ({ adopt, signal }) => {
+      const round = await runGoRound({ adopt, signal })
       return {
         ok: round.ok,
         reason: round.reason,
@@ -722,6 +728,16 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
     },
   })
   ctx.effect(() => () => goScheduler.dispose(), 'dsh-model-sync: go scheduler dispose')
+  // A changed credential invalidates any accumulated backoff: a fixed key must
+  // retry on the normal schedule instead of waiting out a capped 6h backoff
+  // (design §6.3). The effect scopes the listener to this plugin's lifetime —
+  // unload removes it together with the scheduler.
+  ctx.effect(() => ctx.on('credentials/reference-updated', (ref: unknown) => {
+    if (typeof ref !== 'string') return
+    const { value } = readGoRuntimeConfig(config)
+    if (ref !== value.ref) return
+    goScheduler.resetBackoff()
+  }), 'dsh-model-sync: credentials/reference-updated → go backoff reset')
   goScheduler.start()
 
   /** Auto rounds log the same report the /model-sync command shows. */

@@ -15,6 +15,7 @@ import {
   goStartupDelayMs,
 } from '../lib/opencode-go-scheduler.js'
 import { runGoSyncRound } from '../lib/opencode-go-sync.js'
+import { fetchGoOfficialModels } from '../lib/opencode-go-source.js'
 
 let failed = 0
 let passed = 0
@@ -398,6 +399,189 @@ await check('real-round report text is passed through unchanged', async () => {
   const manual = await h.scheduler.triggerManual()
   assert.equal(manual.text, text)
   assert.equal(h.reports.at(-1).text, text)
+})
+
+// ---------------------------------------------------------------------------
+// C1: backoff reset (credential change / manual force)
+// ---------------------------------------------------------------------------
+
+await check('credential change resets a capped auth backoff to the normal interval', async () => {
+  const h = makeHarness({ config: { startupDelaySeconds: 0 }, randomValue: 0 })
+  h.setRun(async () => failOutcome('auth'))
+  h.scheduler.start()
+  await h.clock.advance(0) // startup round fails with auth → 1h backoff
+  // Drive the auth streak up to the 6h cap: 1h, 2h, 4h, then 6h (capped).
+  for (const delay of [60 * 60_000, 2 * 60 * 60_000, 4 * 60 * 60_000]) {
+    assert.deepEqual(h.clock.pending, [delay])
+    await h.clock.advance(delay)
+  }
+  assert.deepEqual(h.clock.pending, [GO_AUTH_BACKOFF_CAP_MS], 'auth backoff reached the 6h cap')
+  assert.equal(h.scheduler.failureStreak, 4)
+
+  // Simulate the credentials/reference-updated listener firing for the go ref.
+  h.scheduler.resetBackoff()
+  assert.equal(h.scheduler.failureStreak, 0, 'backoff history cleared')
+  assert.deepEqual(h.clock.pending, [60 * 60_000], 'next round uses the normal interval, not the 6h cap')
+  await h.clock.advance(60 * 60_000)
+  assert.equal(h.runs.length, 5)
+  assert.equal(h.runs.at(-1).trigger, 'interval', 'the recovery round is an ordinary interval round')
+})
+
+await check('manual force clears backoff before the round (even if that round fails)', async () => {
+  const h = makeHarness({ config: { startupDelaySeconds: 0 }, randomValue: 0 })
+  h.setRun(async () => failOutcome('transport'))
+  h.scheduler.start()
+  await h.clock.advance(0) // streak 1 → 60s
+  await h.clock.advance(60_000) // streak 2 → 120s
+  assert.equal(h.scheduler.failureStreak, 2)
+  assert.deepEqual(h.clock.pending, [120_000])
+
+  const result = await h.scheduler.triggerManual()
+  assert.equal(result.skipped, false)
+  assert.equal(h.runs.at(-1).trigger, 'manual')
+  // The manual round still fails, but it started from a clean slate: only one
+  // failure is counted now, so the next backoff restarts at 60s (not 240s).
+  assert.equal(h.scheduler.failureStreak, 1, 'manual force reset the streak before firing')
+  assert.deepEqual(h.clock.pending, [60_000], 'backoff restarted from the base delay')
+})
+
+await check('resetBackoff is a no-op after dispose', async () => {
+  const h = makeHarness({ config: { startupDelaySeconds: 0 }, randomValue: 0 })
+  h.setRun(async () => failOutcome('transport'))
+  h.scheduler.start()
+  await h.clock.advance(0)
+  h.scheduler.dispose()
+  h.scheduler.resetBackoff()
+  assert.deepEqual(h.clock.pending, [], 'no timer re-armed after unload')
+  assert.equal(h.scheduler.failureStreak, 0, 'streak still cleared, but nothing is scheduled')
+})
+
+// ---------------------------------------------------------------------------
+// C2: unload aborts the in-flight round (no settings write after dispose)
+// ---------------------------------------------------------------------------
+
+const goRoundConfig = {
+  enabled: true,
+  ref: 'OPENCODE_GO_API_KEY',
+  modelsUrl: 'https://example.test/models',
+  routes: {},
+  pinnedModels: [],
+  confirmRemovals: 2,
+  adoptExisting: false,
+}
+const quietLogger = { info() {}, warn() {}, error() {} }
+const noopOwnership = { async read() { return undefined }, async write() {}, async delete() {} }
+
+await check('dispose aborts an in-flight fetch and writes no settings', async () => {
+  const h = makeHarness({ config: { startupDelaySeconds: 0 }, randomValue: 0 })
+  const mutations = []
+  const settings = {
+    describe: () => [{
+      ns: 'llm-pi-ai',
+      revision: 1,
+      user: { providers: { 'opencode-go': { models: [{ id: 'hand-written', name: 'user' }] } } },
+    }],
+    async mutate() { mutations.push(arguments) },
+  }
+  let fetchSignal
+  h.setRun((req) => runGoSyncRound({
+    settings,
+    ownershipStore: noopOwnership,
+    logger: quietLogger,
+    config: goRoundConfig,
+    apiKey: 'test-key',
+    fetchImpl: (url, init) => {
+      fetchSignal = init.signal
+      return new Promise((resolve, reject) => {
+        init.signal.addEventListener('abort', () => {
+          const err = new Error('aborted')
+          err.name = 'AbortError'
+          reject(err)
+        }, { once: true })
+      })
+    },
+    signal: req.signal,
+  }))
+
+  // Route the source's 30s safety timeout into the fake clock: no real timer
+  // is ever created, and the abort below clears it synchronously.
+  const realSetTimeout = globalThis.setTimeout
+  const realClearTimeout = globalThis.clearTimeout
+  globalThis.setTimeout = h.clock.setTimeout.bind(h.clock)
+  globalThis.clearTimeout = h.clock.clearTimeout.bind(h.clock)
+  try {
+    h.scheduler.start()
+    const inFlight = h.clock.fireNext() // round starts; fetch is pending
+    assert.ok(fetchSignal, 'fetch received an AbortSignal')
+    assert.equal(fetchSignal.aborted, false)
+
+    h.scheduler.dispose()
+    assert.equal(fetchSignal.aborted, true, 'dispose aborts the in-flight fetch')
+
+    const result = await inFlight
+    assert.equal(result.ok, false)
+    assert.deepEqual(mutations, [], 'no settings write after unload')
+    assert.deepEqual(h.clock.pending, [], 'no successor timer after unload')
+  } finally {
+    globalThis.setTimeout = realSetTimeout
+    globalThis.clearTimeout = realClearTimeout
+  }
+})
+
+await check('an aborted round never reaches the writer (fetch-returns-anyway race)', async () => {
+  const mutations = []
+  const settings = {
+    describe: () => [{ ns: 'llm-pi-ai', revision: 1, user: { providers: {} } }],
+    async mutate() { mutations.push(arguments) },
+  }
+  const controller = new AbortController()
+  controller.abort() // aborted before the writer is reached
+  const result = await runGoSyncRound({
+    settings,
+    ownershipStore: noopOwnership,
+    logger: quietLogger,
+    config: goRoundConfig,
+    apiKey: 'test-key',
+    // The fetch mock ignores the signal and returns a valid 200: only the
+    // explicit guard in runGoSyncRound can block the write in this race.
+    fetchImpl: async () => ({ status: 200, json: async () => ({ data: [{ id: 'm1', name: 'M1' }] }) }),
+    signal: controller.signal,
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.reason, 'aborted')
+  assert.deepEqual(mutations, [], 'writer guard blocks settings.mutate after abort')
+})
+
+// A source-level signal bridge test: an external abort must reach fetchImpl's
+// signal, proving the plugin-lifetime signal is wired through fetchGoOfficialModels.
+await check('external signal abort reaches the fetch init signal', async () => {
+  const controller = new AbortController()
+  let seenSignal
+  const realSetTimeout = globalThis.setTimeout
+  const realClearTimeout = globalThis.clearTimeout
+  const clock = new FakeClock()
+  globalThis.setTimeout = clock.setTimeout.bind(clock)
+  globalThis.clearTimeout = clock.clearTimeout.bind(clock)
+  try {
+    const promise = fetchGoOfficialModels({
+      apiKey: 'test-key',
+      fetchImpl: (url, init) => {
+        seenSignal = init.signal
+        return new Promise((resolve, reject) => {
+          init.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+        })
+      },
+      signal: controller.signal,
+    })
+    assert.ok(seenSignal, 'fetch saw the bridged signal')
+    assert.equal(seenSignal.aborted, false)
+    controller.abort()
+    assert.equal(seenSignal.aborted, true, 'external abort propagated to fetch')
+    await promise
+  } finally {
+    globalThis.setTimeout = realSetTimeout
+    globalThis.clearTimeout = realClearTimeout
+  }
 })
 
 if (failed > 0) {

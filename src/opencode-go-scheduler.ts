@@ -63,6 +63,8 @@ export interface GoRoundOutcome {
 export interface GoRoundRequest {
   trigger: GoTrigger
   adopt: boolean
+  /** Aborted by dispose() so an in-flight round stops before it can write settings. */
+  signal: AbortSignal
 }
 
 export interface GoSchedulerDeps {
@@ -155,6 +157,8 @@ export class GoScheduler {
   private disposed = false
   private streak = 0
   private lastFailureKind: GoFailureKind | undefined
+  /** Single lifetime signal: dispose() aborts the round that is currently in flight. */
+  private readonly abort = new AbortController()
 
   constructor(deps: GoSchedulerDeps) {
     this.config = deps.config
@@ -185,9 +189,23 @@ export class GoScheduler {
     this.armFromConfig()
   }
 
-  /** Cancel every timer. A round already in flight settles but never re-arms. */
+  /**
+   * Reset backoff after a credential change. Clears the in-memory streak and
+   * re-arms at the normal interval instead of waiting out a capped (up to 6h)
+   * backoff — a fixed key must not stay frozen for hours (design §6.3). The
+   * caller's listener is disposed with the plugin; a disposed scheduler is a
+   * no-op.
+   */
+  resetBackoff(): void {
+    this.clearBackoff()
+    if (this.disposed || !this.started || this.inFlight) return
+    this.armFromConfig()
+  }
+
+  /** Cancel every timer and abort a round already in flight (design §6.3 卸载). */
   dispose(): void {
     this.disposed = true
+    this.abort.abort()
     this.cancel()
   }
 
@@ -228,6 +246,12 @@ export class GoScheduler {
     }
   }
 
+  /** Forget the entire backoff history (transport === auth) — used by reset paths. */
+  private clearBackoff(): void {
+    this.streak = 0
+    this.lastFailureKind = undefined
+  }
+
   private async fire(trigger: GoTrigger, adopt = false): Promise<GoScheduledResult> {
     if (this.disposed) return this.skip('disposed', trigger)
     if (!this.config().enabled) return this.skip('disabled', trigger)
@@ -236,9 +260,12 @@ export class GoScheduler {
     // The timer that fired is now consumed; a new one is armed after the round.
     this.cancel()
     this.inFlight = true
+    // A manual round is an explicit force: forget any accumulated backoff
+    // before it runs (design §6.3 "手动 force 必须重置退避").
+    if (trigger === 'manual') this.clearBackoff()
     let result: GoScheduledResult
     try {
-      const raw = await this.runRound({ trigger, adopt })
+      const raw = await this.runRound({ trigger, adopt, signal: this.abort.signal })
       if (raw.ok) {
         this.streak = 0
         this.lastFailureKind = undefined

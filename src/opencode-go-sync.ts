@@ -59,9 +59,11 @@ export interface GoRoundDeps {
   fetchImpl?: GoFetchLike
   /** Deterministic clock for tests. */
   observedAt?: number
+  /** Plugin-lifetime signal; aborted mid-round stops the fetch and blocks the writer. */
+  signal?: AbortSignal
 }
 
-export type GoRoundReason = 'disabled' | 'settings-unavailable' | 'no-key' | 'source-failed' | 'completed'
+export type GoRoundReason = 'disabled' | 'settings-unavailable' | 'no-key' | 'source-failed' | 'aborted' | 'completed'
 
 export interface GoSyncRoundResult {
   ok: boolean
@@ -93,6 +95,16 @@ function readRouteState(desc: SettingsDescriptor | undefined, route: string): Go
     if (typeof value === 'string') state[field] = value
   }
   return state
+}
+
+/** Round stopped by a plugin-unload abort: last-good settings are untouched. */
+function abortedResult(source: GoSourceResult): GoSyncRoundResult {
+  return {
+    ok: false,
+    reason: 'aborted',
+    source,
+    text: 'opencode-go: round aborted (plugin unload); kept last-good, no settings write',
+  }
 }
 
 /**
@@ -155,6 +167,7 @@ export async function runGoSyncRound(deps: GoRoundDeps): Promise<GoSyncRoundResu
       apiKey,
       fetchImpl: deps.fetchImpl,
       observedAt: deps.observedAt,
+      signal: deps.signal,
     })
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
@@ -171,6 +184,10 @@ export async function runGoSyncRound(deps: GoRoundDeps): Promise<GoSyncRoundResu
     }
   }
 
+  // The plugin may be disposed while the source request (or the ownership
+  // reads below) is in flight. Never reach the writer after unload (§6.3 卸载).
+  if (deps.signal?.aborted) return abortedResult(source)
+
   const currentRoutes = Object.fromEntries(
     Object.values(routes).map((route) => [route, readRouteState(desc, route)]),
   )
@@ -184,6 +201,10 @@ export async function runGoSyncRound(deps: GoRoundDeps): Promise<GoSyncRoundResu
     routes: config.routes,
     pinnedModels: config.pinnedModels,
   })
+
+  // Re-check immediately before the only settings mutation: a dispose that
+  // lands during readOwnership/planning must still produce a zero-write round.
+  if (deps.signal?.aborted) return abortedResult(source)
 
   let write: GoWriteResult
   try {

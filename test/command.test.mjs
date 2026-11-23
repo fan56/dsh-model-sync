@@ -166,6 +166,21 @@ check('the settings/document-updated listener re-arms without throwing', () => {
   disposeAll(state)
 })
 
+check('the credentials/reference-updated listener is scoped to the plugin lifetime', () => {
+  const { ctx, state, config } = createFakeContext()
+  apply(ctx, config)
+  const entry = state.eventListeners.find((e) => e.event === 'credentials/reference-updated')
+  assert.ok(entry, 'credential-change listener registered')
+  assert.doesNotThrow(() => entry.listener('OPENCODE_GO_API_KEY'), 'the go ref resets backoff')
+  assert.doesNotThrow(() => entry.listener('SOME_OTHER_REF'), 'a foreign ref is ignored')
+  disposeAll(state)
+  assert.equal(
+    state.eventListeners.filter((e) => e.event === 'credentials/reference-updated').length,
+    0,
+    'the credential listener is removed on dispose',
+  )
+})
+
 check('the effect disposer unregisters the command', () => {
   const { ctx, state, config } = createFakeContext()
   apply(ctx, config)
