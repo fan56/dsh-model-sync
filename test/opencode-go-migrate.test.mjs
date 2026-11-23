@@ -644,6 +644,89 @@ await checkAsync('P2-4: crash-window rollback restores exact section incl. field
   h.dispose()
 })
 
+// ---------------------------------------------------------------------------
+// P2-5 (third rollback gap): go rounds after apply must not erase the migration
+// snapshot / applied-added-id fields, or rollback reports `snapshot-missing`.
+// This is the apply → 3 go rounds → rollback path found broken on the real host.
+// ---------------------------------------------------------------------------
+
+await checkAsync('P2-5: apply → 3 go rounds (no-change + upstream change + revert) → byte-exact rollback; migration fields never change', async () => {
+  const before = structuredClone(LEGACY_CHAT)
+  const expected = JSON.stringify(before)
+  // `roundEntries` is read by the injected fetch on every go round, so mutating
+  // this array in place simulates an upstream catalog change between rounds.
+  const roundEntries = [...OFFICIAL]
+  const h = createHarness({
+    initialRoutes: { 'opencode-go': structuredClone(before) },
+    roundEntries,
+  })
+  const plan = parsePlan((await h.invoke('migrate plan --adopt')).text)
+  const applied = await h.invoke(`migrate apply --adopt --plan ${plan.planHash} --confirm ${plan.confirmCode}`)
+  assert.equal(applied.kind, 'success', applied.text)
+
+  const keys = [...h.ownership.data.keys()].sort()
+  assert.equal(keys.length, 3, 'chat/msg/resp ledger entries exist')
+  // Snapshot of ONLY the migration-owned fields across all three entries.
+  const snapshotOf = () => Object.fromEntries(keys.map((k) => {
+    const e = h.ownership.data.get(k)
+    return [k, JSON.stringify({
+      preManagedSection: e.preManagedSection,
+      appliedAddedIds: e.appliedAddedIds,
+    })]
+  }))
+  for (const k of keys) {
+    const e = h.ownership.data.get(k)
+    assert.ok(e.preManagedSection !== undefined, `${k}: preManagedSection present right after apply`)
+    assert.ok(Array.isArray(e.appliedAddedIds), `${k}: appliedAddedIds present right after apply`)
+  }
+  const baseline = snapshotOf()
+
+  const chatKey = keys.find((k) => k.startsWith('opencode-go#'))
+  const chatManagedIds = Object.keys(h.ownership.data.get(chatKey).managed)
+  assert.ok(chatManagedIds.length > 0, 'adopt populated the chat managed set')
+  const changedId = chatManagedIds[0]
+  const changedEntry = roundEntries.find((e) => e.id === changedId)
+  assert.ok(changedEntry !== undefined, 'changed id is in the upstream catalog')
+  const originalName = changedEntry.name
+
+  // Round 1: no-change — same catalog apply just converged to.
+  const r1 = await h.invoke('go')
+  assert.match(r1.text, /source ok/i, r1.text)
+  assert.deepEqual(snapshotOf(), baseline, 'round 1 (no-change): migration fields byte-identical')
+
+  // Round 2: upstream metadata change on a managed model → a real settings
+  // write + ledger refresh. Writer-owned fields change; migration fields must
+  // stay byte-identical.
+  changedEntry.name = `${originalName} (upstream v2)`
+  const r2 = await h.invoke('go')
+  assert.match(r2.text, /source ok/i, r2.text)
+  assert.equal(
+    h.settings.state.get('opencode-go').models.find((m) => m.id === changedId)?.name,
+    changedEntry.name,
+    'round 2 wrote the upstream change',
+  )
+  assert.deepEqual(snapshotOf(), baseline, 'round 2 (upstream change): migration fields byte-identical')
+
+  // Round 3: upstream reverts the metadata → another real write, fields still
+  // byte-identical.
+  changedEntry.name = originalName
+  const r3 = await h.invoke('go')
+  assert.match(r3.text, /source ok/i, r3.text)
+  assert.equal(
+    h.settings.state.get('opencode-go').models.find((m) => m.id === changedId)?.name,
+    originalName,
+    'round 3 wrote the reverted value',
+  )
+  assert.deepEqual(snapshotOf(), baseline, 'round 3 (revert): migration fields byte-identical')
+
+  // Rollback must now find the authoritative snapshot and restore byte-exactly.
+  const rolled = await h.invoke(`migrate rollback --plan ${plan.planHash}`)
+  assert.equal(rolled.kind, 'success', rolled.text)
+  assert.equal(JSON.stringify(h.settings.state.get('opencode-go')), expected, 'byte-identical section after 3 go rounds')
+  assert.equal(h.ownership.data.size, 0, 'ledger cleared by rollback')
+  h.dispose()
+})
+
 if (failed > 0) {
   console.error(`\n${failed} test(s) failed, ${passed} passed`)
   process.exit(1)

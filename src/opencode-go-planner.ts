@@ -493,7 +493,12 @@ export function planGoRoutes(options: GoPlannerOptions): GoPlanResult {
     // `desiredIds` is non-empty here, so the merged array is never empty.
     const merged = [...kept].sort((a, b) => a.id.localeCompare(b.id))
     plannedRoutes.push({ slot, route, fields, models: merged, unset: false, skip: false })
-    nextOwnership[ledgerKey] = { routeFields: fields, managed: nextManaged }
+    // P1d-2 ownership: inherit the prior entry so migration-period fields
+    // (`preManagedSection` / `appliedAddedIds` and any future ones) survive the
+    // plan round-trip untouched. The planner never writes or clears these — it
+    // only refreshes the fields it owns (routeFields / managed). The go writer
+    // applies the same merge when it persists the ledger entry.
+    nextOwnership[ledgerKey] = { ...owned, routeFields: fields, managed: nextManaged }
   }
 
   return { routes: plannedRoutes, unsetRoutes, conflicts, report, nextOwnership, desiredByRoute }

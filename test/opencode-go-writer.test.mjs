@@ -751,6 +751,116 @@ await checkAsync('ledger: the same route under two keys is stored in two separat
 })
 
 // ---------------------------------------------------------------------------
+// 9b. Migration-owned ledger fields are inherited, never overwritten (§14.3).
+// P1d-2 regression: the go writer rebuilds the ledger entry every round — even
+// no-change — and used to drop `preManagedSection` / `appliedAddedIds`, so a
+// later migrate rollback reported `snapshot-missing`. The writer must inherit
+// every field it does not own from the prior entry byte-for-byte. These tests
+// go RED the moment the writer recreates the entry from scratch again.
+// ---------------------------------------------------------------------------
+
+const MIGRATION_FIELDS = () => ({
+  preManagedSection: {
+    apiKeyEnv: 'OPENCODE_GO_API_KEY',
+    api: 'openai-completions',
+    models: [{ id: 'legacy-id', name: 'legacy-id' }],
+  },
+  appliedAddedIds: ['legacy-id', 'hy4'],
+  // A future migration-period field must ride along too: the writer inherits
+  // everything it does not own, not just today's two known fields.
+  someFutureMigrationField: { capturedAt: 42, nested: ['a', 'b'] },
+})
+
+const assertMigrationFields = (entry, expected, label) => {
+  assert.ok(entry !== undefined, `${label}: ledger entry still exists`)
+  for (const field of Object.keys(expected)) {
+    assert.equal(
+      JSON.stringify(entry[field]),
+      JSON.stringify(expected[field]),
+      `${label}: ${field} is byte-identical`,
+    )
+  }
+}
+
+await checkAsync('ledger: no-change round inherits migration-owned fields byte-for-byte', async () => {
+  const mapped = mapGoModelToProfile(chatEntry('hy4'))
+  const fields = planGoRouteFields('chat', [chatEntry('hy4')])
+  const ledgerKey = key('opencode-go')
+  const migration = MIGRATION_FIELDS()
+  const store = createMockStore({
+    [ledgerKey]: {
+      routeFields: fields,
+      managed: { hy4: { hash: profileHash(mapped) } },
+      preManagedSnapshot: [structuredClone(mapped)],
+      ...migration,
+    },
+  })
+  const settings = createMockSettings({
+    routes: {
+      'opencode-go': {
+        api: fields.api, baseURL: fields.baseURL, displayName: fields.displayName,
+        apiKeyEnv: fields.apiKeyEnv, models: [structuredClone(mapped)],
+      },
+    },
+  })
+  const plan = planGoRoutes({
+    keyFingerprint: KEY,
+    entries: [chatEntry('hy4')],
+    currentRoutes: { 'opencode-go': routeState([structuredClone(mapped)]) },
+    ownership: structuredClone(Object.fromEntries(store.data)),
+  })
+  const out = await writeGoPlan(plan, deps(settings, store))
+  assert.deepEqual(out.routes.map((r) => r.status), ['no-change'])
+  assert.equal(settings.mutations.length, 0, 'no settings write')
+  assertMigrationFields(store.data.get(ledgerKey), migration, 'no-change')
+})
+
+await checkAsync('ledger: model-write round (upstream add) inherits migration-owned fields byte-for-byte', async () => {
+  const legacy = profile('legacy-extra')
+  const fields = planGoRouteFields('chat', [chatEntry('hy4')])
+  const ledgerKey = key('opencode-go')
+  const migration = MIGRATION_FIELDS()
+  const store = createMockStore({ [ledgerKey]: { routeFields: fields, managed: {}, ...migration } })
+  const settings = createMockSettings({
+    routes: { 'opencode-go': { models: [structuredClone(legacy)] } },
+  })
+  const plan = planGoRoutes({
+    keyFingerprint: KEY,
+    entries: [chatEntry('hy4')],
+    currentRoutes: { 'opencode-go': routeState([structuredClone(legacy)]) },
+    ownership: structuredClone(Object.fromEntries(store.data)),
+  })
+  const out = await writeGoPlan(plan, deps(settings, store))
+  assert.deepEqual(out.routes.map((r) => r.status), ['wrote'])
+  assert.ok(
+    findSetModels(settings.mutations.at(-1), 'opencode-go').some((m) => m.id === 'hy4'),
+    'upstream-added model was written',
+  )
+  assertMigrationFields(store.data.get(ledgerKey), migration, 'model-write')
+})
+
+await checkAsync('ledger: deletion-candidate round inherits migration-owned fields byte-for-byte', async () => {
+  const keep = profile('keep-a')
+  const drop = profile('drop-b')
+  const current = [keep, drop]
+  const managed = { 'keep-a': { hash: profileHash(keep) }, 'drop-b': { hash: profileHash(drop) } }
+  const ledgerKey = key('opencode-go')
+  const migration = MIGRATION_FIELDS()
+  const settings = createMockSettings({ routes: { 'opencode-go': { models: structuredClone(current) } } })
+  const store = createMockStore({ [ledgerKey]: { managed: structuredClone(managed), ...migration } })
+  const plan = planGoRoutes({
+    keyFingerprint: KEY,
+    entries: [chatEntry('keep-a')],
+    currentRoutes: currentRoutesFrom(settings, ['opencode-go']),
+    ownership: structuredClone(Object.fromEntries(store.data)),
+  })
+  const out = await writeGoPlan(plan, deps(settings, store))
+  assert.equal(out.report.some((e) => e.code === 'deletion-pending'), true)
+  assert.equal(store.data.get(ledgerKey).missing['drop-b'], 1, 'deletion counter advanced (writer-owned field changed)')
+  assertMigrationFields(store.data.get(ledgerKey), migration, 'deletion-candidate')
+})
+
+// ---------------------------------------------------------------------------
 // 10. moved association (P1a verification concern ③)
 // ---------------------------------------------------------------------------
 

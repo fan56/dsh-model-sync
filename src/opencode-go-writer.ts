@@ -448,12 +448,25 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
     const preManagedSnapshot = prior?.preManagedSnapshot !== undefined
       ? prior.preManagedSnapshot
       : current.map((model) => ({ ...model }))
+    // §14.3 ownership: `preManagedSection`, `appliedAddedIds` (and any future
+    // migration-period fields) are written ONLY by the migrate module. The go
+    // writer may only read/inherit them — never generate, recompute, or clear
+    // them. Spreading `prior` first carries every field the writer does NOT own
+    // forward verbatim on EVERY round (including no-change and
+    // deletion-candidate rounds), so the authoritative rollback snapshot keeps
+    // its exact bytes until rollback removes it. Only the fields the writer
+    // actually owns (routeFields / managed / preManagedSnapshot / missing) are
+    // overridden below. This is a merge, never a replace.
     const nextEntry: GoOwnershipEntry = {
+      ...prior,
       routeFields: plan.nextOwnership[key]?.routeFields ?? planned.fields,
       managed: nextManaged,
       preManagedSnapshot,
-      ...(Object.keys(missing).length > 0 ? { missing } : {}),
     }
+    // `missing` is writer-owned: reflect this round exactly (drop the key once
+    // the counter drains to empty, matching the previous behaviour).
+    if (Object.keys(missing).length > 0) nextEntry.missing = missing
+    else delete nextEntry.missing
 
     // --- Build + run the mutate (with one revision-conflict retry) ---------
     let built: RouteOps | undefined
