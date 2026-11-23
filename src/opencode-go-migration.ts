@@ -24,8 +24,21 @@ export type RouteWriterCaller = 'go' | 'zen' | 'pi.dev'
 /** Effective owner of a route (`none` = migration gate closed). */
 export type GoRouteOwner = 'go' | 'zen' | 'pi.dev' | 'none'
 
+/** Original settings/ledger state captured before apply (P1d-2, M-3/M-5). */
+export interface MigrationBackup {
+  planHash: string
+  capturedAt: number
+  /** Per-route pre-apply snapshot; `section` absent means the route did not exist. */
+  routes: Record<string, {
+    section?: Record<string, unknown>
+    ledger?: Record<string, unknown>
+  }>
+}
+
 /** Migration record persisted by `/model-sync migrate apply` (P1d-2). */
 export interface MigrationRecord {
+  /** Audit backup written with `applying:true` BEFORE the first settings mutate. */
+  backup?: MigrationBackup
   legacyFingerprint?: string
   /** sha256(canonical({ identity, appliedManagedIds })) — §14.7.4 two-level fingerprint. */
   appliedFingerprint?: string

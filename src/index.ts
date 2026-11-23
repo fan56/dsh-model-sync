@@ -55,7 +55,7 @@ import {
 import { BUILTIN_CATALOG_SNAPSHOT } from './builtin-catalog-snapshot.ts'
 import { refreshLiveCatalog, getLiveBuiltinCatalogForRoute } from './live-catalog.ts'
 import { checkRouteCredential, deriveKeyRef, type RouteCredentialContext } from './route-credential.ts'
-import { OPENCODE_GO_MODELS_URL, OPENCODE_GO_DEFAULT_INTERVAL_MINUTES, fingerprintKey, type GoFetchLike } from './opencode-go-source.ts'
+import { OPENCODE_GO_MODELS_URL, OPENCODE_GO_DEFAULT_INTERVAL_MINUTES, fetchGoOfficialModels, fingerprintKey, type GoFetchLike, type GoModelRecord } from './opencode-go-source.ts'
 import { GO_SLOT_ROUTES, type GoRouteSlot } from './opencode-go-grouping.ts'
 import { createModelsStoreOwnershipStore } from './opencode-go-store.ts'
 import {
@@ -106,11 +106,27 @@ import {
   type MigrationStateStore,
 } from './opencode-go-migration.ts'
 import { goOwnershipKey } from './opencode-go-planner.ts'
+import {
+  applyMigration,
+  buildMigrationPlan,
+  formatMigrationPlan,
+  migrationStatusReport,
+  rollbackMigration,
+  type MigrateDeps,
+  type ReferenceRewrite,
+  type RewriteRefMode,
+} from './opencode-go-migrate.ts'
 
 export const name = 'dsh-model-sync'
 
 /** The settings seam this plugin consumes (its own config namespace). */
 export const inject = ['settings']
+
+/** P1d-2 seams: injected official entries (plan/apply) and optional reference writer. */
+export const GO_MIGRATION_ENTRIES_SERVICE = 'goMigrationEntries'
+export const GO_MIGRATION_REF_WRITER_SERVICE = 'goMigrationRefWriter'
+/** Optional override for the single-flight check (tests inject an in-flight mutex). */
+export const GO_MIGRATION_MUTEX_SERVICE = 'goMigrationMutex'
 
 // dsh-settings 0.1.7 rewrote the seam: the runtime register(ns, schema) call
 // is gone, and a plugin's settings form is projected from its exported
@@ -276,6 +292,11 @@ interface CatalogSeam {
 /** The `modelSync` service surfaced to UIs: run one refresh round and get the report. */
 export interface ModelSyncService {
   syncNow(): Promise<string>
+  /** P1d-2: host-service mirrors of the migrate commands (design §14.5). */
+  migratePlan?(options?: { adopt?: boolean; rewriteRefs?: RewriteRefMode }): Promise<string>
+  migrateApply?(args: { planHash?: string; confirmCode?: string }): Promise<string>
+  migrateRollback?(args: { planHash?: string }): Promise<string>
+  migrateStatus?(): Promise<string>
 }
 
 /**
@@ -945,6 +966,143 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
   }), 'dsh-model-sync: credentials/reference-updated → go backoff reset')
   goScheduler.start()
 
+  // -----------------------------------------------------------------------
+  // P1d-2: `/model-sync migrate plan|apply|rollback|status` (design §14.5).
+  // plan is pure/read-only; apply carries the consent gate and the single-flight
+  // mutex against goScheduler. No auto/startup path reaches any of these.
+  // -----------------------------------------------------------------------
+  type MigrateEntries = readonly GoModelRecord[] | (() => Promise<readonly GoModelRecord[]> | readonly GoModelRecord[])
+
+  /** Resolve the official listing through an injectable seam (tests: a fixture array). */
+  const resolveMigrateEntries = async (
+    value: GoSyncRuntimeConfig,
+    apiKey: string | undefined,
+  ): Promise<readonly GoModelRecord[]> => {
+    const injected = ctx.get(GO_MIGRATION_ENTRIES_SERVICE) as MigrateEntries | undefined
+    if (Array.isArray(injected)) return injected
+    if (typeof injected === 'function') return await injected()
+    const source = await fetchGoOfficialModels({
+      url: value.modelsUrl,
+      apiKey,
+      fetchImpl: ctx.get(GO_FETCH_SERVICE) as GoFetchLike | undefined,
+      timeoutMs: config.refreshTimeoutMs.get(),
+    })
+    if (!source.ok) {
+      throw new Error(`official opencode-go listing unavailable (${source.error?.kind ?? 'unknown'}); no plan generated`)
+    }
+    return source.entries
+  }
+
+  const migrateDeps = async (
+    target: Context,
+    opts: { adopt?: boolean; rewriteRefs?: RewriteRefMode } = {},
+    needsEntries = true,
+  ): Promise<MigrateDeps> => {
+    const { value } = readGoRuntimeConfig(config)
+    const settings = settingsForWriteFrom(target)
+    const desc = settings?.describe().find((d) => d.ns === 'llm-pi-ai')
+    const apiKey = await resolveRouteCredentialValue(
+      target as unknown as NativeCredentialContext,
+      desc,
+      'opencode-go',
+      value.ref,
+    )
+    const refWriter = target.get(GO_MIGRATION_REF_WRITER_SERVICE) as
+      | ((rewrite: ReferenceRewrite) => Promise<void>) | undefined
+    return {
+      settings,
+      ownershipStore: (target.get(GO_OWNERSHIP_STORE_SERVICE) as GoOwnershipStore | undefined)
+        ?? ownershipStoreForRound(),
+      migrationStore: migrationStore(),
+      logger: target.logger as unknown as Logger,
+      // status/rollback never need the official listing: no fetch, no extra I/O.
+      entries: needsEntries ? await resolveMigrateEntries(value, apiKey) : [],
+      routes: value.routes,
+      ref: value.ref,
+      keyFingerprint: fingerprintKey(typeof apiKey === 'string' ? apiKey.trim() : ''),
+      adopt: opts.adopt,
+      rewriteRefs: opts.rewriteRefs,
+      now: Date.now(),
+      isSyncInFlight: (ctx.get(GO_MIGRATION_MUTEX_SERVICE) as (() => boolean) | undefined)
+        ?? (() => goScheduler.isInFlight),
+      applyReferenceRewrite: refWriter,
+    }
+  }
+
+  /** Shared by the slash command and the `modelSync` host service (§14.5). */
+  const runMigrate = async (
+    args: string[],
+    target: Context,
+  ): Promise<{ kind: 'success' | 'error'; text: string }> => {
+    const usage = [
+      'usage: /model-sync migrate plan [--adopt] [--rewrite-refs=default-model|config]',
+      '       /model-sync migrate apply --plan <planHash> --confirm <6-digit-code>',
+      '       /model-sync migrate rollback --plan <planHash>',
+      '       /model-sync migrate status',
+    ].join('\n')
+    const action = args[0] ?? 'plan'
+    const rest = args.slice(1)
+    if (!['plan', 'apply', 'rollback', 'status'].includes(action)) {
+      return { kind: 'error', text: `migrate: unknown action '${action}'\n${usage}` }
+    }
+    // Consent has no bypass: these flags are recognised and rejected explicitly.
+    if (rest.some((flag) => flag === '--yes' || flag === '--auto' || flag.startsWith('--yes=') || flag.startsWith('--auto='))) {
+      return { kind: 'error', text: 'migrate: --yes/--auto are not supported; apply requires --plan <hash> and --confirm <code>' }
+    }
+    const flagValue = (name: string): string | undefined => {
+      const index = rest.indexOf(name)
+      if (index >= 0) return rest[index + 1]
+      const inline = rest.find((token) => token.startsWith(`${name}=`))
+      return inline?.slice(name.length + 1)
+    }
+    const planHash = flagValue('--plan')
+    const confirmCode = flagValue('--confirm')
+    const adopt = rest.includes('--adopt')
+    const rewriteRefsRaw = rest.find((token) => token.startsWith('--rewrite-refs='))?.slice('--rewrite-refs='.length)
+    const rewriteRefs = rewriteRefsRaw === 'default-model' || rewriteRefsRaw === 'config'
+      ? rewriteRefsRaw as RewriteRefMode
+      : undefined
+
+    try {
+      if (action === 'status') {
+        const deps = await migrateDeps(target, {}, false)
+        const report = await migrationStatusReport(deps, { caller: 'go', goEnabled: readGoRuntimeConfig(config).value.enabled })
+        return { kind: 'success', text: report.text }
+      }
+      if (action === 'plan') {
+        const deps = await migrateDeps(target, { adopt, rewriteRefs })
+        const descriptor = deps.settings?.describe().find((d) => d.ns === 'llm-pi-ai')
+        const record = await deps.migrationStore.read().catch(() => undefined)
+        // The plan builder is pure — no settings/store write, no outbound call
+        // beyond the already-injected official listing used to describe intent.
+        const plan = buildMigrationPlan({
+          descriptor,
+          entries: deps.entries,
+          routes: deps.routes,
+          ref: deps.ref,
+          keyFingerprint: deps.keyFingerprint,
+          adopt,
+          rewriteRefs,
+          record,
+          now: deps.now,
+        })
+        return { kind: 'success', text: formatMigrationPlan(plan) }
+      }
+      if (action === 'apply') {
+        const deps = await migrateDeps(target, { adopt, rewriteRefs })
+        const result = await applyMigration({ planHash, confirmCode }, deps)
+        return { kind: result.ok ? 'success' : 'error', text: result.text }
+      }
+      // rollback
+      const deps = await migrateDeps(target, {}, false)
+      const result = await rollbackMigration({ planHash }, deps)
+      return { kind: result.ok ? 'success' : 'error', text: result.text }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return { kind: 'error', text: `migrate ${action} failed: ${message}` }
+    }
+  }
+
   /** Auto rounds log the same report the /model-sync command shows. */
   const runAuto = (): void => {
     // A rejected round (service lookups mid-dispose, a refused mutate) must
@@ -1005,7 +1163,24 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
   // The modelSync service stays exposed for UIs that want direct access. The
   // /model-sync command itself is registered by this plugin (below) through
   // the shared command registry, which interactive UIs discover on their own.
-  ctx.provide('modelSync', { syncNow: () => syncNow(true) } satisfies ModelSyncService)
+  ctx.provide('modelSync', {
+    syncNow: () => syncNow(true),
+    migratePlan: (options) => runMigrate(
+      ['plan', ...(options?.adopt === true ? ['--adopt'] : []),
+        ...(options?.rewriteRefs !== undefined ? [`--rewrite-refs=${options.rewriteRefs}`] : [])],
+      ctx,
+    ).then((result) => result.text),
+    migrateApply: (args) => runMigrate(
+      ['apply', ...(args.planHash !== undefined ? ['--plan', args.planHash] : []),
+        ...(args.confirmCode !== undefined ? ['--confirm', args.confirmCode] : [])],
+      ctx,
+    ).then((result) => result.text),
+    migrateRollback: (args) => runMigrate(
+      ['rollback', ...(args.planHash !== undefined ? ['--plan', args.planHash] : [])],
+      ctx,
+    ).then((result) => result.text),
+    migrateStatus: () => runMigrate(['status'], ctx).then((result) => result.text),
+  } satisfies ModelSyncService)
 
   // Register the /model-sync slash command from the plugin itself. The
   // registry is @deepseek-ai/dsh-commands' CommandRuntime ("Plugin-owned
@@ -1023,10 +1198,15 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
     cmdCtx.effect(() => {
       const definition: CommandDefinition = {
         name: 'model-sync',
-        description: 'Force one model-list sync round from the pi.dev gateway into settings; go subcommands: go|status (one full opencode-go round), adopt go, eject go',
+        description: 'Force one model-list sync round from the pi.dev gateway into settings; go subcommands: go|status (one full opencode-go round), adopt go, eject go; migrate plan|apply|rollback|status (explicit consent only)',
         handler: async (invocation) => {
           const args = invocation.rawInput.trim().split(/\s+/).filter((part) => part.length > 0)
           const [sub, scope] = args
+          // P1d-2: migration is the ONLY explicit-consent config writer. It is
+          // never auto-triggered and never folded into the pi.dev sync path.
+          if (sub === 'migrate') {
+            return runMigrate(args.slice(1), cmdCtx)
+          }
           // Design §7.1 keeps bare `/model-sync` (pi.dev settings sync) exactly
           // as it was. The go subcommands are additive: `go`/`status` run one
           // full go round, `adopt go` runs it with adoption, `eject go` undoes
