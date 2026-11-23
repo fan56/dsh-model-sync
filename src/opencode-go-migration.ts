@@ -10,7 +10,7 @@
 
 import { createHash } from 'node:crypto'
 import { GO_SLOT_ROUTES } from './opencode-go-grouping.ts'
-import { isUnscopedStoreKey, scopedStoreKey } from './opencode-go-profile.ts'
+import { GO_MIGRATION_STORE_KEY_BASE, isUnscopedStoreKey, scopedStoreKey } from './opencode-go-profile.ts'
 import { loadModelsStore, type ModelsStoreAccessor } from './remote-catalog.ts'
 import type { SettingsDescriptor } from './writer.ts'
 
@@ -20,9 +20,11 @@ export const GO_MIGRATION_STORE_SERVICE = 'goMigrationStore'
  * Base name of the models-store raw slot holding the go migration record
  * (P1d-1). B1: profile-scoped stores persist it as
  * `<profileKey>#migration:opencode-go`; the unscoped name is kept only for
- * legacy callers/tests and is never claimed by a scoped store.
+ * legacy callers/tests and is never claimed by a scoped store. The literal is
+ * owned by opencode-go-profile.ts so `isUnscopedStoreKey` can distinguish a
+ * scoped migration record from a legacy key without guessing the key shape.
  */
-export const GO_MIGRATION_STORE_KEY = 'migration:opencode-go'
+export const GO_MIGRATION_STORE_KEY = GO_MIGRATION_STORE_KEY_BASE
 
 export type MigrationState = 'absent' | 'legacy-inherit' | 'legacy-inline' | 'drifted' | 'applied'
 /** The writer identity used by the single-writer priority table. */

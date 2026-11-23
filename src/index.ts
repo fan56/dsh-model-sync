@@ -91,7 +91,7 @@ import {
   type SettingsUpdateSeam,
 } from './legacy-import.ts'
 import { runGoDiagnostic, formatGoDiagnosticReport } from './opencode-go-diagnose.ts'
-import { resolveProfileKey } from './opencode-go-profile.ts'
+import { PROFILE_IDENTITY_REQUIRED_MESSAGE, resolveProfileKey } from './opencode-go-profile.ts'
 import {
   GO_MIGRATION_STORE_SERVICE,
   appliedFingerprintOf,
@@ -465,17 +465,25 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
   }
   const settingsForWrite = (): SettingsService | undefined => settingsForWriteFrom(ctx)
 
-  // B1: one stable profile identity per plugin instance, resolved from the
+  // B1/H9: one stable profile identity per plugin instance, resolved from the
   // host (profileContext / DSH_PROFILE). Both file-backed stores below scope
   // every shared models-store key with it so two profiles cannot share a
-  // migration record or ownership ledger entry.
+  // migration record or ownership ledger entry. When no identity can be
+  // resolved there is NO 'default' collapse: every file-backed ledger path
+  // fails closed with an actionable error instead of silently sharing a key.
   const profileKey = resolveProfileKey(ctx)
+  const requireScopedProfileKey = (): string => {
+    if (profileKey === undefined) throw new Error(PROFILE_IDENTITY_REQUIRED_MESSAGE)
+    return profileKey
+  }
+  // The injection seam is an explicit opt-in (tests / hosts that supply their
+  // own scoped store); only the file-backed fallback requires host identity.
   const migrationStore = (): MigrationStateStore =>
     (ctx.get(GO_MIGRATION_STORE_SERVICE) as MigrationStateStore | undefined)
-      ?? createModelsStoreMigrationStateStore(undefined, profileKey)
+      ?? createModelsStoreMigrationStateStore(undefined, requireScopedProfileKey())
   const ownershipStoreForRound = (): GoOwnershipStore =>
     (ctx.get(GO_OWNERSHIP_STORE_SERVICE) as GoOwnershipStore | undefined)
-      ?? createModelsStoreOwnershipStore(undefined, profileKey)
+      ?? createModelsStoreOwnershipStore(undefined, requireScopedProfileKey())
 
   /**
    * Read current migration status from the persisted record + live settings +
@@ -488,10 +496,20 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
     opts: { keyFingerprint?: string; strict?: boolean } = {},
   ): Promise<MigrationStatus> => {
     const desc = rawSettings()?.describe().find((d) => d.ns === 'llm-pi-ai')
-    const store = migrationStore()
+    // H9 fail-closed: with no resolvable profile identity the file-backed store
+    // factory throws. A non-strict READ degrades to "no record" (gate closed,
+    // zero writes) so boot-time status refreshes / isApplying cannot produce an
+    // unhandled rejection; strict reads (the per-mutate second gate) rethrow.
+    // Every WRITE path still fails closed when it builds its file-backed store.
+    let store: MigrationStateStore | undefined
+    try {
+      store = migrationStore()
+    } catch (err) {
+      if (opts.strict === true) throw err
+    }
     let record: MigrationRecord | undefined
     try {
-      record = await store.read()
+      record = await store?.read()
     } catch (err) {
       if (opts.strict === true) throw err
       record = undefined // unreadable ⇒ conservative legacy detection
@@ -499,11 +517,16 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
     const goRoutes = Object.values(readGoRuntimeConfig(config).value.routes ?? {})
     let managedIds: Record<string, string[]> | undefined
     if (opts.keyFingerprint !== undefined) {
-      const ownership = ownershipStoreForRound()
+      let ownership: GoOwnershipStore | undefined
+      try {
+        ownership = ownershipStoreForRound()
+      } catch (err) {
+        if (opts.strict === true) throw err
+      }
       managedIds = {}
       for (const route of goRoutes) {
         try {
-          const entry = await ownership.read(goOwnershipKey(route, opts.keyFingerprint))
+          const entry = await ownership?.read(goOwnershipKey(route, opts.keyFingerprint))
           managedIds[route] = entry === undefined ? [] : Object.keys(entry.managed ?? {}).sort()
         } catch {
           managedIds[route] = [] // unreadable ledger ⇒ no managed ids (never delete)
@@ -514,7 +537,7 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
     // §14.7.4 self-heal: identity matches but the stored full fingerprint is
     // stale because the fingerprint persist failed after settings+ledger landed.
     // Rewrite it in the same queue instead of closing the gate forever.
-    if (status.fingerprintHealed && typeof store.write === 'function') {
+    if (status.fingerprintHealed && typeof store?.write === 'function') {
       try {
         ctx.logger.info('model-sync: fingerprint-healed (identity matched; stale appliedFingerprint)')
         await store.write({
@@ -1235,7 +1258,7 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
                   return { kind: 'error', text: `model-sync eject go: no credential value for ${value.ref}; cannot derive the ledger key` } satisfies CommandResult
                 }
                 const ownershipStore = (cmdCtx.get(GO_OWNERSHIP_STORE_SERVICE) as GoOwnershipStore | undefined)
-                  ?? createModelsStoreOwnershipStore(undefined, profileKey)
+                  ?? createModelsStoreOwnershipStore(undefined, requireScopedProfileKey())
                 const result = await runGoEject({
                   routes: Object.values(value.routes),
                   keyFingerprint: fingerprintKey(apiKey),
