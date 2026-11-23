@@ -138,8 +138,11 @@ function fakeInvocation(rawInput = '') {
 check('apply registers exactly one model-sync command definition', () => {
   const { ctx, state, config } = createFakeContext()
   apply(ctx, config)
-  assert.equal(state.definitions.length, 1, 'exactly one command definition')
-  const definition = state.definitions[0]
+  // P0 adds a second command (/opencode-status); select by name so this
+  // existing assertion still verifies the original /model-sync contract.
+  const modelSyncDefinitions = state.definitions.filter((d) => d.name === 'model-sync')
+  assert.equal(modelSyncDefinitions.length, 1, 'exactly one model-sync command definition')
+  const definition = modelSyncDefinitions[0]
   assert.equal(definition.name, 'model-sync')
   assert.ok(typeof definition.description === 'string' && definition.description.length > 0,
     'description is a non-empty string')
@@ -168,7 +171,8 @@ check('the effect disposer unregisters the command', () => {
   apply(ctx, config)
   assert.equal(state.unregisterCalls, 0, 'not unregistered while plugin is live')
   disposeAll(state)
-  assert.equal(state.unregisterCalls, 1, 'unregistered exactly once on dispose')
+  // P0 adds /opencode-status; both command registrations dispose once.
+  assert.equal(state.unregisterCalls, state.definitions.length, 'each registered command unregisters exactly once on dispose')
 })
 
 // ---------------------------------------------------------------------------

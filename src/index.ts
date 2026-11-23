@@ -63,6 +63,7 @@ import {
   type LegacyImportLogger,
   type SettingsUpdateSeam,
 } from './legacy-import.ts'
+import { runGoDiagnostic, formatGoDiagnosticReport } from './opencode-go-diagnose.ts'
 
 export const name = 'dsh-model-sync'
 
@@ -587,6 +588,39 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
       }
       return commands.register(definition)
     }, 'dsh-model-sync: /model-sync')
+
+    // P0 read-only diagnostic. Parallel to /model-sync (whose behavior is
+    // unchanged): fetch the official go listing, compare it with the current
+    // profile's opencode-go routes, and print a structured report. This path
+    // never calls settings.mutate, never writes credentials, and never edits
+    // a profile file — it only reads describe()/credentials.resolve().
+    cmdCtx.effect(() => {
+      const definition: CommandDefinition = {
+        name: 'opencode-status',
+        description: 'Read-only diagnostic: compare opencode-go official /v1/models with the current profile routes (no writes)',
+        handler: async (invocation) => {
+          const token = invocation.rawInput.trim()
+          const ignored = token !== '' && token !== 'go'
+            ? 'opencode-status: P0 diagnoses opencode-go only; the argument is ignored.\n'
+            : ''
+          try {
+            const desc = (cmdCtx.get('settings') as SettingsService | undefined)?.describe()
+              .find((d) => d.ns === 'llm-pi-ai')
+            const apiKey = await resolveRouteCredentialValue(
+              cmdCtx as unknown as NativeCredentialContext,
+              desc,
+              'opencode-go',
+            )
+            const report = await runGoDiagnostic({ apiKey, descriptor: desc })
+            return { kind: 'success', text: `${ignored}${formatGoDiagnosticReport(report)}` } satisfies CommandResult
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            return { kind: 'error', text: `${ignored}opencode-status failed: ${message}` } satisfies CommandResult
+          }
+        },
+      }
+      return commands.register(definition)
+    }, 'dsh-model-sync: /opencode-status')
   })
 
   // One-time legacy settings import (0.1.5 → 0.1.7 upgrade path, see

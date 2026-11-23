@@ -1,0 +1,86 @@
+{
+  "_comment": "Trimmed slices of research/opencode-go-coverage-20261123/05-raw/noauth-models.body (sanitized sample, 2026-11-23). Only fields the P0 parser reads are kept; no key material.",
+  "object": "list",
+  "data": [
+    {
+      "id": "deepseek-v4.1-flash",
+      "object": "model",
+      "created": 1795399907,
+      "name": "DeepSeek V4.1 Flash 1017",
+      "canonical_id": "deepseek/deepseek-v4.1-flash-1017",
+      "release_date": "2026-10-17",
+      "last_updated": "2026-10-17",
+      "modalities": {
+        "input": ["text", "image/jpeg", "image/png", "audio/wav", "video/mp4"],
+        "output": ["text"]
+      },
+      "capabilities": {
+        "reasoning": { "supported": true, "effort": ["low", "high", "max"] }
+      },
+      "limit": { "context": 1000000, "output": 384000 },
+      "api": {
+        "chat-completions": { "base_url": "https://opencode.ai/inference/go/openai/v1" }
+      },
+      "recommended_api": "chat-completions",
+      "go": { "monthly_usage": { "go": 100, "go-plus": 200, "go-teams": 105 } }
+    },
+    {
+      "id": "qwen4-max",
+      "object": "model",
+      "created": 1795399907,
+      "name": "Qwen4 Max",
+      "canonical_id": "alibaba/qwen4-max",
+      "release_date": "2026-11-16",
+      "last_updated": "2026-11-16",
+      "modalities": { "input": ["text", "image/png"], "output": ["text"] },
+      "capabilities": {
+        "reasoning": { "supported": true, "effort": ["low", "high", "xhigh"] }
+      },
+      "limit": { "context": 1000000, "output": 262144 },
+      "api": {
+        "messages": { "base_url": "https://opencode.ai/inference/go/anthropic/v1" }
+      },
+      "recommended_api": "messages",
+      "go": { "monthly_usage": { "go": 15, "go-plus": 60, "go-teams": 20 } }
+    },
+    {
+      "id": "grok-4.7",
+      "object": "model",
+      "created": 1795399907,
+      "name": "Grok 4.7",
+      "canonical_id": "xai/grok-4.7",
+      "release_date": "2026-09-21",
+      "last_updated": "2026-09-21",
+      "modalities": { "input": ["text", "image/jpeg", "application/pdf"], "output": ["text"] },
+      "capabilities": {
+        "reasoning": { "supported": true, "effort": ["low", "medium", "high", "xhigh"] }
+      },
+      "limit": { "context": 500000, "output": 500000 },
+      "api": {
+        "responses": { "base_url": "https://opencode.ai/inference/go/openai/v1" }
+      },
+      "recommended_api": "responses",
+      "go": { "monthly_usage": { "go": 15, "go-plus": 60, "go-teams": 20 } }
+    },
+    {
+      "id": "gemini-4-argon",
+      "object": "model",
+      "created": 1795399907,
+      "name": "Gemini 4 Argon",
+      "canonical_id": "google/gemini-4-argon",
+      "release_date": "2026-10-13",
+      "last_updated": "2026-10-13",
+      "modalities": { "input": ["text", "image/png", "video/mp4"], "output": ["text"] },
+      "capabilities": {
+        "reasoning": { "supported": true, "effort": ["low", "medium", "high"] }
+      },
+      "limit": { "context": 1048576, "output": 65536 },
+      "api": {
+        "generate-content": { "base_url": "https://opencode.ai/inference/go/google/v1beta" },
+        "interactions": { "base_url": "https://opencode.ai/inference/go/google/v1beta" }
+      },
+      "recommended_api": "interactions",
+      "go": { "monthly_usage": { "go": 30, "go-plus": 120, "go-teams": 35 } }
+    }
+  ]
+}
