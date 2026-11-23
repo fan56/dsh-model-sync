@@ -111,7 +111,13 @@ function canonicalize(value: unknown): unknown {
  * order makes the two agree regardless of key insertion or array order.
  */
 export function journalContentHash(models: readonly SettingsModelProfile[]): string {
-  const stable = [...models].sort((a, b) => a.id.localeCompare(b.id)).map((model) => canonicalize(model))
+  // oldfox #5: localeCompare is host/locale-dependent, so the same models array
+  // could hash differently on two machines sharing a store → `journal-stale`
+  // false positives. JS string `<` compares UTF-16 code units (deterministic
+  // byte/codepoint order for these ASCII ids), making the hash locale-proof.
+  const stable = [...models]
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+    .map((model) => canonicalize(model))
   return createHash('sha256').update(JSON.stringify(stable)).digest('hex')
 }
 
@@ -122,6 +128,55 @@ function errorText(err: unknown): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * Defensive bound against a corrupt/hostile journal carrying an oversized
+ * entry. Legitimate ledgers are far smaller; this only rejects absurd arrays
+ * before they are copied into an in-memory ledger.
+ */
+const MAX_LEDGER_ENTRIES = 100_000
+
+/**
+ * oldfox #4: `entry` is the exact object reconciliation re-commits to the
+ * ownership ledger, so a malformed one must never enter it. parseJournal used
+ * to accept any object here; validate the real GoOwnershipEntry shape instead:
+ * the required `managed` id→{hash} map plus every optional field's type. On
+ * failure the whole slot is treated as an unparseable journal (warn + clean),
+ * never reconciled.
+ */
+function isValidOwnershipEntry(value: unknown): value is GoOwnershipEntry {
+  if (!isRecord(value)) return false
+  const managed = value.managed
+  if (!isRecord(managed)) return false
+  const ids = Object.keys(managed)
+  if (ids.length > MAX_LEDGER_ENTRIES) return false
+  for (const id of ids) {
+    if (id.length === 0) return false
+    const owner = managed[id]
+    if (!isRecord(owner) || typeof owner.hash !== 'string' || owner.hash.length === 0) return false
+  }
+  if (value.routeFields !== undefined && !isRecord(value.routeFields)) return false
+  if (value.preManagedSnapshot !== undefined) {
+    if (!Array.isArray(value.preManagedSnapshot) || value.preManagedSnapshot.length > MAX_LEDGER_ENTRIES) return false
+    if (value.preManagedSnapshot.some((m) => !isRecord(m) || typeof m.id !== 'string')) return false
+  }
+  if (value.preManagedSection !== undefined
+    && value.preManagedSection !== null && !isRecord(value.preManagedSection)) return false
+  if (value.appliedAddedIds !== undefined) {
+    if (!Array.isArray(value.appliedAddedIds) || value.appliedAddedIds.length > MAX_LEDGER_ENTRIES) return false
+    if (value.appliedAddedIds.some((id) => typeof id !== 'string')) return false
+  }
+  if (value.missing !== undefined) {
+    if (!isRecord(value.missing)) return false
+    const missingIds = Object.keys(value.missing)
+    if (missingIds.length > MAX_LEDGER_ENTRIES) return false
+    for (const id of missingIds) {
+      const count = value.missing[id]
+      if (typeof count !== 'number' || !Number.isFinite(count)) return false
+    }
+  }
+  return true
 }
 
 /** Strict parse: any missing/mistyped field is a parse failure, never a journal. */
@@ -136,7 +191,7 @@ export function parseJournal(raw: unknown): { journal?: GoWriteJournal; error?: 
   }
   if (typeof raw.contentHash !== 'string' || raw.contentHash.length === 0) return { error: 'journal has no contentHash' }
   if (typeof raw.unset !== 'boolean') return { error: 'journal has no unset flag' }
-  if (!raw.unset && !isRecord(raw.entry)) return { error: 'journal has no ledger entry' }
+  if (!raw.unset && raw.entry === undefined) return { error: 'journal has no ledger entry' }
   if (typeof raw.at !== 'number' || !Number.isFinite(raw.at)) return { error: 'journal has invalid timestamp' }
   const journal: GoWriteJournal = {
     version: JOURNAL_VERSION,
@@ -149,7 +204,12 @@ export function parseJournal(raw: unknown): { journal?: GoWriteJournal; error?: 
     at: raw.at,
   }
   if (typeof raw.expectedRevision === 'number') journal.expectedRevision = raw.expectedRevision
-  if (raw.entry !== undefined) journal.entry = raw.entry as unknown as GoOwnershipEntry
+  // Validate whenever an entry is present (also on unset journals, where a
+  // stale malformed entry must not survive into a later re-commit).
+  if (raw.entry !== undefined) {
+    if (!isValidOwnershipEntry(raw.entry)) return { error: 'journal has invalid ledger entry' }
+    journal.entry = raw.entry
+  }
   return { journal }
 }
 
@@ -218,6 +278,10 @@ export function createModelsStoreJournalStore(storePath?: string): GoJournalStor
 export interface JournalNotice {
   code: 'journal-reconciled' | 'journal-stale' | 'journal-orphan'
     | 'journal-unparseable' | 'journal-reconcile-failed' | 'journal-list-failed'
+    // oldfox #2: the descriptor-unavailable branch is a distinct condition from
+    // a store enumeration failure. Sharing `journal-list-failed` misled
+    // machine consumers into reporting a list error when nothing was listed.
+    | 'journal-descriptor-unavailable'
   level: 'info' | 'warn' | 'error'
   key: string
   message: string
@@ -288,9 +352,12 @@ export async function reconcileJournals(deps: ReconcileDeps): Promise<ReconcileR
   const desc = deps.settings?.describe().find((entry) => entry.ns === 'llm-pi-ai')
   if (desc === undefined) {
     // Cannot verify the present hash — keep every journal, never guess.
+    // This is NOT a list failure: enumeration succeeded. Use a dedicated code
+    // so automation can tell the two apart (oldfox #2). Text stays accurate:
+    // journals are kept, not discarded.
     notice({
-      code: 'journal-list-failed', level: 'warn', key: `profile:${deps.profileKey}`,
-      message: 'llm-pi-ai descriptor unavailable; journals kept for a later round',
+      code: 'journal-descriptor-unavailable', level: 'warn', key: `profile:${deps.profileKey}`,
+      message: 'llm-pi-ai descriptor unavailable; journals kept for a later round (reconciliation deferred, no list error)',
     })
     return result
   }

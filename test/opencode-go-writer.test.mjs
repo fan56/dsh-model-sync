@@ -1317,5 +1317,62 @@ await checkAsync('O1 #1: a migration record persist failure is visible (record g
   assert.match(entry.message, /\/model-sync adopt go/)
 })
 
+// ---------------------------------------------------------------------------
+// oldfox #1 — no-change path ledger failures are honest failures
+// ---------------------------------------------------------------------------
+
+/** A plan+settings whose desired state already matches settings (no settings mutate). */
+function noChangeFixture() {
+  const entry = chatEntry('hy4')
+  const mapped = mapGoModelToProfile(entry)
+  const fields = planGoRouteFields('chat', [entry])
+  const settings = createMockSettings({
+    routes: {
+      'opencode-go': {
+        api: fields.api, baseURL: fields.baseURL, displayName: fields.displayName,
+        apiKeyEnv: fields.apiKeyEnv, models: [structuredClone(mapped)],
+      },
+    },
+  })
+  const plan = planGoRoutes({
+    keyFingerprint: KEY,
+    entries: [entry],
+    currentRoutes: { 'opencode-go': routeState([structuredClone(mapped)]) },
+    ownership: {},
+  })
+  return { settings, plan }
+}
+
+await checkAsync('oldfox #1: no-change ledger non-lock failure enters failedRoutes with truthful text', async () => {
+  const { settings, plan } = noChangeFixture()
+  const store = { ...createMockStore(), async write() { throw new Error('ledger full (seam)') } }
+  const out = await writeGoPlan(plan, deps(settings, store))
+
+  assert.equal(settings.mutations.length, 0, 'no settings write on a no-change path')
+  assert.deepEqual(out.failedRoutes.map((f) => f.reason), ['ledger-write-failed'], 'counted as a real failure')
+  assert.equal(out.routes[0].status, 'no-change', 'settings really were unchanged')
+  assert.equal(out.routes[0].reason, 'ledger-write-failed', 'machine-readable route reason')
+  const report = out.report.find((e) => e.code === 'ledger-write-failed')
+  assert.ok(report, 'failure is visible in the report')
+  assert.equal(report.level, 'error')
+  assert.doesNotMatch(report.message, /written but/, 'no false claim that settings were written')
+  assert.match(report.message, /no settings writes were made/, 'states the real outcome')
+  const text = formatGoRoundReport(asSource(), out)
+  assert.match(text, /opencode-go: no-change \(ledger-write-failed\)/, 'round text shows the failure')
+})
+
+await checkAsync('oldfox #1: no-change ledger lock timeout keeps store-lock-timeout semantics unchanged', async () => {
+  const { settings, plan } = noChangeFixture()
+  const store = { ...createMockStore(), async write() { throw lockTimeoutError() } }
+  const out = await writeGoPlan(plan, deps(settings, store))
+
+  assert.equal(settings.mutations.length, 0, 'zero settings writes')
+  assert.deepEqual(out.failedRoutes.map((f) => f.reason), ['store-lock-timeout'], 'lock reason unchanged')
+  assert.equal(out.report.some((e) => e.code === 'ledger-write-failed'), false, 'not mislabelled as a non-lock failure')
+  const text = formatGoRoundReport(asSource(), out)
+  assert.ok(text.includes(LOCK_PATH), 'lock diagnostics preserved')
+  assert.match(text, /Retry the operation/, 'zero-write lock advice stays truthful on a no-change path')
+})
+
 console.log(`\n${passed} passed, ${failed} failed`)
 if (failed > 0) process.exitCode = 1

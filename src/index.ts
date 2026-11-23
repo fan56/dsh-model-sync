@@ -1378,6 +1378,9 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
               // already-in-flight, migration-applying, disposed) stay success,
               // byte-identical to before.
               const failed = outcome.reason === 'source-failed'
+                // oldfox #3: a writer exception is a real failure at the
+                // command surface, but a distinct reason from source failure.
+                || outcome.reason === 'writer-error'
                 || outcome.reason === 'scheduler-error'
                 // B4: an abandoned round must be visible as a failure at the
                 // command surface too (it is not a successful sync). The reason

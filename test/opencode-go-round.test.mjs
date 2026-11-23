@@ -695,6 +695,52 @@ await checkAsync('O1 #3 (sync): second-gate skip carries the real migration-gate
   assert.deepEqual(settings.mutations, [], 'skipped routes never mutate settings')
 })
 
+// ---------------------------------------------------------------------------
+// oldfox #3 — an unexpected writer exception is not a source failure
+// ---------------------------------------------------------------------------
+
+await checkAsync('oldfox #3: writer exception yields reason writer-error (not source-failed), text stays truthful', async () => {
+  const base = mockSettings()
+  let armed = false
+  let describesAfterFetch = 0
+  const settings = {
+    ...base,
+    describe() {
+      // The fetch in flight is the arming point. After it, sync.ts re-reads the
+      // descriptor once (post-fetch freshness) and writeGoPlan reads it next;
+      // throw on that second read so the exception is inside writeGoPlan.
+      if (armed && ++describesAfterFetch === 2) throw new Error('writer seam exploded')
+      return base.describe()
+    },
+  }
+  const result = await runGoSyncRound({
+    settings,
+    ownershipStore: memoryOwnershipStore(),
+    logger: { info() {}, warn() {}, debug() {} },
+    config: {
+      enabled: true,
+      ref: 'OPENCODE_GO_API_KEY',
+      modelsUrl: 'https://opencode.ai/inference/go/v1/models',
+      routes: { chat: 'opencode-go', msg: 'opencode-go-msg', resp: 'opencode-go-resp' },
+      pinnedModels: [],
+      confirmRemovals: 2,
+      adoptExisting: false,
+    },
+    apiKey: KEY,
+    observedAt: 0,
+    fetchImpl: async () => {
+      armed = true
+      return { status: 200, json: async () => structuredClone(officialPayload) }
+    },
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.reason, 'writer-error')
+  assert.notEqual(result.reason, 'source-failed', 'machine-readable reason matches the text')
+  assert.match(result.text, /writer error/, 'text is unchanged and truthful')
+  assert.match(result.text, /writer seam exploded/, 'underlying error preserved')
+  assert.deepEqual(settings.mutations, [], 'no settings write happened before the writer threw')
+})
+
 if (failed > 0) {
   console.error(`\n${failed} test(s) failed, ${passed} passed`)
   process.exit(1)

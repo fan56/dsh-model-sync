@@ -822,10 +822,22 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
     if (built === undefined) {
       const commit = await persistLedger(ownershipStore, key, planned.unset, nextEntry, logger, report, planned.route)
       if (commit.lockTimeout !== undefined) {
+        // Lock failures keep their dedicated fail-closed semantics (unchanged).
         recordLockTimeout(result, report, planned, commit.lockTimeout, 'ledger commit')
         continue
       }
-      result.routes.push({ route: planned.route, slot: planned.slot, status: 'no-change' })
+      // A non-lock ledger failure on a no-change path is still a real failure:
+      // the round must not advertise a clean no-change. Data direction is safe
+      // (the next round re-reads ownership from scratch), but surface it in
+      // failedRoutes so the command reports `kind:'error'` (oldfox #1).
+      if (!commit.committed) {
+        result.failedRoutes.push({ route: planned.route, reason: 'ledger-write-failed' })
+        result.routes.push({
+          route: planned.route, slot: planned.slot, status: 'no-change', reason: 'ledger-write-failed',
+        })
+      } else {
+        result.routes.push({ route: planned.route, slot: planned.slot, status: 'no-change' })
+      }
       continue
     }
 
@@ -958,7 +970,16 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
                 recordLockTimeout(result, report, planned, retryCommit.lockTimeout, 'ledger commit (conflict retry)')
                 continue
               }
-              result.routes.push({ route: planned.route, slot: planned.slot, status: 'no-change' })
+              // Same honest failure accounting as the normal no-change path
+              // (oldfox #1): a non-lock ledger failure is a real failure.
+              if (!retryCommit.committed) {
+                result.failedRoutes.push({ route: planned.route, reason: 'ledger-write-failed' })
+                result.routes.push({
+                  route: planned.route, slot: planned.slot, status: 'no-change', reason: 'ledger-write-failed',
+                })
+              } else {
+                result.routes.push({ route: planned.route, slot: planned.slot, status: 'no-change' })
+              }
               continue
             }
             // O1/C2: the retry may write a different models array; refresh the
@@ -1063,6 +1084,10 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
   // so the next round will treat it as user-owned (S1/S2 report-text trap).
   const notClaimed = new Set([
     ...result.routes.filter((r) => r.status === 'skipped' || r.status === 'failed').map((r) => r.route),
+    // oldfox #1: a no-change route whose ledger re-commit failed is in
+    // failedRoutes but keeps status 'no-change' (no settings were written).
+    // Its model was never claimed, so never advertise an `added` line for it.
+    ...result.failedRoutes.map((f) => f.route),
     ...unaccounted,
   ])
   const honestReport = report.filter((entry) =>
@@ -1105,11 +1130,14 @@ async function persistLedger(
         message: `route ${route} ${UNACCOUNTED_ADVICE} (ledger write error: ${errorText(err)})`,
       })
     } else {
+      // No settings write preceded this commit (no-change path). The old
+      // "written but ownership ledger could not be persisted" was false —
+      // nothing was written here. State the real outcome (oldfox #1).
       report.push({
-        level: 'warn',
+        level: 'error',
         code: 'ledger-write-failed',
         route,
-        message: `route ${route} written but ownership ledger could not be persisted`,
+        message: `route ${route} ownership ledger could not be persisted; no settings writes were made in this no-change path (self-heals next round via a fresh ownership read; re-claim with \`/model-sync adopt go\` if needed)`,
       })
     }
     return { committed: false }

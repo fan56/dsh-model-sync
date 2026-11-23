@@ -102,6 +102,11 @@ export type GoRoundReason =
   | 'settings-unavailable'
   | 'no-key'
   | 'source-failed'
+  // oldfox #3: an unexpected exception inside writeGoPlan is a writer error,
+  // not a source failure. Distinct machine-readable reason matching the
+  // "writer error" text; the scheduler only backs off on source-failed, so a
+  // writer exception keeps normal-interval retry semantics.
+  | 'writer-error'
   | 'aborted'
   | 'migration-gate'
   | 'settings-changed-during-sync'
@@ -441,10 +446,15 @@ export async function runGoSyncRound(deps: GoRoundDeps): Promise<GoSyncRoundResu
       profileKey: deps.profileKey,
     })
   } catch (err) {
+    // The source already succeeded above; this is an unexpected writer throw.
+    // Keep the truthful text and give it a matching reason instead of lying
+    // with `source-failed` (oldfox #3). No failureKind is attached by the
+    // scheduler adapter (it is source-only), so no transport/auth backoff is
+    // scheduled for a writer exception — the normal interval still retries.
     const message = err instanceof Error ? err.message : String(err)
     return withJournal({
       ok: false,
-      reason: 'source-failed',
+      reason: 'writer-error',
       source,
       text: `opencode-go: writer error — ${message}; settings state is whatever landed before the error`,
     })

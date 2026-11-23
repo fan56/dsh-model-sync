@@ -852,5 +852,109 @@ await checkAsync('journal wired: ledger-read lock timeout still reports store-lo
   assert.deepEqual(await h.journalStore.list(PROFILE), [], 'no journal written after a failed ledger read')
 })
 
+// ---------------------------------------------------------------------------
+// oldfox #2/#4/#5 — final-gate suggestions (journal side)
+// ---------------------------------------------------------------------------
+
+await checkAsync('oldfox #2: descriptor-unavailable reconciliation has its own code, keeps every journal', async () => {
+  const store = memoryJournal()
+  const key = goJournalKey(PROFILE, 'opencode-go', FP)
+  store.rawSet(key, {
+    version: 1, profileKey: PROFILE, route: 'opencode-go', keyFingerprint: FP,
+    modelIds: ['x'], contentHash: 'whatever', unset: false,
+    entry: { managed: { x: { hash: 'h' } } }, at: 1,
+  })
+  const result = await reconcileJournals({
+    journalStore: store,
+    ownershipStore: memoryOwnership(),
+    settings: { describe: () => [] }, // no llm-pi-ai descriptor
+    profileKey: PROFILE, keyFingerprint: FP,
+    logger: { info() {}, warn() {}, debug() {} },
+  })
+  assert.equal(result.reconciled.length, 0)
+  assert.deepEqual(result.notices.map((n) => n.code), ['journal-descriptor-unavailable'])
+  assert.equal(result.notices.some((n) => n.code === 'journal-list-failed'), false, 'not mislabelled as a list failure')
+  assert.match(result.notices[0].message, /descriptor unavailable/)
+  assert.match(result.notices[0].message, /journals kept/)
+  assert.deepEqual(await store.list(PROFILE), [key], 'the journal is kept, never discarded')
+})
+
+await checkAsync('oldfox #4: parseJournal rejects malformed ownership entries (missing / mistyped / oversized)', () => {
+  const good = {
+    version: 1, profileKey: PROFILE, route: 'opencode-go', keyFingerprint: FP,
+    modelIds: ['hy4-flash-free'], contentHash: 'abc', unset: false,
+    entry: { managed: { 'hy4-flash-free': { hash: 'h' } } }, at: 1,
+  }
+  assert.ok(parseJournal(good).journal !== undefined, 'a valid entry is accepted')
+  const rejects = (patch) => {
+    const parsed = parseJournal({ ...good, ...patch })
+    assert.ok(parsed.error !== undefined && /invalid ledger entry/.test(parsed.error), `expected rejection: ${JSON.stringify(patch)}`)
+  }
+  rejects({ entry: {} })                                             // missing required `managed`
+  rejects({ entry: { managed: [] } })                                // wrong type (array)
+  rejects({ entry: { managed: { x: { hash: 42 } } } })                // wrong hash type
+  rejects({ entry: { managed: { x: {} } } })                         // hash field missing
+  rejects({ entry: { ...good.entry, missing: { x: 'two' } } })       // wrong optional type
+  rejects({ entry: { ...good.entry, appliedAddedIds: [1, 2] } })     // wrong array element type
+  rejects({ entry: { ...good.entry, preManagedSection: 'nope' } })   // wrong nullable-object type
+  rejects({ entry: { ...good.entry, appliedAddedIds: Array(100001).fill('x') } }) // oversized array
+  rejects({ unset: true, entry: { managed: 'nope' } })               // malformed entry on unset too
+})
+
+await checkAsync('oldfox #4: a malformed-entry journal is warned+cleaned and never re-committed to the ledger', async () => {
+  const settings = mockSettings({ 'opencode-go': { models: [model('keep-me')] } })
+  const store = memoryJournal()
+  const key = goJournalKey(PROFILE, 'opencode-go', FP)
+  store.rawSet(key, {
+    version: 1, profileKey: PROFILE, route: 'opencode-go', keyFingerprint: FP,
+    modelIds: ['keep-me'], contentHash: journalContentHash([model('keep-me')]),
+    unset: false, entry: { managed: { 'keep-me': { hash: 123 } } }, at: 1,
+  })
+  const ledger = memoryOwnership()
+  const recorded = []
+  const result = await reconcileJournals({
+    journalStore: store, ownershipStore: ledger, settings,
+    profileKey: PROFILE, keyFingerprint: FP,
+    logger: { info() {}, warn() {}, debug() {} },
+    onRecord: (route, ids) => { recorded.push([route, ids]) },
+  })
+  assert.equal(result.reconciled.length, 0, 'never reconciled')
+  assert.equal(result.discarded.length, 1, 'discarded as a corrupt slot')
+  assert.ok(result.notices.some((n) => n.code === 'journal-unparseable' && /invalid ledger entry/.test(n.message)),
+    'warned as an unparseable journal')
+  assert.equal(await ledger.read(goOwnershipKey('opencode-go', FP)), undefined, 'ledger untouched')
+  assert.deepEqual(recorded, [], 'migration record untouched')
+  assert.deepEqual(await store.list(PROFILE), [], 'slot cleaned')
+})
+
+await checkAsync('oldfox #5: journalContentHash uses deterministic code-unit order, not localeCompare', async () => {
+  // Code-unit order puts 'Zed' (0x5A) before 'alpha' (0x61); an English collator
+  // orders 'alpha' first. A hash computed with localeCompare would differ from
+  // the byte-order reference below and could be judged `journal-stale`.
+  assert.ok('Zed' < 'alpha', 'sanity: code-unit order')
+  assert.equal('Zed'.localeCompare('alpha') > 0, true, 'sanity: locale disagrees with code units')
+  const z = { id: 'Zed' }
+  const a = { id: 'alpha' }
+  const { createHash } = await import('node:crypto')
+  const reference = createHash('sha256').update(JSON.stringify([z, a])).digest('hex')
+  assert.equal(journalContentHash([a, z]), reference, 'hash equals the byte-order reference')
+  assert.equal(journalContentHash([a, z]), journalContentHash([z, a]), 'array order is irrelevant')
+
+  // Cross-locale proof: 'I'/'i' order flips between en and tr collators, so a
+  // localeCompare-based hash would change between the two processes.
+  const { execFileSync } = await import('node:child_process')
+  const { fileURLToPath } = await import('node:url')
+  const modulePath = fileURLToPath(new URL('../lib/opencode-go-journal.js', import.meta.url))
+  const childHash = execFileSync(process.execPath, ['-e', `
+    import { journalContentHash } from ${JSON.stringify(modulePath)}
+    process.stdout.write(journalContentHash([{ id: 'I' }, { id: 'i' }]))
+  `], {
+    encoding: 'utf8',
+    env: { ...process.env, LC_ALL: 'tr_TR.UTF-8', LANG: 'tr_TR.UTF-8' },
+  })
+  assert.equal(journalContentHash([{ id: 'I' }, { id: 'i' }]), childHash,
+    'hash is identical in a Turkish-locale process (no journal-stale false positive)')
+})
+
 console.log(`\n${passed} assertions passed, ${failed} failed.`)
 if (failed > 0) process.exitCode = 1
