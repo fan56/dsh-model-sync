@@ -2,11 +2,22 @@
 // process and report the outcome (including error name/code/message) to a
 // result file. `barrier` blocks until the parent creates it, so two writers
 // can be released simultaneously; `ready` signals the child is about to write.
-import { writeFile, readFile } from 'node:fs/promises'
+// The result file is written atomically (temp + rename) so the parent's
+// wait-for-file can never observe a half-written JSON document.
+import { writeFile, readFile, rename } from 'node:fs/promises'
 
 const [configJson] = process.argv.slice(2)
 const cfg = JSON.parse(configJson)
 const { loadModelsStore } = await import(cfg.libRemote)
+
+// Atomic result publish: waitForFile() returns only once the final path exists,
+// and rename(2) guarantees the content is complete at that point.
+async function publishResult(value) {
+  if (!cfg.result) return
+  const tmp = `${cfg.result}.${process.pid}.tmp`
+  await writeFile(tmp, JSON.stringify(value))
+  await rename(tmp, cfg.result)
+}
 
 if (cfg.barrier) {
   for (;;) {
@@ -29,15 +40,13 @@ try {
   } else {
     await store.writeRaw(cfg.key, cfg.value)
   }
-  if (cfg.result) await writeFile(cfg.result, JSON.stringify({ ok: true }))
+  await publishResult({ ok: true })
 } catch (err) {
-  if (cfg.result) {
-    await writeFile(cfg.result, JSON.stringify({
-      ok: false,
-      name: err?.name ?? null,
-      code: err?.code ?? null,
-      message: err?.message ?? String(err),
-    }))
-  }
+  await publishResult({
+    ok: false,
+    name: err?.name ?? null,
+    code: err?.code ?? null,
+    message: err?.message ?? String(err),
+  })
   process.exitCode = 1
 }

@@ -14,7 +14,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 
 // ---------------------------------------------------------------------------
 // Constants (ported from docs-dsh-llm-pi-ai.patch:35-36)
@@ -173,7 +173,11 @@ let modelsStoreCache: ModelsStoreAccessor | undefined
 // EPERM / any other outcome is indeterminate and conservatively keeps the
 // lock), and a re-read immediately before deletion still shows the same
 // nonce (compare-and-delete, so a lock replaced mid-check is never removed).
-// A lock that cannot be acquired within LOCK_WAIT_MS is a hard failure:
+// A lock with NO parseable stamp is the crash window between `open(wx)` and
+// the stamp write: it has no owner to validate, so it is only reclaimed once
+// its FILE mtime is older than LOCK_STALE_MS and its raw bytes are unchanged
+// at delete time — otherwise it keeps the lock (fail-closed). A lock that
+// cannot be acquired within LOCK_WAIT_MS is a hard failure:
 // StoreLockTimeoutError is thrown and the write does NOT run (fail-closed),
 // because a bypass would reintroduce the whole-document last-writer-wins loss
 // this guard exists to prevent. The store bytes are untouched on timeout.
@@ -209,6 +213,18 @@ export class StoreLockTimeoutError extends Error {
     this.lockPath = lockPath
     this.waitMs = waitMs
   }
+}
+
+/**
+ * Structural check for a store lock timeout. Uses `code`/`name` rather than
+ * `instanceof` so a timeout that was re-wrapped (or crossed a module boundary)
+ * is still recognized and its actionable message is not degraded to a generic
+ * failure.
+ */
+function isStoreLockTimeout(err: unknown): boolean {
+  if (err === null || typeof err !== 'object') return false
+  const value = err as { code?: unknown; name?: unknown }
+  return value.code === 'DSH_STORE_LOCK_TIMEOUT' || value.name === 'StoreLockTimeoutError'
 }
 
 function lockPathFor(path: string): string {
@@ -262,32 +278,51 @@ type BreakOutcome = 'broken' | 'kept' | 'mismatch'
 
 /** Attempt an owner-validated stale break. Never deletes a lock it cannot prove is stale. */
 async function tryBreakStaleLock(lockPath: string, now: number): Promise<BreakOutcome> {
-  let first: LockOwner | undefined
+  let raw: string
   try {
-    first = parseLockOwner(await readFile(lockPath, 'utf8'))
+    raw = await readFile(lockPath, 'utf8')
   } catch {
     return 'kept' // vanished or unreadable between EEXIST and read — retry later
   }
-  if (first === undefined) return 'kept'
+  const owner = parseLockOwner(raw)
 
-  // (1) age: use the stamped creation time, not mtime (mtime can be touched).
-  if (!(now - first.createdAt > LOCK_STALE_MS)) return 'kept'
-  // (2) ownership: only a conclusive ESRCH is enough to break the lock.
-  if (!isLockOwnerDead(first.pid)) return 'kept'
+  if (owner !== undefined) {
+    // Stamped lock: age comes from the stamp, not mtime (mtime can be touched).
+    // (1) age
+    if (!(now - owner.createdAt > LOCK_STALE_MS)) return 'kept'
+    // (2) ownership: only a conclusive ESRCH is enough to break the lock.
+    if (!isLockOwnerDead(owner.pid)) return 'kept'
+  } else {
+    // Unstamped / empty / half-written / foreign lock (N3): the crash window
+    // between `open(wx)` and the stamp write leaves a file with no owner to
+    // validate. Use the file's mtime as the age evidence and require it to be
+    // over LOCK_STALE_MS. Combine with the byte-compare at delete time below:
+    // if a real owner stamped the file in the meantime, its bytes changed and
+    // we abandon. A fresh unstamped lock keeps waiting (fail-closed).
+    let mtimeMs: number
+    try {
+      mtimeMs = (await stat(lockPath)).mtimeMs
+    } catch {
+      return 'kept'
+    }
+    if (!Number.isFinite(mtimeMs) || !(now - mtimeMs > LOCK_STALE_MS)) return 'kept'
+  }
 
   const delay = lockBreakVerifyDelayMs()
   if (delay > 0) await new Promise<void>((resolve) => setTimeout(resolve, delay))
 
-  // (3) compare-and-delete: re-read by path and require the same nonce. If the
-  // lock was replaced while we decided it was stale, abandon — never remove
-  // the replacement, just keep waiting (and fail closed at the deadline).
-  let second: LockOwner | undefined
+  // (3) compare-and-delete: re-read by path and require byte-identical content.
+  // For stamped locks this subsumes the nonce check (the nonce is part of the
+  // bytes); for unstamped locks it proves nobody claimed the file meanwhile.
+  // A replaced lock is never removed — just keep waiting (fail closed at the
+  // deadline).
+  let second: string
   try {
-    second = parseLockOwner(await readFile(lockPath, 'utf8'))
+    second = await readFile(lockPath, 'utf8')
   } catch {
     return 'kept'
   }
-  if (second === undefined || second.nonce !== first.nonce) return 'mismatch'
+  if (second !== raw) return 'mismatch'
   try {
     await rm(lockPath, { force: true })
     return 'broken'
@@ -760,6 +795,16 @@ export async function fetchRemoteCatalog(
     return { entries: refreshed, fromCache: false }
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err)
+    // A store lock timeout is not a fetch/network error. Keep its actionable
+    // message (lock path + retry / check-other-processes guidance) verbatim so
+    // callers can tell "retry later" from "the catalog request itself failed".
+    if (isStoreLockTimeout(err)) {
+      return {
+        entries: stored?.models ?? [],
+        fromCache: false,
+        error: `store lock timeout while persisting ${route}: ${message}`,
+      }
+    }
     // On abort or network error, return cached entries
     return {
       entries: stored?.models ?? [],

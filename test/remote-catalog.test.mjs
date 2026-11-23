@@ -14,6 +14,7 @@ import {
   loadModelsStore,
   resetModelsStoreCache,
   fetchRemoteCatalog,
+  StoreLockTimeoutError,
 } from '../lib/remote-catalog.js'
 
 let failed = 0
@@ -1046,6 +1047,34 @@ await checkAsync('regression: network error → cached entries returned, store u
   } finally {
     await rm(dir, { recursive: true, force: true })
     resetModelsStoreCache()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// N2 — a store lock timeout during fetch persistence stays actionable
+// ---------------------------------------------------------------------------
+await checkAsync('N2: fetchRemoteCatalog keeps a lock timeout actionable instead of a generic fetch error', async () => {
+  const base = loadModelsStore(join(tmpdir(), `dsh-n2-fetch-${Date.now()}.json`))
+  const lockPath = '/tmp/hash.dsh-store.lock'
+  const store = {
+    ...base,
+    async read() { return undefined },
+    async update() { throw new StoreLockTimeoutError(lockPath, 2000) },
+  }
+  const origFetch = globalThis.fetch
+  globalThis.fetch = async () => new Response(JSON.stringify([{ id: 'm1', name: 'M1', api: 'openai-completions' }]), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  })
+  try {
+    const result = await fetchRemoteCatalog('test-route', 5000, store)
+    assert.ok(result.error, 'an error must be reported')
+    assert.match(result.error, /store lock timeout while persisting test-route/, 'distinguished from a network error')
+    assert.ok(result.error.includes(lockPath), 'lock path preserved')
+    assert.ok(result.error.includes('Retry the operation'), 'retry advice preserved')
+    assert.ok(!result.error.includes('Fetch failed'), 'not degraded to a generic fetch failure')
+  } finally {
+    globalThis.fetch = origFetch
   }
 })
 
