@@ -77,6 +77,15 @@ export interface GoWriterDeps {
   /** Optional models-store seam for override fold + unset (store-first). */
   overrideStorer?: GoOverrideStorer
   /**
+   * B4/N1 fail-closed guard: the llm-pi-ai revision the plan was built against
+   * (the fetch-time / post-validation revision). The writer re-reads the
+   * descriptor before ANY settings mutate or ledger commit; if the revision
+   * moved since the round was validated, the plan is stale and the WHOLE round
+   * is abandoned (zero writes, no ledger/fingerprint). Omitted only by pure
+   * unit writers that do not have a round-level revision to validate.
+   */
+  expectedRevision?: number
+  /**
    * §14.7.5 second gate: called immediately before EACH mutate (and again on a
    * SETTINGS_CONFLICT retry). Must re-read the persisted migration status —
    * never reuse the round-level snapshot. A false result leaves the route
@@ -124,6 +133,12 @@ export interface GoWriteResult {
   writtenRoutes: string[]
   /** Routes whose mutate failed, with an honest reason. */
   failedRoutes: { route: string; reason: string }[]
+  /**
+   * B4/N1: set when the round was abandoned because the host settings revision
+   * moved mid-round. The caller must report this as
+   * `settings-changed-during-sync` and treat the round as a zero-write no-op.
+   */
+  settingsChanged?: { expectedRevision: number | undefined; actualRevision: number }
   /** Planner report adjusted by writer decisions + `moved` association. */
   report: GoPlanReportEntry[]
 }
@@ -285,6 +300,45 @@ async function recordOwnWrite(
   }
 }
 
+/**
+ * B4/N1: abandon the WHOLE round the moment the host settings revision moved
+ * underneath a validated plan. Nothing is written — no settings mutate, no
+ * ledger commit, no fingerprint — so a user edit that landed mid-round is kept
+ * byte-for-byte. `plan.routes` that were never touched are reported as skipped
+ * for observability; routes that already wrote (a mid-loop race) are left as-is
+ * and the report stays honest.
+ */
+function abandonForSettingsChange(
+  result: GoWriteResult,
+  report: GoPlanReportEntry[],
+  plan: GoPlanResult,
+  expectedRevision: number | undefined,
+  actualRevision: number,
+): GoWriteResult {
+  result.settingsChanged = { expectedRevision, actualRevision }
+  const touched = new Set([
+    ...result.routes.map((status) => status.route),
+    ...result.failedRoutes.map((failed) => failed.route),
+    ...result.writtenRoutes,
+  ])
+  for (const planned of plan.routes) {
+    if (planned.skip || touched.has(planned.route)) continue
+    result.routes.push({
+      route: planned.route,
+      slot: planned.slot,
+      status: 'skipped',
+      reason: 'settings-changed-during-sync',
+    })
+  }
+  report.push({
+    level: 'warn',
+    code: 'settings-changed-during-sync',
+    message: `llm-pi-ai revision ${String(expectedRevision)} -> ${actualRevision} during this round; stale plan discarded (zero settings writes, no ledger/fingerprint update); the next round re-reads current settings`,
+  })
+  result.report = associateGoMoves(report)
+  return result
+}
+
 // ---------------------------------------------------------------------------
 // Per-route mutation building
 // ---------------------------------------------------------------------------
@@ -388,6 +442,16 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
     }
     result.report = associateGoMoves(report)
     return result
+  }
+
+  // B4/N1 window ②: the user changed settings after the round validated the
+  // revision but before the writer first read the descriptor. The plan was
+  // built from the OLD settings, so even a fresh-revision mutate would silently
+  // delete the just-saved model. Abandon before touching anything.
+  const expectedRevision = deps.expectedRevision
+  let currentExpectedRevision = expectedRevision
+  if (expectedRevision !== undefined && desc.revision !== expectedRevision) {
+    return abandonForSettingsChange(result, report, plan, expectedRevision, desc.revision)
   }
 
   for (const planned of plan.routes) {
@@ -538,6 +602,21 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
       continue
     }
 
+    // B4/N1 window ①: re-read the descriptor IMMEDIATELY before any settings
+    // mutate (or the no-change ledger commit) for this route. A revision moved
+    // since our last validated write means settings changed underneath us —
+    // the plan is stale, so abandon the whole round with zero writes. Our own
+    // earlier mutate advances the document revision, so compare against the
+    // rolling baseline (updated after each successful write), not the round's
+    // original revision.
+    let live: SettingsDescriptor | undefined
+    if (expectedRevision !== undefined) {
+      live = findLlmDescriptor(settings)
+      if (live === undefined || live.revision !== currentExpectedRevision) {
+        return abandonForSettingsChange(result, report, plan, currentExpectedRevision, live?.revision ?? -1)
+      }
+    }
+
     if (built === undefined) {
       const commit = await persistLedger(ownershipStore, key, planned.unset, nextEntry, logger, report, planned.route)
       if (commit.lockTimeout !== undefined) {
@@ -574,13 +653,30 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
 
     if (failedReason === undefined) {
       try {
-        await settings.mutate('llm-pi-ai', built.ops, desc.revision)
+        await settings.mutate('llm-pi-ai', built.ops, live?.revision ?? desc.revision)
         settingsLanded = true
+        // Our own write advances the document revision. Re-read it so later
+        // routes compare against this new baseline instead of the stale
+        // round-level revision (otherwise every subsequent route would look
+        // like a settings change just because WE wrote the previous one).
+        if (expectedRevision !== undefined) {
+          const after = findLlmDescriptor(settings)
+          if (after !== undefined) currentExpectedRevision = after.revision
+        }
       } catch (err) {
         if (!isConflictError(err)) {
           failedReason = 'mutate-rejected'
           logger.warn('mutate failed for %s: %s', planned.route, errorText(err))
+        } else if (expectedRevision !== undefined) {
+          // B4/N1: a conflict AFTER our freshness check can only be an external
+          // edit that landed in the narrow gap before the mutate. Retrying with
+          // the stale plan would delete the just-saved model — abandon the
+          // whole round instead (no ledger/fingerprint, next round re-plans).
+          const fresh = findLlmDescriptor(settings)
+          return abandonForSettingsChange(result, report, plan, currentExpectedRevision, fresh?.revision ?? -1)
         } else {
+          // Legacy retry for direct unit writers that did not supply a
+          // round-level expectedRevision (production always supplies one).
           // §14.7.5: re-run the second gate BEFORE the retry mutate. The live
           // migration status may have flipped during the first attempt; the
           // round-level decision and the first gate result are both stale now.

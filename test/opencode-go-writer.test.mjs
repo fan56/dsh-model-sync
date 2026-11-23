@@ -638,6 +638,68 @@ await checkAsync('conflict: a second conflict is reported as failed, not retried
 })
 
 // ---------------------------------------------------------------------------
+// 8a. B4/N1 fail-closed guard (guarded callers only; production always guarded)
+// ---------------------------------------------------------------------------
+
+await checkAsync('guard (N1): stale expectedRevision at writer entry → abandon whole round, zero writes', async () => {
+  const plan = planGoRoutes({
+    keyFingerprint: KEY,
+    entries: [chatEntry('hy4'), msgEntry('qwen4-max'), respEntry('grok-4.7')],
+    currentRoutes: {},
+    ownership: {},
+  })
+  const settings = createMockSettings({ revision: 2 })
+  const store = createMockStore()
+  const out = await writeGoPlan(plan, deps(settings, store, { expectedRevision: 1 }))
+  assert.deepEqual(out.settingsChanged, { expectedRevision: 1, actualRevision: 2 })
+  assert.deepEqual(out.writtenRoutes, [])
+  assert.deepEqual(out.failedRoutes, [])
+  assert.equal(settings.mutations.length, 0, 'no settings mutate at all')
+  assert.equal(store.writes.length, 0, 'no ledger write')
+  assert.equal(out.routes.length, 3)
+  assert.ok(out.routes.every((r) => r.reason === 'settings-changed-during-sync'))
+  assert.ok(out.report.some((e) => e.code === 'settings-changed-during-sync'))
+})
+
+await checkAsync('guard (N1): SETTINGS_CONFLICT after the freshness check → abandon, never reapply the stale plan', async () => {
+  const userModel = { id: 'user-saved-model', name: 'user' }
+  const state = new Map([['opencode-go', { models: [] }]])
+  let revision = 1
+  const mutations = []
+  const settings = {
+    mutations,
+    state,
+    describe() {
+      return [{
+        ns: 'llm-pi-ai',
+        revision,
+        user: { providers: Object.fromEntries([...state].map(([r, d]) => [r, structuredClone(d)])) },
+      }]
+    },
+    async mutate(ns, ops, expectedRevision) {
+      assert.equal(ns, 'llm-pi-ai')
+      mutations.push({ ops, expectedRevision })
+      // Another writer lands a user edit in the narrow gap between our
+      // pre-mutate descriptor read and this mutate.
+      state.set('opencode-go', { models: structuredClone([userModel]) })
+      revision += 1
+      throw Object.assign(new Error('settings conflict'), { code: 'SETTINGS_CONFLICT' })
+    },
+  }
+  const plan = planGoRoutes({
+    keyFingerprint: KEY, entries: [chatEntry('hy4')], currentRoutes: {}, ownership: {},
+  })
+  const store = createMockStore()
+  const out = await writeGoPlan(plan, deps(settings, store, { expectedRevision: 1 }))
+  assert.deepEqual(out.settingsChanged, { expectedRevision: 1, actualRevision: 2 })
+  assert.deepEqual(out.writtenRoutes, [])
+  assert.equal(mutations.length, 1, 'exactly one rejected attempt — no retry reusing the stale plan')
+  assert.deepEqual(state.get('opencode-go').models, [userModel], 'the just-saved model survived')
+  assert.equal(store.writes.length, 0, 'no ledger write on abandon')
+  assert.equal(out.routes[0].reason, 'settings-changed-during-sync')
+})
+
+// ---------------------------------------------------------------------------
 // 8b. §14.7.5 second gate + §14.7.4 fingerprint persistence
 // ---------------------------------------------------------------------------
 

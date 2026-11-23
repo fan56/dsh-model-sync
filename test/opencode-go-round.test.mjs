@@ -421,6 +421,110 @@ await checkAsync('B4 command surface: fetch-window edit returns kind=error with 
   assert.deepEqual(settings.state.get('opencode-go').models, [{ id: 'user-saved-model', name: 'user' }])
 }, { onFetch: (settings) => settings.userEdit('opencode-go', [{ id: 'user-saved-model', name: 'user' }]) }))
 
+// ---------------------------------------------------------------------------
+// N1 (51 §5): a settings edit in the two gaps AFTER the fetch-window guard
+// must never let the writer apply its stale plan. Both windows are built with
+// an injection seam that bumps the revision at a precise point, and both must
+// end in a zero-write `settings-changed-during-sync` round with the user's new
+// model preserved byte-for-byte.
+// ---------------------------------------------------------------------------
+
+await checkAsync('N1 window ①: edit after the writer reads its descriptor → zero writes, stale plan never applied', async () => {
+  const settings = mockSettings()
+  const store = memoryOwnershipStore()
+  const userModel = { id: 'user-saved-model', name: 'user' }
+  let owned = 0
+  let describeCalls = 0
+  let writerEntered = false
+  // Seam: the 3rd describe() is the writer's entry descriptor read (the first
+  // two belong to runGoSyncRound's initial + post-fetch reads).
+  const originalDescribe = settings.describe
+  settings.describe = () => {
+    describeCalls += 1
+    if (describeCalls === 3) writerEntered = true
+    return originalDescribe()
+  }
+  let bumped = false
+  const wrappedStore = {
+    ...store,
+    async read(key) {
+      // The writer's first ledger read happens after its entry descriptor read
+      // but before its first mutate — exactly reproduction path A from 51 §5.
+      if (writerEntered && !bumped) {
+        bumped = true
+        settings.userEdit('opencode-go', [userModel])
+      }
+      return store.read(key)
+    },
+  }
+  const result = await directGoRound(settings, {
+    ownershipStore: wrappedStore,
+    onOwnWrite: () => { owned += 1 },
+  })
+  assert.equal(bumped, true, 'the seam actually fired')
+  assert.equal(result.reason, 'settings-changed-during-sync', `report=${result.text}`)
+  assert.equal(result.ok, false)
+  assert.equal(result.write, undefined, 'no half-written round is exposed')
+  assert.deepEqual(result.settingsChanged, { beforeRevision: 1, afterRevision: 2 })
+  assert.deepEqual(settings.mutations, [], 'zero settings mutations')
+  assert.deepEqual(settings.state.get('opencode-go').models, [userModel], 'the just-saved user model survived')
+  assert.deepEqual([...store.map.keys()], [], 'no ownership ledger change')
+  assert.equal(owned, 0, 'no appliedFingerprint update')
+  assert.doesNotMatch(result.text, /reason:'completed'/)
+  assert.match(result.text, /settings changed during this sync round/)
+  assert.match(result.text, /discarding the stale plan/)
+})
+
+await checkAsync('N1 window ②: edit after fetch validation but before the writer reads its descriptor → zero writes', async () => {
+  const settings = mockSettings()
+  const store = memoryOwnershipStore()
+  const userModel = { id: 'user-saved-model', name: 'user' }
+  let owned = 0
+  let bumped = false
+  const wrappedStore = {
+    ...store,
+    async read(key) {
+      // runGoSyncRound reads the ledger AFTER its post-fetch revision check but
+      // BEFORE writeGoPlan — reproduction path B from 51 §5.
+      if (!bumped) {
+        bumped = true
+        settings.userEdit('opencode-go', [userModel])
+      }
+      return store.read(key)
+    },
+  }
+  const result = await directGoRound(settings, {
+    ownershipStore: wrappedStore,
+    onOwnWrite: () => { owned += 1 },
+  })
+  assert.equal(bumped, true, 'the seam actually fired')
+  assert.equal(result.reason, 'settings-changed-during-sync', `report=${result.text}`)
+  assert.equal(result.ok, false)
+  assert.equal(result.write, undefined, 'writer never produced a completed round')
+  assert.deepEqual(result.settingsChanged, { beforeRevision: 1, afterRevision: 2 })
+  assert.deepEqual(settings.mutations, [], 'zero settings mutations')
+  assert.deepEqual(settings.state.get('opencode-go').models, [userModel], 'the user edit is preserved verbatim')
+  assert.deepEqual([...store.map.keys()], [], 'no ownership ledger change')
+  assert.equal(owned, 0, 'no appliedFingerprint update')
+})
+
+await checkAsync('N1: a normal unchanged-revision round still writes all three routes, then a second idempotent round', async () => {
+  const settings = mockSettings()
+  const store = memoryOwnershipStore()
+  let owned = 0
+  const first = await directGoRound(settings, { ownershipStore: store, onOwnWrite: () => { owned += 1 } })
+  assert.equal(first.reason, 'completed')
+  assert.equal(first.write.failedRoutes.length, 0, 'own writes advance the rolling revision baseline without false conflicts')
+  assert.deepEqual(first.write.writtenRoutes.sort(), ['opencode-go', 'opencode-go-msg', 'opencode-go-resp'])
+  assert.equal(settings.mutations.length, 3)
+  assert.equal(owned, 3)
+  const second = await directGoRound(settings, { ownershipStore: store, onOwnWrite: () => { owned += 1 } })
+  assert.equal(second.reason, 'completed')
+  assert.deepEqual(second.write.writtenRoutes, [])
+  assert.equal(settings.mutations.length, 3, 'second round is a no-change round')
+  assert.equal(owned, 3)
+})
+
 if (failed > 0) {
   console.error(`\n${failed} test(s) failed, ${passed} passed`)
   process.exit(1)

@@ -159,6 +159,29 @@ function settingsChangedResult(source: GoSourceResult, beforeRevision: number, a
 }
 
 /**
+ * B4/N1: the writer detected a settings revision change after the round was
+ * validated — the plan went stale before any mutate landed. Same zero-write
+ * semantics as the fetch-window case, but honest about WHEN the change landed.
+ */
+function writerSettingsChangedResult(
+  source: GoSourceResult,
+  beforeRevision: number | undefined,
+  afterRevision: number,
+): GoSyncRoundResult {
+  return {
+    ok: false,
+    reason: 'settings-changed-during-sync',
+    source,
+    settingsChanged: { beforeRevision: beforeRevision ?? -1, afterRevision },
+    text: [
+      `opencode-go: settings changed during this sync round (llm-pi-ai revision ${String(beforeRevision)} -> ${afterRevision}); discarding the stale plan`,
+      '  user edits were kept as-is: no settings write, no ownership ledger change, no fingerprint update',
+      '  the next round re-reads the current settings and retries normally',
+    ].join('\n'),
+  }
+}
+
+/**
  * Read only this key's ledger slots. A slot that cannot be read is treated as
  * absent — the writer then refuses to delete (no hash), the safe direction.
  */
@@ -331,6 +354,10 @@ export async function runGoSyncRound(deps: GoRoundDeps): Promise<GoSyncRoundResu
       keyFingerprint: source.keyFingerprint,
       confirmRemovals: config.confirmRemovals,
       adoptExisting: config.adoptExisting,
+      // B4/N1: the revision this round validated (post-fetch == pre-fetch).
+      // The writer re-checks it before every mutate and abandons the whole
+      // round if a user edit landed in the gap between here and the write.
+      expectedRevision: preFetchRevision,
       canWrite,
       onOwnWrite: deps.onOwnWrite,
     })
@@ -342,6 +369,17 @@ export async function runGoSyncRound(deps: GoRoundDeps): Promise<GoSyncRoundResu
       source,
       text: `opencode-go: writer error — ${message}; settings state is whatever landed before the error`,
     }
+  }
+
+  // B4/N1: the writer abandoned the round because settings changed after
+  // validation. Do NOT expose a `completed` write or a half-plan here — report
+  // the same zero-write reason as the fetch-window guard.
+  if (write.settingsChanged !== undefined) {
+    return writerSettingsChangedResult(
+      source,
+      write.settingsChanged.expectedRevision,
+      write.settingsChanged.actualRevision,
+    )
   }
 
   return { ok: write.failedRoutes.length === 0, reason: 'completed', source, write, text: formatGoRoundReport(source, write) }
