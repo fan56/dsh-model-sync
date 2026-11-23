@@ -11,10 +11,10 @@
  * @module dsh-model-sync/remote-catalog
  */
 
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises'
 
 // ---------------------------------------------------------------------------
 // Constants (ported from docs-dsh-llm-pi-ai.patch:35-36)
@@ -153,7 +153,7 @@ export function parseRemoteCatalog(
 
 let modelsStoreCache: ModelsStoreAccessor | undefined
 
-// --- Minimal cross-process write guard (B1 / R-14) -------------------------
+// --- Cross-process write guard (B1 / R-14; D2/D3 hardening) -----------------
 //
 // The promise queue below serializes writes WITHIN one process only. Two dsh
 // processes (two profiles sharing models-store.json) still race: both read the
@@ -162,21 +162,138 @@ let modelsStoreCache: ModelsStoreAccessor | undefined
 // prevent that whole-document last-writer-wins loss.
 //
 // Guard the read-modify-write+rename critical section with a single lock file
-// via atomic exclusive create (`open(..., 'wx')`). This adds no new service or
-// dependency: it is a sibling of the store file, held only for the few ms of
-// one write and removed in `finally`. A stale lock (holder crashed) is broken
-// after LOCK_STALE_MS; a lock that cannot be acquired within LOCK_WAIT_MS is
-// bypassed (fail-open) so a stuck lock never hangs a sync round — a skipped
-// guard degrades to the pre-fix last-writer-wins behavior (the file itself
-// stays well-formed thanks to the atomic rename). The lock lives in the OS
-// temp dir (name hashed from the absolute store path): two processes derive
-// the same lock, and no transient file is ever created under ~/.dsh.
+// created by atomic exclusive `open(..., 'wx')`. The lock lives in the OS temp
+// dir (name hashed from the absolute store path) so two processes derive the
+// same file and no transient file is ever created under ~/.dsh. It is held
+// only for the few ms of one write and removed in `finally`.
+//
+// Lock files carry an owner stamp { pid, nonce, createdAt }. A lock is only
+// broken as stale when ALL three hold: its recorded age exceeds
+// LOCK_STALE_MS, its owner PID is *conclusively* gone (kill(pid, 0) -> ESRCH;
+// EPERM / any other outcome is indeterminate and conservatively keeps the
+// lock), and a re-read immediately before deletion still shows the same
+// nonce (compare-and-delete, so a lock replaced mid-check is never removed).
+// A lock that cannot be acquired within LOCK_WAIT_MS is a hard failure:
+// StoreLockTimeoutError is thrown and the write does NOT run (fail-closed),
+// because a bypass would reintroduce the whole-document last-writer-wins loss
+// this guard exists to prevent. The store bytes are untouched on timeout.
 const LOCK_STALE_MS = 10_000
 const LOCK_WAIT_MS = 2_000
 const LOCK_RETRY_MS = 8
 
+/** Payload written into the lock file so a stale break can validate ownership. */
+interface LockOwner {
+  pid: number
+  nonce: string
+  createdAt: number
+}
+
+/**
+ * Fail-closed error for a cross-process lock that stayed contended past
+ * LOCK_WAIT_MS. `name` and `code` distinguish it from an ordinary store write
+ * failure (corrupt JSON, EIO, ...) so callers can tell "retry / someone else
+ * is holding the lock" from "the store itself is broken".
+ */
+export class StoreLockTimeoutError extends Error {
+  readonly code = 'DSH_STORE_LOCK_TIMEOUT'
+  readonly lockPath: string
+  readonly waitMs: number
+
+  constructor(lockPath: string, waitMs: number) {
+    super(
+      `Timed out after ${waitMs}ms waiting for the models-store lock (${lockPath}). ` +
+      'The store was NOT modified. Retry the operation; if it keeps failing, check other running dsh processes for a stalled sync round holding the lock. ' +
+      `A lock left by a crashed process is broken automatically once it is older than ${LOCK_STALE_MS}ms and its owner PID is no longer alive.`,
+    )
+    this.name = 'StoreLockTimeoutError'
+    this.lockPath = lockPath
+    this.waitMs = waitMs
+  }
+}
+
 function lockPathFor(path: string): string {
   return join(tmpdir(), `${createHash('sha256').update(path).digest('hex')}.dsh-store.lock`)
+}
+
+function parseLockOwner(raw: string): LockOwner | undefined {
+  try {
+    const value = JSON.parse(raw) as Partial<LockOwner>
+    if (
+      typeof value.pid === 'number' && Number.isInteger(value.pid) && value.pid > 0
+      && typeof value.nonce === 'string' && value.nonce.length > 0
+      && typeof value.createdAt === 'number' && Number.isFinite(value.createdAt)
+    ) {
+      return { pid: value.pid, nonce: value.nonce, createdAt: value.createdAt }
+    }
+  } catch {
+    // Empty (just-created, not yet stamped), half-written or foreign file —
+    // ownership cannot be determined, so the lock must not be broken.
+  }
+  return undefined
+}
+
+/** True only when signal probe conclusively reports the owner process is gone. */
+function isLockOwnerDead(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return false // process exists (or at least can be signalled): keep the lock
+  } catch (err: unknown) {
+    // ESRCH is the only "definitely gone" answer. EPERM means the process
+    // exists but belongs to another user; anything else is indeterminate.
+    // Both must be treated conservatively as "alive/unknown" — never break.
+    return (err as NodeJS.ErrnoException).code === 'ESRCH'
+  }
+}
+
+/**
+ * Test-only seam (never set by dsh or the plugin): widens the gap between the
+ * two owner reads so a behavioral test can swap the lock file in between and
+ * prove compare-and-delete refuses to remove a replacement. Zero in normal
+ * operation, so production timing is unchanged.
+ */
+function lockBreakVerifyDelayMs(): number {
+  const raw = process.env.DSH_LOCK_BREAK_VERIFY_DELAY_MS
+  if (raw === undefined || raw === '') return 0
+  const ms = Number(raw)
+  return Number.isFinite(ms) && ms > 0 ? ms : 0
+}
+
+type BreakOutcome = 'broken' | 'kept' | 'mismatch'
+
+/** Attempt an owner-validated stale break. Never deletes a lock it cannot prove is stale. */
+async function tryBreakStaleLock(lockPath: string, now: number): Promise<BreakOutcome> {
+  let first: LockOwner | undefined
+  try {
+    first = parseLockOwner(await readFile(lockPath, 'utf8'))
+  } catch {
+    return 'kept' // vanished or unreadable between EEXIST and read — retry later
+  }
+  if (first === undefined) return 'kept'
+
+  // (1) age: use the stamped creation time, not mtime (mtime can be touched).
+  if (!(now - first.createdAt > LOCK_STALE_MS)) return 'kept'
+  // (2) ownership: only a conclusive ESRCH is enough to break the lock.
+  if (!isLockOwnerDead(first.pid)) return 'kept'
+
+  const delay = lockBreakVerifyDelayMs()
+  if (delay > 0) await new Promise<void>((resolve) => setTimeout(resolve, delay))
+
+  // (3) compare-and-delete: re-read by path and require the same nonce. If the
+  // lock was replaced while we decided it was stale, abandon — never remove
+  // the replacement, just keep waiting (and fail closed at the deadline).
+  let second: LockOwner | undefined
+  try {
+    second = parseLockOwner(await readFile(lockPath, 'utf8'))
+  } catch {
+    return 'kept'
+  }
+  if (second === undefined || second.nonce !== first.nonce) return 'mismatch'
+  try {
+    await rm(lockPath, { force: true })
+    return 'broken'
+  } catch {
+    return 'kept'
+  }
 }
 
 async function withCrossProcessLock(path: string, task: () => Promise<void>): Promise<void> {
@@ -187,19 +304,20 @@ async function withCrossProcessLock(path: string, task: () => Promise<void>): Pr
     for (;;) {
       try {
         handle = await open(lockPath, 'wx')
+        // Stamp ownership right after the exclusive create. A concurrent
+        // contender that sees the file before the stamp cannot parse an owner
+        // and will conservatively refuse to break it.
+        await handle.writeFile(JSON.stringify({
+          pid: process.pid,
+          nonce: randomUUID(),
+          createdAt: Date.now(),
+        } satisfies LockOwner), 'utf8')
         break
       } catch (err: unknown) {
         if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
-        try {
-          const info = await stat(lockPath)
-          if (Date.now() - info.mtimeMs > LOCK_STALE_MS) {
-            await rm(lockPath, { force: true })
-            continue
-          }
-        } catch {
-          // Lock vanished between EEXIST and stat — retry acquisition.
-        }
-        if (Date.now() >= deadline) break // fail-open; never hang the round
+        // Ignore the outcome: 'mismatch' and 'kept' both mean "still held".
+        await tryBreakStaleLock(lockPath, Date.now())
+        if (Date.now() >= deadline) throw new StoreLockTimeoutError(lockPath, LOCK_WAIT_MS)
         await new Promise<void>((resolve) => setTimeout(resolve, LOCK_RETRY_MS))
       }
     }
