@@ -41,6 +41,7 @@ import {
   fingerprintSection,
   readGoProviderSections,
   routeWriter,
+  unclaimedRecordState,
   type MigrationBackup,
   type MigrationRecord,
   type MigrationState,
@@ -1631,9 +1632,7 @@ export async function migrationStatusReport(
       // An unreadable store never changes status (same rule as legacyKeys).
     }
   }
-  const recordState: MigrationState | undefined = unclaimed.some((r) => r.kind === 'foreign-profile')
-    ? 'foreign-profile'
-    : unclaimed.length > 0 ? 'legacy-store' : undefined
+  const recordState: MigrationState | undefined = unclaimedRecordState(unclaimed)
   const overall = recordState ?? sectionState
   const states = detectRouteStates(sections, record, routeIds, sectionState)
   const authority: RouteWriterConfig = {

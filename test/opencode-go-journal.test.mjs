@@ -538,6 +538,184 @@ await checkAsync('reconcile store failure keeps the journal for a later retry', 
 })
 
 // ---------------------------------------------------------------------------
+// 7a. N-1: raw-type corrupted journal slots (warn + clean), non-journal keys safe
+// ---------------------------------------------------------------------------
+
+await checkAsync('N-1: primitive/null journal slots warn + are cleaned, reconciliation continues, non-journal keys untouched', async () => {
+  const { mkdtemp, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { loadModelsStore, resetModelsStoreCache } = await import('../lib/remote-catalog.js')
+  const dir = await mkdtemp(join(tmpdir(), 'c2-raw-journal-'))
+  try {
+    const accessor = loadModelsStore(join(dir, 'models-store.json'))
+    const store = createFileJournalStore(accessor)
+    const settings = mockSettings({ 'opencode-go': { models: [model('keep-me')] } })
+    const validKey = goJournalKey(PROFILE, 'opencode-go', FP)
+    await accessor.writeRaw(validKey, {
+      version: 1, profileKey: PROFILE, route: 'opencode-go', keyFingerprint: FP,
+      modelIds: ['keep-me'], contentHash: journalContentHash([model('keep-me')]),
+      unset: false, entry: { managed: { 'keep-me': { hash: 'h' } } }, at: 1,
+    })
+    const corrupted = [
+      goJournalKey(PROFILE, 'opencode-go-msg', FP),
+      goJournalKey(PROFILE, 'opencode-go-resp', FP),
+      goJournalKey(PROFILE, 'opencode-go-extra', FP),
+    ]
+    await accessor.writeRaw(corrupted[0], 'not-a-journal')
+    await accessor.writeRaw(corrupted[1], 42)
+    await accessor.writeRaw(corrupted[2], null)
+    // Non-journal keys with primitive values must NEVER be touched.
+    const foreignKey = goJournalKey('other-profile', 'opencode-go', FP)
+    await accessor.writeRaw(foreignKey, null)
+    await accessor.writeRaw('plain-non-journal-key', 'keep-me')
+
+    const ledger = memoryOwnership()
+    const recorded = []
+    const result = await reconcileJournals({
+      journalStore: store, ownershipStore: ledger, settings,
+      profileKey: PROFILE, keyFingerprint: FP,
+      logger: { info() {}, warn() {}, debug() {} },
+      onRecord: (route, ids) => { recorded.push([route, ids]) },
+    })
+
+    const rawNotices = result.notices.filter((n) => n.code === 'journal-unparseable' && n.rawTypeCorrupt === true)
+    assert.equal(rawNotices.length, 3, result.text)
+    assert.match(rawNotices[0].message, /raw-type corruption/, 'the raw-type case is recognizable')
+    assert.ok(result.notices.every((n) => n.level !== 'error'))
+    assert.deepEqual(result.reconciled, ['opencode-go'], 'a healthy slot still reconciles in the same round')
+    assert.equal(result.discarded.length, 3)
+    for (const key of corrupted) {
+      assert.equal(await accessor.readRaw(key), undefined, `corrupt slot ${key} was cleaned`)
+    }
+    assert.deepEqual(recorded, [['opencode-go', ['keep-me']]])
+    assert.ok((await ledger.read(goOwnershipKey('opencode-go', FP)))?.managed['keep-me'] !== undefined)
+    assert.equal(await accessor.readRaw(foreignKey), null, 'another profile\'s slot is not deleted')
+    assert.equal(await accessor.readRaw('plain-non-journal-key'), 'keep-me', 'non-journal key is not deleted')
+  } finally {
+    resetModelsStoreCache()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 7b. N-2: store enumeration failure surfaces journal-list-failed (not silent)
+// ---------------------------------------------------------------------------
+
+await checkAsync('N-2: list failure surfaces journal-list-failed, skips reconciliation visibly, recovers next round', async () => {
+  const seed = mockSettings()
+  const h = await makeHarness({ migrationRecord: appliedRecord(seed), fault: { ledgerWrite: true } })
+  await h.round()
+  assert.equal((await h.journalStore.list(PROFILE)).length, 3, 'premise: journals survive a ledger failure')
+  const inner = h.journalStore
+  let failList = true
+  const failingStore = {
+    ...inner,
+    async list(profileKey) {
+      if (failList) throw new Error('models-store.json unreadable (seam)')
+      return inner.list(profileKey)
+    },
+  }
+  let recorded = 0
+  const skipped = await reconcileJournals({
+    journalStore: failingStore, ownershipStore: h.ownershipStore, settings: h.settings,
+    profileKey: PROFILE, keyFingerprint: FP,
+    logger: { info() {}, warn() {}, debug() {} },
+    onRecord: () => { recorded += 1 },
+  })
+  assert.equal(skipped.reconciled.length, 0)
+  assert.ok(skipped.notices.some((n) => n.code === 'journal-list-failed'), 'enumeration failure is a recognizable notice')
+  assert.match(skipped.lines.join('\n'), /journal-list-failed/, 'notice is visible in the round lines')
+  assert.equal(recorded, 0, 'no ledger/record re-commit when enumeration failed')
+  assert.equal((await h.journalStore.list(PROFILE)).length, 3, 'journals kept, not treated as "no journal"')
+
+  // The notice must also be visible through the real round/report surface.
+  const gated = await h.round({ journalStore: failingStore })
+  assert.ok(gated.journal?.notices.some((n) => n.code === 'journal-list-failed'), gated.text)
+  assert.match(gated.text, /journal-list-failed/, gated.text)
+
+  failList = false
+  h.fault.ledgerWrite = false
+  const recovered = await h.round({ journalStore: failingStore })
+  assert.equal(recovered.reason, 'completed', recovered.text)
+  assert.equal(recovered.journal.reconciled.length, 3, 'recovery converges the kept journals')
+  assert.deepEqual(await h.journalStore.list(PROFILE), [])
+})
+
+await checkAsync('N-2 file store: an unreadable models-store.json makes list() throw, not return []', async () => {
+  const { mkdtemp, rm, readFile, writeFile } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { loadModelsStore, resetModelsStoreCache } = await import('../lib/remote-catalog.js')
+  const dir = await mkdtemp(join(tmpdir(), 'c2-list-fail-'))
+  try {
+    const file = join(dir, 'models-store.json')
+    const accessor = loadModelsStore(file)
+    const store = createFileJournalStore(accessor)
+    const key = goJournalKey(PROFILE, 'opencode-go', FP)
+    await accessor.writeRaw(key, {
+      version: 1, profileKey: PROFILE, route: 'opencode-go', keyFingerprint: FP,
+      modelIds: ['x'], contentHash: 'h', unset: false,
+      entry: { managed: { x: { hash: 'h' } } }, at: 1,
+    })
+    assert.deepEqual(await store.list(PROFILE), [key], 'healthy store enumerates the journal')
+    const goodBytes = await readFile(file, 'utf8')
+
+    await writeFile(file, '{not-json', 'utf8')
+    await assert.rejects(() => store.list(PROFILE), 'enumeration failure is no longer swallowed')
+    const result = await reconcileJournals({
+      journalStore: store, ownershipStore: memoryOwnership(), settings: mockSettings(),
+      profileKey: PROFILE, keyFingerprint: FP, logger: { info() {}, warn() {}, debug() {} },
+    })
+    assert.ok(result.notices.some((n) => n.code === 'journal-list-failed'), 'the real file-store path surfaces the notice')
+    assert.equal(result.reconciled.length, 0)
+
+    await writeFile(file, goodBytes, 'utf8')
+    assert.deepEqual(await store.list(PROFILE), [key], 'recovery restores enumeration')
+  } finally {
+    resetModelsStoreCache()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 7c. Journal write failure is fail-closed: zero settings writes, then converges
+// ---------------------------------------------------------------------------
+
+await checkAsync('journal write failure: zero settings/ledger/fingerprint writes, journal-unavailable reason, next round converges', async () => {
+  const h = await makeHarness()
+  const inner = h.journalStore
+  let failWrite = true
+  const failingStore = {
+    ...inner,
+    async write(key, journal) {
+      if (failWrite) throw new Error('journal store lock timeout (seam)')
+      return inner.write(key, journal)
+    },
+  }
+  const first = await h.round({ journalStore: failingStore })
+  assert.equal(first.reason, 'write-failed', first.text)
+  assert.equal(first.write.settingsLandedRoutes.length, 0, 'no settings mutate landed')
+  assert.equal(first.write.writtenRoutes.length, 0)
+  assert.deepEqual(first.write.failedRoutes.map((f) => f.reason).sort(),
+    ['journal-unavailable', 'journal-unavailable', 'journal-unavailable'])
+  assert.ok(first.write.report.some((e) => e.code === 'journal-unavailable'), first.text)
+  assert.match(first.text, /journal-unavailable/)
+  assert.equal(h.settings.mutations.length, 0, 'zero settings writes')
+  assert.equal(h.ownershipBase.map.size, 0, 'zero ledger writes')
+  assert.equal(h.migrationStore.get(), undefined, 'zero fingerprint/record writes')
+  assert.deepEqual(await h.journalStore.list(PROFILE), [], 'no partially written journal')
+
+  failWrite = false
+  const second = await h.round({ journalStore: failingStore })
+  assert.equal(second.reason, 'completed', second.text)
+  assert.equal(second.write.writtenRoutes.length, 3)
+  assert.equal(h.settings.mutations.length, 3, 'journal recovery unblocks the normal write path')
+  assert.deepEqual(await h.journalStore.list(PROFILE), [], 'fully accounted write closes its journal')
+  assert.ok((await h.migrationStore.read())?.appliedIdentity !== undefined)
+})
+
+// ---------------------------------------------------------------------------
 // 8. Healthy path: journals written and cleaned; no extra settings writes
 // ---------------------------------------------------------------------------
 

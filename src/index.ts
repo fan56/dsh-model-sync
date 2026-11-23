@@ -108,9 +108,11 @@ import {
   migrationStatusOf,
   readGoProviderSections,
   routeWriter,
+  unclaimedRecordState,
   type MigrationRecord,
   type MigrationStatus,
   type MigrationStateStore,
+  type UnclaimedMigrationRecord,
 } from './opencode-go-migration.ts'
 import { goOwnershipKey } from './opencode-go-planner.ts'
 import {
@@ -562,6 +564,22 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
           : ownership.read(goOwnershipKey(route, fp)))
     }
     const status = migrationStatusOf(desc, record, goRoutes, managedIds)
+    // W1/D6: the go report and `migrate status` must agree on the label for a
+    // record this profile cannot claim. Use the SAME helper as migrate status;
+    // only when our own scoped read() found no record (B1 isolation). This is
+    // label-only: both states already keep the gate closed / write authority
+    // none / zero writes, and nothing is claimed or deleted.
+    if (record === undefined && store?.unclaimedRecords !== undefined) {
+      let unclaimed: UnclaimedMigrationRecord[]
+      try {
+        unclaimed = await store.unclaimedRecords()
+      } catch (err) {
+        if (opts.strict === true) throw err
+        unclaimed = [] // advisory provenance scan never changes the gate
+      }
+      const recordState = unclaimedRecordState(unclaimed)
+      if (recordState !== undefined) status.state = recordState
+    }
     // N2: a non-strict refresh that degraded because no identity was available
     // must be VISIBLE — log the actionable error (covers boot / document-updated
     // refresh where there is no report line) and tag the status so sync reports

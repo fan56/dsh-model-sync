@@ -419,13 +419,22 @@ export interface ModelsStoreAccessor {
    * collide with a provider route id. Raw reads stay strict — an unreadable
    * file throws, so callers can decide whether to fail closed or degrade to
    * "no ledger" (store loss degrades to never-delete).
+   *
+   * The VALUE is returned verbatim (unstructured): `undefined` means the key is
+   * absent, while a present primitive/null slot is returned as-is so callers
+   * can detect and clean raw-type corruption instead of silently losing it.
    */
-  readRaw(key: string): Promise<Record<string, unknown> | undefined>
+  readRaw(key: string): Promise<unknown>
   /** Queue-serialized replacement of one opaque slot (atomic temp+rename). */
   writeRaw(key: string, value: Record<string, unknown>): Promise<void>
   /** Queue-serialized removal of one opaque slot. */
   deleteRaw(key: string): Promise<void>
-  /** All top-level keys currently in the document, for legacy-key detection. */
+  /**
+   * All top-level keys currently in the document, for legacy-key detection and
+   * journal enumeration. An unreadable store THROWS (never an empty list): a
+   * caller that would silently treat [] as "no journals / no legacy keys" must
+   * surface the enumeration failure instead.
+   */
   listRawKeys(): Promise<string[]>
 }
 
@@ -601,11 +610,13 @@ export function loadModelsStore(storePath?: string): ModelsStoreAccessor {
     // a concurrent `update`/`updateOverrides` can never clobber each other's
     // slots in models-store.json. Keys carrying `#` are ledger entries, not
     // route ids, so `read(route)`/`update(route)` never see them.
-    readRaw: async (key: string): Promise<Record<string, unknown> | undefined> => {
-      const value = (await readDoc())[key]
-      return value !== undefined && typeof value === 'object' && !Array.isArray(value)
-        ? value as unknown as Record<string, unknown>
-        : undefined
+    readRaw: async (key: string): Promise<unknown> => {
+      // Return the slot verbatim. Only `undefined` (key absent, or a JSON doc
+      // that never carried the key) means "no slot"; a present string/number/
+      // null/array is surfaced so the journal store can warn + clean it under
+      // its key-shape/profile safety check instead of silently degrading to
+      // "no journal". Object-shape consumers still validate the type themselves.
+      return (await readDoc())[key]
     },
     writeRaw: (key: string, value: Record<string, unknown>): Promise<void> =>
       enqueue(async () => {
@@ -631,13 +642,7 @@ export function loadModelsStore(storePath?: string): ModelsStoreAccessor {
         delete (doc as unknown as Record<string, unknown>)[key]
         await writeDoc(doc)
       }),
-    listRawKeys: async (): Promise<string[]> => {
-      try {
-        return Object.keys(await readDoc())
-      } catch {
-        return [] // unreadable store ⇒ nothing to report (advisory only)
-      }
-    },
+    listRawKeys: async (): Promise<string[]> => Object.keys(await readDoc()),
   }
 
   // Only cache the default-path accessor (singleton)

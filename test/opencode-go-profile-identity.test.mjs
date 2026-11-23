@@ -516,6 +516,32 @@ test('D6: foreign-profile record → distinct label, writeAuthority=none, zero w
   }
 })
 
+test('W1: migrate status and go report agree on the label for the same foreign-profile state', async () => {
+  await resetStore({
+    'opencode-go': structuredClone(LEGACY_CHAT),
+    [`A#${GO_MIGRATION_STORE_KEY}`]: { profileKey: 'B', appliedIdentity: APPLIED_IDENTITY },
+  })
+  let inst
+  try {
+    inst = makeInstance({ identity: IDENTITY_A, initialRoutes: { 'opencode-go': structuredClone(LEGACY_CHAT) } })
+    const before = await readFile(STORE_FILE, 'utf8')
+    const statusText = (await inst.invoke('migrate status')).text
+    const goText = (await inst.invoke('go')).text
+
+    const statusLabel = /status: ([a-z-]+)/.exec(statusText)?.[1]
+    const goLabel = /migration gate: ([a-z-]+)/.exec(goText)?.[1]
+    assert.equal(statusLabel, 'foreign-profile', statusText)
+    assert.equal(goLabel, statusLabel, `go report label must match migrate status; go text=${goText}`)
+    assert.doesNotMatch(goText, /migration gate: legacy-inline/, 'no misleading "ordinary un-migrated" label')
+    assert.equal(inst.settings.mutations.length, 0, 'zero settings writes')
+    assert.equal(inst.fetchCalls.length, 0, 'zero source requests')
+    assert.equal(await readFile(STORE_FILE, 'utf8'), before, 'store bytes unchanged')
+  } finally {
+    inst?.dispose()
+    await rm(LOCK_PATH, { force: true })
+  }
+})
+
 test('D6: legacy unscoped record → distinct label, writeAuthority=none, zero writes', async () => {
   await resetStore({
     'opencode-go': structuredClone(LEGACY_CHAT),

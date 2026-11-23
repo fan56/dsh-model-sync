@@ -37,18 +37,22 @@ export function createFileOwnershipStore(
   const slot = (key: string): string => profileKey === undefined ? key : scopedStoreKey(profileKey, key)
   return {
     async read(key: string): Promise<GoOwnershipEntry | undefined> {
-      let raw: Record<string, unknown> | undefined
+      let raw: unknown
       try {
         raw = await accessor.readRaw(slot(key))
       } catch {
         // Corrupt file / EACCES: no ledger. Never infer one, never delete.
         return undefined
       }
-      if (raw === undefined || typeof raw.managed !== 'object' || raw.managed === null
-        || Array.isArray(raw.managed)) {
+      // readRaw now returns the slot verbatim; a present primitive/null slot is
+      // NOT a ledger entry (same conservative "no ledger" direction as before).
+      if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+      const record = raw as Record<string, unknown>
+      if (typeof record.managed !== 'object' || record.managed === null
+        || Array.isArray(record.managed)) {
         return undefined
       }
-      return raw as unknown as GoOwnershipEntry
+      return record as unknown as GoOwnershipEntry
     },
     async write(key: string, entry: GoOwnershipEntry): Promise<void> {
       await accessor.writeRaw(slot(key), entry as unknown as Record<string, unknown>)

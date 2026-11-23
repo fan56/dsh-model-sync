@@ -459,10 +459,10 @@ async function writeJournal(
     await deps.journalStore.write(key, journal)
     return true
   } catch (err) {
-    // Journal persistence failure degrades to the pre-C2 path: do NOT block the
-    // settings write (that would change lock-timeout / gate semantics). The
-    // honest `settings-written-unaccounted` report still covers this rare
-    // residual window; the next round simply has no journal to reconcile.
+    // Fail closed: the caller refuses the settings mutate when the journal did
+    // not land. Writing settings without a journal recreates the S1/S2/S3
+    // window (user-owned route, closed gate, hash-mismatch rollback) with no
+    // record to reconcile on the next round.
     deps.logger.warn('write-ahead journal write failed for %s: %s', input.route, errorText(err))
     return false
   }
@@ -868,6 +868,20 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
         unset: planned.unset,
         expectedRevision: currentExpectedRevision,
       })
+      if (!journalWritten) {
+        // Fail closed: no journal means no way to re-account this write next
+        // round. Refuse the settings mutate entirely (zero settings/ledger/
+        // fingerprint writes for this route) with an identifiable reason.
+        failedReason = 'journal-unavailable'
+        logger.warn('write-ahead journal unavailable for %s; refusing settings mutate (fail-closed)', planned.route)
+        report.push({
+          level: 'error',
+          code: 'journal-unavailable',
+          route: planned.route,
+          slot: planned.slot,
+          message: `route ${planned.route} not written: the write-ahead journal could not be persisted; zero settings writes (fail-closed)`,
+        })
+      }
     }
 
     // O1/C2: re-run the freshness check AFTER the journal store write, so the
@@ -948,9 +962,13 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
               continue
             }
             // O1/C2: the retry may write a different models array; refresh the
-            // journal so reconciliation hashes the value actually written.
+            // journal so reconciliation hashes the value actually written. A
+            // failed refresh is fail-closed too: mutating with the FIRST
+            // attempt's stale journal would give reconciliation a hash mismatch
+            // (journal-stale) and recreate the S1/S2/S3 window.
+            let retryJournalWritten = true
             if (jkey !== undefined && journalWritten) {
-              await writeJournal(deps, jkey, {
+              retryJournalWritten = await writeJournal(deps, jkey, {
                 route: planned.route,
                 models: retryBuilt.models,
                 entry: nextEntry,
@@ -958,11 +976,24 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
                 expectedRevision: currentExpectedRevision,
               })
             }
-            await stageOverrides(deps.overrideStorer, planned.route, retryBuilt.settingsOverrides)
-            await settings.mutate('llm-pi-ai', retryBuilt.ops, fresh.revision)
-            settingsLanded = true
-            result.settingsLandedRoutes.push(planned.route)
-            failedReason = undefined
+            if (!retryJournalWritten) {
+              await deleteJournal(deps, jkey)
+              failedReason = 'journal-unavailable'
+              logger.warn('write-ahead journal unavailable on conflict retry for %s; refusing settings mutate (fail-closed)', planned.route)
+              report.push({
+                level: 'error',
+                code: 'journal-unavailable',
+                route: planned.route,
+                slot: planned.slot,
+                message: `route ${planned.route} not written: the write-ahead journal could not be refreshed on conflict retry; zero settings writes (fail-closed)`,
+              })
+            } else {
+              await stageOverrides(deps.overrideStorer, planned.route, retryBuilt.settingsOverrides)
+              await settings.mutate('llm-pi-ai', retryBuilt.ops, fresh.revision)
+              settingsLanded = true
+              result.settingsLandedRoutes.push(planned.route)
+              failedReason = undefined
+            }
           } catch (retryErr) {
             if (isStoreLockTimeout(retryErr)) {
               recordLockTimeout(result, report, planned, retryErr, 'write (conflict retry)')

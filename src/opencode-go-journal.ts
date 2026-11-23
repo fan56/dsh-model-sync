@@ -57,6 +57,12 @@ export interface JournalReadResult {
   journal?: GoWriteJournal
   /** Slot existed but could not be parsed — treat as "no journal" + warn. */
   parseError?: string
+  /**
+   * The slot held a primitive/null (not an object at all). Such a value can
+   * never carry a journal; reconciliation warns AND cleans it (after the
+   * key-shape/profile check), unlike a plain parse error on an object slot.
+   */
+  rawTypeCorrupt?: boolean
 }
 
 export interface GoJournalStore {
@@ -151,13 +157,22 @@ export function parseJournal(raw: unknown): { journal?: GoWriteJournal; error?: 
 export function createFileJournalStore(accessor: ModelsStoreAccessor): GoJournalStore {
   return {
     async read(key) {
-      let raw: Record<string, unknown> | undefined
+      let raw: unknown
       try {
         raw = await accessor.readRaw(key)
       } catch (err) {
         return { parseError: `journal read failed: ${errorText(err)}` }
       }
       if (raw === undefined) return {}
+      if (!isRecord(raw)) {
+        // A primitive/null slot is not "no journal" — it is corruption that
+        // can never carry a valid journal. Flag it so reconciliation warns and
+        // cleans it under the key-shape/profile safety check.
+        return {
+          parseError: `journal slot held a non-object value (${raw === null ? 'null' : typeof raw})`,
+          rawTypeCorrupt: true,
+        }
+      }
       const parsed = parseJournal(raw)
       return parsed.journal !== undefined
         ? { journal: parsed.journal }
@@ -170,11 +185,10 @@ export function createFileJournalStore(accessor: ModelsStoreAccessor): GoJournal
       await accessor.deleteRaw(key)
     },
     async list(profileKey) {
-      try {
-        return (await accessor.listRawKeys()).filter((key) => isJournalKey(key, profileKey))
-      } catch {
-        return []
-      }
+      // Do NOT swallow enumeration failures. An unreadable store must reach
+      // reconcileJournals' try/catch and surface `journal-list-failed`, not be
+      // mistaken for "no journals this round".
+      return (await accessor.listRawKeys()).filter((key) => isJournalKey(key, profileKey))
     },
     async clearProfile(profileKey) {
       const keys = await this.list(profileKey)
@@ -207,6 +221,8 @@ export interface JournalNotice {
   level: 'info' | 'warn' | 'error'
   key: string
   message: string
+  /** True for a primitive/null slot (vs an object that merely failed parsing). */
+  rawTypeCorrupt?: boolean
 }
 
 export interface ReconcileResult {
@@ -244,6 +260,8 @@ function rawModels(desc: SettingsDescriptor | undefined, route: string): Setting
  *   hash differs → the user edited the value: discard journal, keep their value;
  *   wrong scope  → orphan (profile/key rotation): discard journal;
  *   parse fail   → treat as no journal, warn, discard;
+ *   raw-type slot → warn (journal-unparseable + rawTypeCorrupt flag) and clean
+ *                  it after a journal-key / profile safety check;
  *   store fail   → keep journal for the next round, never block the round.
  */
 export async function reconcileJournals(deps: ReconcileDeps): Promise<ReconcileResult> {
@@ -288,8 +306,23 @@ export async function reconcileJournals(deps: ReconcileDeps): Promise<ReconcileR
     }
     if (read.parseError !== undefined) {
       deps.logger.warn('unparseable journal %s: %s', key, read.parseError)
-      notice({ code: 'journal-unparseable', level: 'warn', key, message: `${read.parseError}; journal discarded (treated as no journal)` })
-      try { await deps.journalStore.delete(key) } catch { /* best effort */ }
+      if (read.rawTypeCorrupt === true) {
+        // A primitive/null slot can never carry a valid journal. Same warn code
+        // as an object-shape parse failure, but flagged and explicitly worded so
+        // the raw-type case is recognizable. Clean it ONLY after re-confirming
+        // the slot is a journal-shaped key of THIS profile — never touch a
+        // foreign or non-journal key that happens to hold a primitive.
+        notice({
+          code: 'journal-unparseable', level: 'warn', key, rawTypeCorrupt: true,
+          message: `${read.parseError}; raw-type corruption (cannot carry a journal) — slot discarded and cleaned`,
+        })
+        if (isJournalKey(key, deps.profileKey)) {
+          try { await deps.journalStore.delete(key) } catch { /* best effort */ }
+        }
+      } else {
+        notice({ code: 'journal-unparseable', level: 'warn', key, message: `${read.parseError}; journal discarded (treated as no journal)` })
+        try { await deps.journalStore.delete(key) } catch { /* best effort */ }
+      }
       result.discarded.push(key)
       continue
     }

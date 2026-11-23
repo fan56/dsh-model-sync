@@ -114,6 +114,22 @@ export interface UnclaimedMigrationRecord {
   profileKey?: string
 }
 
+/**
+ * D6: the ONE computation of the "unclaimable record" status label. Both
+ * `migrate status` (opencode-go-migrate.ts) and the go report's status refresh
+ * (index.ts `loadMigrationStatus`) use this helper, so the same store state
+ * yields the same label in both commands (W1). Call only when the profile's own
+ * scoped read() found no record — a foreign record must never relabel a profile
+ * that already has its own applied/drifted record (B1 isolation).
+ */
+export function unclaimedRecordState(
+  unclaimed: readonly UnclaimedMigrationRecord[],
+): MigrationState | undefined {
+  if (unclaimed.some((record) => record.kind === 'foreign-profile')) return 'foreign-profile'
+  if (unclaimed.length > 0) return 'legacy-store'
+  return undefined
+}
+
 /** Migration record seam. `write` / `legacyKeys` are optional so read-only test stores keep working. */
 export interface MigrationStateStore {
   read(): Promise<MigrationRecord | undefined>
@@ -480,7 +496,7 @@ export function createFileMigrationStateStore(
     : scopedStoreKey(profileKey, GO_MIGRATION_STORE_KEY)
   return {
     async read(): Promise<MigrationRecord | undefined> {
-      let raw: Record<string, unknown> | undefined
+      let raw: unknown
       try {
         raw = await accessor.readRaw(slot)
       } catch {
@@ -512,7 +528,7 @@ export function createFileMigrationStateStore(
         const isUnscopedSlot = key === GO_MIGRATION_STORE_KEY
         const isScopedSlot = !isUnscopedSlot && key.endsWith(`#${GO_MIGRATION_STORE_KEY}`)
         if (!isUnscopedSlot && !isScopedSlot) continue
-        let raw: Record<string, unknown> | undefined
+        let raw: unknown
         try {
           raw = await accessor.readRaw(key)
         } catch {
