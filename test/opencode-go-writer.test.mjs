@@ -104,6 +104,7 @@ function createMockSettings({
   revision = 1,
   throwFor = {},
   conflictOnce = [],
+  afterMutate,
 } = {}) {
   const state = new Map(Object.entries(routes).map(([route, data]) => [route, structuredClone(data)]))
   const mutations = []
@@ -112,6 +113,7 @@ function createMockSettings({
   return {
     mutations,
     state,
+    get revision() { return currentRevision },
     /** Test seam: simulate an external settings edit landing mid-round. */
     bumpRevision() { currentRevision += 1 },
     describe() {
@@ -140,6 +142,9 @@ function createMockSettings({
       }
       for (const op of ops) applyOp(state, op)
       currentRevision += 1
+      // Test seam: an external edit that lands AFTER our ops are committed but
+      // BEFORE mutate() returns — i.e. before the writer's post-mutate re-read.
+      if (afterMutate !== undefined) await afterMutate({ state, bumpRevision: () => { currentRevision += 1 } })
     },
   }
 }
@@ -707,6 +712,69 @@ await checkAsync('guard (N1): SETTINGS_CONFLICT after the freshness check → ab
   assert.equal(out.routes[0].reason, 'settings-changed-during-sync')
 })
 
+await checkAsync('guard (N1 residual): user edit between mutate() and the post-mutate re-read abandons the round, keeps the edit and writes nothing more', async () => {
+  const userModel = { id: 'user-saved-after-write', name: 'user' }
+  let edits = 0
+  const settings = createMockSettings({
+    revision: 1,
+    afterMutate: async ({ state, bumpRevision }) => {
+      // Our chat ops are already committed and the revision advanced, but
+      // mutate() has not returned yet: the exact residual window under test.
+      edits += 1
+      state.set('opencode-go-msg', {
+        apiKeyEnv: 'OPENCODE_GO_API_KEY',
+        api: 'anthropic-messages',
+        baseURL: MSG_BASE_OFFICIAL,
+        models: [structuredClone(userModel)],
+      })
+      bumpRevision() // the user's edit bumps revision again
+    },
+  })
+  const plan = planGoRoutes({
+    keyFingerprint: KEY,
+    entries: [chatEntry('hy4'), msgEntry('qwen4-max'), respEntry('grok-4.7')],
+    currentRoutes: {},
+    ownership: {},
+  })
+  const store = createMockStore()
+  const out = await writeGoPlan(plan, deps(settings, store, { expectedRevision: 1 }))
+
+  assert.equal(edits, 1, 'the mid-window edit seam fired exactly once')
+  assert.ok(out.settingsChanged, 'round abandoned with settingsChanged')
+  assert.deepEqual(out.settingsLandedRoutes, ['opencode-go'], 'only the first mutate landed')
+  assert.equal(settings.mutations.length, 1, 'zero additional settings writes')
+  assert.equal(store.writes.length, 0, 'no ledger write after the abandoned mutate')
+  assert.deepEqual(settings.state.get('opencode-go-msg').models, [userModel], 'user edit preserved byte-for-byte')
+  assert.equal(settings.state.has('opencode-go-resp'), false, 'later routes untouched')
+  assert.equal(out.routes.find((r) => r.route === 'opencode-go-msg').reason, 'settings-changed-during-sync')
+  assert.equal(out.routes.find((r) => r.route === 'opencode-go-resp').reason, 'settings-changed-during-sync')
+  const report = out.report.find((e) => e.code === 'settings-changed-during-sync')
+  assert.ok(report)
+  assert.match(report.message, /already written: \[opencode-go\]/, 'landed route reported honestly')
+  assert.match(report.message, /discarded \(no settings write\): \[opencode-go-msg, opencode-go-resp\]/)
+})
+
+await checkAsync('guard (N1 residual): no mid-window edit lets all three routes write; the next round is idempotent', async () => {
+  const settings = createMockSettings({ revision: 1 })
+  const store = createMockStore()
+  const plan = planGoRoutes({
+    keyFingerprint: KEY,
+    entries: [chatEntry('hy4'), msgEntry('qwen4-max'), respEntry('grok-4.7')],
+    currentRoutes: {},
+    ownership: {},
+  })
+  const first = await writeGoPlan(plan, deps(settings, store, { expectedRevision: 1 }))
+  assert.equal(first.settingsChanged, undefined, 'clean round is not abandoned')
+  assert.deepEqual([...first.writtenRoutes].sort(), ['opencode-go', 'opencode-go-msg', 'opencode-go-resp'])
+  assert.equal(settings.mutations.length, 3, 'one mutate per route')
+  assert.equal(store.writes.length, 3, 'one ledger commit per route')
+
+  const second = await writeGoPlan(plan, deps(settings, store, { expectedRevision: settings.revision }))
+  assert.equal(second.settingsChanged, undefined)
+  assert.ok(second.routes.every((r) => r.status === 'no-change'))
+  assert.equal(settings.mutations.length, 3, 'idempotent: no new settings mutate')
+})
+
 // ---------------------------------------------------------------------------
 // 8b. §14.7.5 second gate + §14.7.4 fingerprint persistence
 // ---------------------------------------------------------------------------
@@ -1051,7 +1119,8 @@ const asSource = () => ({ entries: [], keyFingerprint: KEY, payloadHash: 'abc' }
 // O1-minimal: the lock timeout on the ledger commit happens AFTER settings
 // landed. The old `store-lock-timeout` code + "The store was NOT modified.
 // Retry the operation" text were misleading (retry cannot re-claim the route).
-// Keep the actionable error detail verbatim, but report the truthful new code.
+// Keep the lock diagnostics (path/wait), but strip those two false sentences
+// and report the truthful new code + reconciliation/claim advice.
 await checkAsync('N2/O1: lock timeout on ledger commit is truthful (settings landed, unaccounted) and still actionable', async () => {
   const plan = planGoRoutes({
     keyFingerprint: KEY, entries: [chatEntry('hy4')], currentRoutes: {}, ownership: {},
@@ -1067,9 +1136,10 @@ await checkAsync('N2/O1: lock timeout on ledger commit is truthful (settings lan
   assert.ok(entry.message.includes(LOCK_PATH), 'report must carry the lock path')
   const text = formatGoRoundReport(asSource(), out)
   assert.ok(text.includes(LOCK_PATH), 'user-visible text must name the lock path')
-  assert.ok(text.includes('Retry the operation'), 'original error detail is kept verbatim for diagnosis')
-  assert.ok(text.includes('check other running dsh processes'), 'original process advice is kept')
+  assert.doesNotMatch(text, /The store was NOT modified/i, 'no false "store not modified" claim after settings landed')
+  assert.doesNotMatch(text, /Retry the operation/i, 'no misleading retry advice after settings landed')
   assert.match(text, /settings were written but the ownership ledger was not updated/, 'truthful unaccounted state is stated')
+  assert.match(text, /reconciles the write-ahead journal/, 'next-round reconciliation is stated')
   assert.match(text, /user-owned/, 'next-round user-owned consequence is stated')
   assert.match(text, /\/model-sync adopt go/, 'recovery command is stated')
 })
@@ -1142,8 +1212,9 @@ await checkAsync('N4: plain-object lock error is readable (no [object Object]) a
   const text = formatGoRoundReport(asSource(), out)
   assert.equal(text.includes('[object Object]'), false, 'user-visible text must not degrade to [object Object]')
   assert.ok(text.includes(LOCK_PATH), 'user-visible text must carry the lock path')
-  assert.ok(text.includes('Retry the operation'), 'user-visible text must carry the retry advice')
-  assert.ok(text.includes('check other running dsh processes'), 'user-visible text must carry the process advice')
+  assert.doesNotMatch(text, /The store was NOT modified/i, 'plain-object lock detail must not claim the store was untouched')
+  assert.doesNotMatch(text, /Retry the operation/i, 'plain-object lock detail must not advise a futile retry')
+  assert.match(text, /settings were written but the ownership ledger was not updated/, 'truthful state is still stated')
 })
 
 // ---------------------------------------------------------------------------

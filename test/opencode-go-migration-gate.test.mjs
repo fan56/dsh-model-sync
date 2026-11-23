@@ -14,7 +14,8 @@ import {
   fingerprintGoIdentity,
   fingerprintSection,
 } from '../lib/opencode-go-migration.js'
-import { planGoRouteFields } from '../lib/opencode-go-planner.js'
+import { goOwnershipKey, planGoRouteFields } from '../lib/opencode-go-planner.js'
+import { fingerprintKey } from '../lib/opencode-go-source.js'
 import { createFileOwnershipStore } from '../lib/opencode-go-store.js'
 import {
   GO_FETCH_SERVICE,
@@ -120,7 +121,7 @@ function makeConfig(overrides = {}) {
  * - { applying: true, ... } → M-5 applying state
  */
 function createHarness({
-  initialRoutes = {}, migrationRecord = 'applied', configOverrides = {}, payloads,
+  initialRoutes = {}, migrationRecord = 'applied', configOverrides = {}, payloads, ledgerSeed = {},
 } = {}) {
   const settings = mockSettings(initialRoutes)
   const logs = []
@@ -152,8 +153,9 @@ function createHarness({
     get record() { return storedRecord === undefined ? undefined : structuredClone(storedRecord) },
   }
   // Real in-memory ledger: the writer's managed-id commits are visible to the
-  // live migration-status reads (§14.7.4 fingerprint contract).
-  const ledgerData = new Map()
+  // live migration-status reads (§14.7.4 fingerprint contract). `ledgerSeed`
+  // models a post-apply ledger for onboarding tests (keys are full ledger keys).
+  const ledgerData = new Map(Object.entries(ledgerSeed).map(([k, v]) => [k, structuredClone(v)]))
   const ownership = {
     async read(key) { const value = ledgerData.get(key); return value === undefined ? undefined : structuredClone(value) },
     async write(key, entry) { ledgerData.set(key, structuredClone(entry)) },
@@ -429,6 +431,53 @@ await checkAsync('§14.7.4: stale appliedFingerprint with matching identity self
   assert.ok(h.settings.mutations.length > 0, 'healed round still writes')
   assert.ok(h.logs.some((line) => line.includes('fingerprint-healed')), `heal logged; logs=${JSON.stringify(h.logs)}`)
   assert.notEqual(h.migrationStore.record.appliedFingerprint, 'stale', 'fingerprint rewritten in the store')
+  h.dispose()
+})
+
+await checkAsync('O1 residual: healthy first round + own write emit no fingerprint-healed; a real stale fingerprint still heals', async () => {
+  // Mirrors a freshly applied migration: the record and ledger carry ONLY the
+  // routes actually written (chat), not `<route>: []` for every configured slot.
+  const identityRoutes = ['opencode-go']
+  const identity = fingerprintGoIdentity({ 'opencode-go': INITIAL['opencode-go'] }, identityRoutes)
+  const managedIds = { 'opencode-go': ['hy4-flash-free', 'seed'] }
+  const record = {
+    appliedIdentity: identity,
+    appliedIdentityRoutes: identityRoutes,
+    appliedManagedIds: managedIds,
+    appliedFingerprint: appliedFingerprintOf(identity, managedIds),
+  }
+  const ledgerSeed = {
+    [goOwnershipKey('opencode-go', fingerprintKey(KEY))]: {
+      routeFields: CHAT_FIELDS,
+      managed: Object.fromEntries(managedIds['opencode-go'].map((id) => [id, { hash: 'seeded' }])),
+    },
+  }
+  const h = createHarness({ initialRoutes: INITIAL, migrationRecord: record, ledgerSeed })
+
+  const first = await h.invoke('go')
+  assert.ok(!first.text.includes('migration gate'), first.text)
+  assert.ok(!h.logs.some((line) => line.includes('fingerprint-healed')),
+    `clean onboarding must not log a phantom heal; logs=${JSON.stringify(h.logs)}`)
+
+  const second = await h.invoke('go')
+  assert.ok(!second.text.includes('migration gate'), second.text)
+  assert.ok(!h.logs.some((line) => line.includes('fingerprint-healed')),
+    `healthy own-write round must not log a phantom heal; logs=${JSON.stringify(h.logs)}`)
+  const healthy = h.migrationStore.record
+  assert.ok(Object.values(healthy.appliedManagedIds).every((ids) => ids.length > 0),
+    'no fabricated empty-route entries in the persisted route set')
+  assert.equal(healthy.appliedFingerprint,
+    appliedFingerprintOf(healthy.appliedIdentity, healthy.appliedManagedIds),
+    'persisted fingerprint matches the shared route-set convention')
+
+  // A genuine mismatch (record fingerprint stale vs present ledger) must still
+  // produce the self-heal notice — the fix must not silence real repairs.
+  await h.migrationStore.write({ ...(await h.migrationStore.read()), appliedFingerprint: 'stale-on-purpose' })
+  const third = await h.invoke('go')
+  assert.ok(!third.text.includes('migration gate'), third.text)
+  assert.ok(h.logs.some((line) => line.includes('fingerprint-healed')),
+    `a real stale fingerprint must still heal; logs=${JSON.stringify(h.logs)}`)
+  assert.notEqual(h.migrationStore.record.appliedFingerprint, 'stale-on-purpose', 'fingerprint repaired')
   h.dispose()
 })
 

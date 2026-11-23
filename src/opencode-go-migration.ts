@@ -258,6 +258,50 @@ export function appliedFingerprintOf(
   return fingerprintSection({ identity, managedIds: managedIds ?? {} })
 }
 
+/**
+ * ONE route-set convention for the two-level applied fingerprint, shared by
+ * `migrationStatusOf` (loadMigrationStatus) and the writer's `onOwnWrite`:
+ * identity routes are the record's `appliedIdentityRoutes` (or the routes
+ * present in settings when the record has none); managed-id routes are exactly
+ * the entries present in the supplied map. A configured-but-absent route must
+ * NOT be fabricated as `<route>: []` — migrate/onOwnWrite persist only routes
+ * with a real ledger entry, and inventing empty ones here makes the first
+ * healthy round look like a fingerprint drift (`fingerprint-healed` noise).
+ */
+export function appliedFingerprintFieldsOf(
+  sections: Record<string, unknown> | undefined,
+  record: { appliedIdentityRoutes?: string[] } | undefined,
+  managedIds: Record<string, string[]> | undefined,
+): { identity: string; appliedFingerprint: string } {
+  const identityRoutes = record?.appliedIdentityRoutes ?? Object.keys(sections ?? {})
+  const identity = fingerprintGoIdentity(sections, identityRoutes)
+  return { identity, appliedFingerprint: appliedFingerprintOf(identity, managedIds) }
+}
+
+/**
+ * Ledger ids for exactly the routes that HAVE a ledger entry. This is the
+ * managed-id half of the shared fingerprint convention above: no entry means
+ * no route in the map (never an empty array), so a normal first onboarding and
+ * a later own write hash identically. Unreadable entries are skipped too —
+ * the strict per-mutate gate already fails closed on a record read failure.
+ */
+export async function goLedgerManagedIds(
+  routes: readonly string[],
+  readEntry: (route: string) => Promise<{ managed?: Record<string, unknown> } | undefined>,
+): Promise<Record<string, string[]>> {
+  const managedIds: Record<string, string[]> = {}
+  for (const route of routes) {
+    let entry: { managed?: Record<string, unknown> } | undefined
+    try {
+      entry = await readEntry(route)
+    } catch {
+      continue // unreadable ledger ⇒ no managed ids (never delete), no fabricated entry
+    }
+    if (entry !== undefined) managedIds[route] = Object.keys(entry.managed ?? {}).sort()
+  }
+  return managedIds
+}
+
 function hasInlineModels(sections: Record<string, unknown>, chatRoute: string): boolean {
   const chat = sections[chatRoute]
   return isRecord(chat) && Array.isArray(chat.models)
@@ -307,10 +351,13 @@ export function migrationStatusOf(
 ): MigrationStatus {
   const sections = readGoProviderSections(source, routes)
   // Compare only the route set the record was written with — routes added by a
-  // later sync round must not invalidate an otherwise unchanged identity.
-  const identity = fingerprintGoIdentity(sections, record?.appliedIdentityRoutes)
+  // later sync round must not invalidate an otherwise unchanged identity. The
+  // shared helper keeps this EXACT route set in sync with onOwnWrite, so a
+  // healthy round cannot emit a phantom `fingerprint-healed`.
   const managedIds = currentManagedIds ?? record?.appliedManagedIds ?? {}
-  const expectedFingerprint = appliedFingerprintOf(identity, managedIds)
+  const { identity, appliedFingerprint: expectedFingerprint } = appliedFingerprintFieldsOf(
+    sections, record, managedIds,
+  )
   return {
     state: migrationStateOf(sections, record, routes?.[0] ?? GO_SLOT_ROUTES.chat),
     fingerprint: fingerprintSection(sections ?? {}),

@@ -100,9 +100,9 @@ import {
 } from './opencode-go-profile.ts'
 import {
   GO_MIGRATION_STORE_SERVICE,
-  appliedFingerprintOf,
+  appliedFingerprintFieldsOf,
   createModelsStoreMigrationStateStore,
-  fingerprintGoIdentity,
+  goLedgerManagedIds,
   isGoRoute,
   MIGRATION_GATE_HINT,
   migrationStatusOf,
@@ -543,7 +543,8 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
     }
     const goRoutes = Object.values(readGoRuntimeConfig(config).value.routes ?? {})
     let managedIds: Record<string, string[]> | undefined
-    if (opts.keyFingerprint !== undefined) {
+    const fp = opts.keyFingerprint
+    if (fp !== undefined) {
       let ownership: GoOwnershipStore | undefined
       try {
         ownership = ownershipStoreForRound()
@@ -551,15 +552,14 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
         if (opts.strict === true) throw err
         if (err instanceof Error && err.message === PROFILE_IDENTITY_REQUIRED_MESSAGE) identityUnavailable = true
       }
-      managedIds = {}
-      for (const route of goRoutes) {
-        try {
-          const entry = await ownership?.read(goOwnershipKey(route, opts.keyFingerprint))
-          managedIds[route] = entry === undefined ? [] : Object.keys(entry.managed ?? {}).sort()
-        } catch {
-          managedIds[route] = [] // unreadable ledger ⇒ no managed ids (never delete)
-        }
-      }
+      // Only routes with a REAL ledger entry join the fingerprint set. The old
+      // `<route>: []` filler for configured-but-absent routes disagreed with
+      // migrate/onOwnWrite and produced a phantom `fingerprint-healed` on the
+      // first healthy round after onboarding.
+      managedIds = await goLedgerManagedIds(goRoutes, (route) =>
+        ownership === undefined
+          ? Promise.resolve(undefined)
+          : ownership.read(goOwnershipKey(route, fp)))
     }
     const status = migrationStatusOf(desc, record, goRoutes, managedIds)
     // N2: a non-strict refresh that degraded because no identity was available
@@ -982,14 +982,18 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
         const liveDesc = rawSettings()?.describe().find((d) => d.ns === 'llm-pi-ai')
         const sections = readGoProviderSections(liveDesc, goRoutes)
         const appliedIdentityRoutes = record?.appliedIdentityRoutes ?? Object.keys(sections ?? {})
-        const identity = fingerprintGoIdentity(sections, appliedIdentityRoutes)
         const appliedManagedIds = { ...(record?.appliedManagedIds ?? {}), [route]: [...managedIds].sort() }
+        // Same helper + route-set convention as loadMigrationStatus: a normal
+        // onboarding/own write must not look like a fingerprint drift next round.
+        const { identity, appliedFingerprint } = appliedFingerprintFieldsOf(
+          sections, record, appliedManagedIds,
+        )
         await store.write({
           ...(record ?? {}),
           appliedIdentity: identity,
           appliedIdentityRoutes,
           appliedManagedIds,
-          appliedFingerprint: appliedFingerprintOf(identity, appliedManagedIds),
+          appliedFingerprint,
         })
       },
     })

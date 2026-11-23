@@ -39,6 +39,7 @@ import {
   type GoJournalStore,
   type GoWriteJournal,
 } from './opencode-go-journal.ts'
+import { fingerprintSection } from './opencode-go-migration.ts'
 
 const SETTINGS_CONFLICT = 'SETTINGS_CONFLICT'
 // O1-minimal: `displayName` is a display field, NOT an identity/ownership field.
@@ -52,11 +53,14 @@ const OWNED_FIELDS = ['api', 'baseURL', 'apiKeyEnv'] as const
 // user-owned) and NOT a lock-only failure either (retrying does nothing). Report
 // it truthfully with its own code + reason + actionable advice.
 const UNACCOUNTED_CODE = 'settings-written-unaccounted'
-const UNACCOUNTED_ADVICE = 'settings were written but the ownership ledger was not updated; the next round will keep this route as user-owned (no refresh, no deletion); re-claim it with `/model-sync adopt go`'
+// O1 residual: once settings landed, "the store was NOT modified / retry the
+// operation" is a lie — the store that failed is the ledger, not settings, and
+// a retry cannot re-claim the route. State the real consequence and recovery.
+const UNACCOUNTED_ADVICE = 'settings were written but the ownership ledger was not updated; retrying cannot re-claim the route; the next round reconciles the write-ahead journal (otherwise keeps this route as user-owned: no refresh, no deletion); re-claim it with `/model-sync adopt go`'
 // Settings + ledger landed, but the migration record persist failed (S1).
 // This is not a failed route (fingerprint-healed next round), but it must not
 // be silent: the next round may see the route as un-migrated and close the gate.
-const RECORD_ADVICE = 'settings and the ownership ledger landed but the migration record could not be persisted; the next round may treat this route as un-migrated and close the gate; re-claim it with `/model-sync adopt go`'
+const RECORD_ADVICE = 'settings and the ownership ledger landed but the migration record could not be persisted; the next round reconciles the write-ahead journal or self-heals via fingerprint-healed, do not simply retry; re-claim it with `/model-sync adopt go`'
 
 // ---------------------------------------------------------------------------
 // Injected seams
@@ -246,6 +250,68 @@ function errorText(err: unknown): string {
   return typeof message === 'string' ? message : String(err)
 }
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+/** Clone a JSON-ish settings value without relying on host-specific prototypes. */
+function cloneSettingsValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(cloneSettingsValue)
+  if (isPlainRecord(value)) {
+    const out: Record<string, unknown> = {}
+    for (const [key, nested] of Object.entries(value)) out[key] = cloneSettingsValue(nested)
+    return out
+  }
+  return value
+}
+
+/**
+ * The exact `user` object this writer's ops would leave behind. Used only to
+ * hash the expected post-mutate content in the N1 residual-window check; it
+ * never writes settings. General `providers.*` path handling keeps a future op
+ * from silently escaping the check.
+ */
+function expectedUserAfterOps(
+  user: Record<string, unknown> | undefined,
+  ops: readonly SettingsMutationOp[],
+): Record<string, unknown> {
+  const out = isPlainRecord(user) ? cloneSettingsValue(user) as Record<string, unknown> : {}
+  for (const op of ops) {
+    const [section, route, field, ...rest] = op.path
+    if (section !== 'providers' || route === undefined || rest.length > 0) continue
+    const providers = isPlainRecord(out.providers) ? out.providers as Record<string, unknown> : {}
+    out.providers = providers
+    if (field === undefined) {
+      if (op.op === 'unset') delete providers[route]
+      else providers[route] = cloneSettingsValue(op.value)
+      continue
+    }
+    const base = isPlainRecord(providers[route]) ? providers[route] as Record<string, unknown> : {}
+    providers[route] = base
+    if (op.op === 'unset') delete base[field]
+    else base[field] = cloneSettingsValue(op.value)
+  }
+  return out
+}
+
+/**
+ * O1 residual: a settings-landed ledger timeout must not repeat the stock
+ * "store NOT modified / retry" claim. Keep the lock diagnostics (path, wait,
+ * stale-lock note) but drop those two false sentences. A final guard covers
+ * re-wrapped errors whose wording differs from the stock seam.
+ */
+function truthfulLockDetail(detail: string): string {
+  const cleaned = detail
+    .replace(/The store was NOT modified\.?\s*/gi, '')
+    .replace(/Retry the operation\s*[;,.]\s*/gi, '')
+    .replace(/if it keeps failing, check other running dsh processes(?: for a stalled sync round holding the lock)?\.?\s*/gi, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+  return /not modified|retry the operation/i.test(cleaned)
+    ? 'lock error detail contained misleading retry advice (the ownership ledger store was not written; see the actionable note below)'
+    : cleaned
+}
+
 /** Structural check for a store lock timeout (survives re-wrapping / module boundaries). */
 function isStoreLockTimeout(err: unknown): boolean {
   if (err === null || typeof err !== 'object') return false
@@ -263,8 +329,9 @@ function isStoreLockTimeout(err: unknown): boolean {
  * O1-minimal: when `settingsLanded` is true the timeout happened on the ledger
  * AFTER settings were written. The stock "The store was NOT modified. Retry the
  * operation" text is then misleading (retry will not re-claim the route), so
- * the report uses the truthful `settings-written-unaccounted` code and carries
- * the advice. The original error detail is still kept verbatim for diagnosis.
+ * the report uses the truthful `settings-written-unaccounted` code, strips those
+ * two false sentences from the detail, and carries the real advice. The zero-
+ * write path keeps the original detail verbatim for diagnosis.
  */
 function recordLockTimeout(
   result: GoWriteResult,
@@ -275,7 +342,7 @@ function recordLockTimeout(
   settingsLanded = false,
 ): void {
   const reason = settingsLanded ? UNACCOUNTED_CODE : 'store-lock-timeout'
-  const detail = errorText(err)
+  const detail = settingsLanded ? truthfulLockDetail(errorText(err)) : errorText(err)
   result.routes.push({ route: planned.route, slot: planned.slot, status: 'failed', reason })
   result.failedRoutes.push({ route: planned.route, reason })
   report.push({
@@ -345,7 +412,7 @@ async function recordOwnWrite(
         level: 'warn',
         code: UNACCOUNTED_CODE,
         route,
-        message: `route ${route} appliedFingerprint re-persist hit a store lock timeout: ${errorText(err)}. ${RECORD_ADVICE}`,
+        message: `route ${route} appliedFingerprint re-persist hit a store lock timeout: ${truthfulLockDetail(errorText(err))}. ${RECORD_ADVICE}`,
       })
       return false
     }
@@ -357,7 +424,7 @@ async function recordOwnWrite(
       level: 'warn',
       code: UNACCOUNTED_CODE,
       route,
-      message: `route ${route} ${RECORD_ADVICE} (record error: ${errorText(err)})`,
+      message: `route ${route} ${RECORD_ADVICE} (record error: ${truthfulLockDetail(errorText(err))})`,
     })
     return false
   }
@@ -820,13 +887,21 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
         await settings.mutate('llm-pi-ai', built.ops, live?.revision ?? desc.revision)
         settingsLanded = true
         result.settingsLandedRoutes.push(planned.route)
-        // Our own write advances the document revision. Re-read it so later
-        // routes compare against this new baseline instead of the stale
-        // round-level revision (otherwise every subsequent route would look
-        // like a settings change just because WE wrote the previous one).
+        // N1 residual window: the revision alone is not enough to establish the
+        // new baseline. A user edit landing between mutate() returning and this
+        // re-read bumps the revision too, so adopting it would make later routes
+        // treat a stale plan as fresh. Hash the content we EXPECT our ops to
+        // leave and compare it with what is actually present; only a match
+        // advances the rolling baseline. The write-ahead journal is deliberately
+        // kept on mismatch so the next round can still re-account our write.
         if (expectedRevision !== undefined) {
           const after = findLlmDescriptor(settings)
-          if (after !== undefined) currentExpectedRevision = after.revision
+          const expectedContent = fingerprintSection(expectedUserAfterOps(live?.user, built.ops))
+          if (after === undefined || fingerprintSection(after.user ?? {}) !== expectedContent) {
+            logger.warn('settings changed after our mutate for %s; abandoning round', planned.route)
+            return abandonForSettingsChange(result, report, plan, currentExpectedRevision, after?.revision ?? -1)
+          }
+          currentExpectedRevision = after.revision
         }
       } catch (err) {
         if (!isConflictError(err)) {
