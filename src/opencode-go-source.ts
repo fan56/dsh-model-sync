@@ -15,6 +15,9 @@ import { createHash } from 'node:crypto'
 /** Official model-listing endpoint (design §6.2.6 default). */
 export const OPENCODE_GO_MODELS_URL = 'https://opencode.ai/inference/go/v1/models'
 
+/** P0 fixed default polling interval for the go source (design §6.2.6). */
+export const OPENCODE_GO_DEFAULT_INTERVAL_MINUTES = 60
+
 /** Explicit UA — the gateway bans default library UAs with CF 1010 (05 §1). */
 export const GO_USER_AGENT = 'dsh-model-sync/0.9.0'
 

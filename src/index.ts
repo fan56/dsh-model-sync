@@ -49,7 +49,8 @@ import {
 } from './writer.ts'
 import { BUILTIN_CATALOG_SNAPSHOT } from './builtin-catalog-snapshot.ts'
 import { refreshLiveCatalog, getLiveBuiltinCatalogForRoute } from './live-catalog.ts'
-import { checkRouteCredential, type RouteCredentialContext } from './route-credential.ts'
+import { checkRouteCredential, deriveKeyRef, type RouteCredentialContext } from './route-credential.ts'
+import { OPENCODE_GO_MODELS_URL, OPENCODE_GO_DEFAULT_INTERVAL_MINUTES } from './opencode-go-source.ts'
 import {
   PROVIDER_NATIVE_ENDPOINTS,
   fetchProviderNativeModels,
@@ -129,6 +130,50 @@ export const Config = z.object({
    * a re-emitted retired id is a model the 0.1.7 host no longer resolves.
    */
   keepDeprecatedBuiltin: z.boolean().default(false).volatile(),
+
+  /**
+   * OpenCode Go / Zen configuration contract (design §6.2.6). Published in one
+   * Config schema in P1: read-only subset (go.enabled/ref/modelsUrl/
+   * intervalMinutes, zen.enabled/ref/mode/modelsUrl) plus the write-side subset
+   * (go.routes/adoptExisting/pinnedModels/confirmRemovals/compatEnrichment,
+   * zen.routes/seedFromBuiltin). Defaults are byte-for-byte the P0 constants —
+   * `modelsUrl` and `ref` are imported from the P0 modules so a P0→P1 drift is
+   * impossible. Zen stays login-only with no modelsUrl by default (design A5).
+   * Nested leaves are `.volatile()` (host settings can edit them); the parent
+   * objects are not, because schemastery forbids a volatile field under an
+   * enclosing volatile field.
+   */
+  opencode: z.object({
+    go: z.object({
+      enabled: z.boolean().default(false).volatile(),
+      ref: z.string().default(deriveKeyRef('opencode-go')).volatile(),
+      modelsUrl: z.string().default(OPENCODE_GO_MODELS_URL).volatile(),
+      intervalMinutes: z.number().step(1).min(15).default(OPENCODE_GO_DEFAULT_INTERVAL_MINUTES).volatile(),
+      adoptExisting: z.boolean().default(false).volatile(),
+      pinnedModels: z.array(z.string()).default([]).volatile(),
+      routes: z.object({
+        chat: z.string().default('opencode-go').volatile(),
+        msg: z.string().default('opencode-go-msg').volatile(),
+        resp: z.string().default('opencode-go-resp').volatile(),
+        google: z.string().default('opencode-go-google').volatile(),
+      }).default({}),
+      confirmRemovals: z.number().step(1).min(2).default(2).volatile(),
+      compatEnrichment: z.boolean().default(true).volatile(),
+    }).default({}),
+    zen: z.object({
+      enabled: z.boolean().default(true).volatile(),
+      ref: z.string().default('OPENCODE_API_KEY').volatile(),
+      mode: z.union(['login-only', 'routes']).default('login-only').volatile(),
+      /** No proven listing endpoint; without it routes mode is unsupported. */
+      modelsUrl: z.string().volatile(),
+      seedFromBuiltin: z.boolean().default(false).volatile(),
+      routes: z.object({
+        chat: z.string().default('opencode-zen').volatile(),
+        msg: z.string().default('opencode-zen-msg').volatile(),
+        resp: z.string().default('opencode-zen-resp').volatile(),
+      }).default({}),
+    }).default({}),
+  }).default({}),
 })
 
 /**
@@ -155,6 +200,27 @@ interface ModelSyncConfigValue {
   forceMaxReasoningEffort: VolatileRef<boolean>
   providerNativeFetch: VolatileRef<boolean>
   keepDeprecatedBuiltin: VolatileRef<boolean>
+  opencode: {
+    go: {
+      enabled: VolatileRef<boolean>
+      ref: VolatileRef<string>
+      modelsUrl: VolatileRef<string>
+      intervalMinutes: VolatileRef<number>
+      adoptExisting: VolatileRef<boolean>
+      pinnedModels: VolatileRef<readonly string[]>
+      routes: Record<'chat' | 'msg' | 'resp' | 'google', VolatileRef<string>>
+      confirmRemovals: VolatileRef<number>
+      compatEnrichment: VolatileRef<boolean>
+    }
+    zen: {
+      enabled: VolatileRef<boolean>
+      ref: VolatileRef<string>
+      mode: VolatileRef<'login-only' | 'routes'>
+      modelsUrl: VolatileRef<string | undefined>
+      seedFromBuiltin: VolatileRef<boolean>
+      routes: Record<'chat' | 'msg' | 'resp', VolatileRef<string>>
+    }
+  }
 }
 
 /** The llm seam as this plugin needs it (overlay mode). */
