@@ -65,6 +65,14 @@ import {
 } from './opencode-go-sync.ts'
 import type { GoOverrideStorer, GoOwnershipStore } from './opencode-go-writer.ts'
 import {
+  GO_SCHEDULER_RANDOM_SERVICE,
+  GO_SCHEDULER_TIMERS_SERVICE,
+  GoScheduler,
+  type GoSchedulerConfig,
+  type GoSchedulerRandom,
+  type GoSchedulerTimers,
+} from './opencode-go-scheduler.ts'
+import {
   PROVIDER_NATIVE_ENDPOINTS,
   fetchProviderNativeModels,
   mergeProviderNativeEntries,
@@ -312,6 +320,28 @@ function readGoRuntimeConfig(config: ModelSyncConfigValue): { enabled: boolean; 
       confirmRemovals: readVolatile(go?.confirmRemovals, 2),
       adoptExisting: readVolatile(go?.adoptExisting, false),
     },
+  }
+}
+
+/**
+ * Project the go scheduling subset (design §6.3). `intervalMinutes` is the go
+ * field (default 60, floor 15, enforced by the scheduler); the startup delay is
+ * the shared top-level field the design names for startup jitter.
+ *
+ * IMPORTANT (P1c-2): `enabled` defaults to false — the design §6.2.6 value.
+ * The migration gate (§14.6 M-4) is P1d and NOT implemented yet, so a true
+ * default would let the timer write to un-migrated hand-written routes before
+ * exit criteria are met. Keep this false until P1d lands: 待 P1d 迁移门落地后
+ * 再评估是否放开默认值. All scheduler paths are gated by this value.
+ */
+function readGoSchedulerConfig(config: ModelSyncConfigValue): GoSchedulerConfig {
+  const raw = config as unknown as Record<string, unknown>
+  const opencode = raw.opencode as Record<string, unknown> | undefined
+  const go = opencode?.go as Record<string, unknown> | undefined
+  return {
+    enabled: readVolatile(go?.enabled, false),
+    intervalMinutes: readVolatile(go?.intervalMinutes, OPENCODE_GO_DEFAULT_INTERVAL_MINUTES),
+    startupDelaySeconds: readVolatile(raw.startupDelaySeconds, 5),
   }
 }
 
@@ -627,7 +657,8 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
 
   // -----------------------------------------------------------------------
   // P1c go round: source → planner → writer, all deps from cordis seams.
-  // No timer here (P1c-2); the /model-sync command is the only trigger.
+  // P1c-2 wraps this in the scheduler below; the round itself still owns no
+  // timer and no command registration.
   // -----------------------------------------------------------------------
   const runGoRound = async (options: { adopt?: boolean } = {}): Promise<GoSyncRoundResult> => {
     const { value } = readGoRuntimeConfig(config)
@@ -658,6 +689,40 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
       fetchImpl: ctx.get(GO_FETCH_SERVICE) as GoFetchLike | undefined,
     })
   }
+
+  // -----------------------------------------------------------------------
+  // P1c-2: async timer + scheduling for the go round (design §6.3 / §14.6).
+  // One GoScheduler instance serves BOTH the timer and the manual /model-sync
+  // go command, so they share the single-flight lock. Clock and jitter inputs
+  // are optional cordis services so tests never arm a real timer.
+  // -----------------------------------------------------------------------
+  const goTimers: GoSchedulerTimers = (ctx.get(GO_SCHEDULER_TIMERS_SERVICE) as GoSchedulerTimers | undefined) ?? {
+    setTimeout: (fn, ms) => setTimeout(fn, ms),
+    clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+  }
+  const goRandom: GoSchedulerRandom = (ctx.get(GO_SCHEDULER_RANDOM_SERVICE) as GoSchedulerRandom | undefined)
+    ?? { next: () => Math.random() }
+  const goScheduler = new GoScheduler({
+    config: () => readGoSchedulerConfig(config),
+    timers: goTimers,
+    random: goRandom,
+    runRound: async ({ adopt }) => {
+      const round = await runGoRound({ adopt })
+      return {
+        ok: round.ok,
+        reason: round.reason,
+        text: round.text,
+        failureKind: round.reason === 'source-failed' && round.source?.error !== undefined
+          ? round.source.error.kind
+          : undefined,
+      }
+    },
+    report: (text) => {
+      for (const line of text.split('\n')) ctx.logger.info('model-sync: %s', line)
+    },
+  })
+  ctx.effect(() => () => goScheduler.dispose(), 'dsh-model-sync: go scheduler dispose')
+  goScheduler.start()
 
   /** Auto rounds log the same report the /model-sync command shows. */
   const runAuto = (): void => {
@@ -704,6 +769,10 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
     // Clear any pending startup timer before setting a new one
     if (startupTimer !== undefined) clearTimeout(startupTimer)
     startupTimer = setTimeout(runAuto, 1000)
+    // P1c-2: live re-arm of the go scheduler on config edits (interval/enabled
+    // changes take effect without a remount). goScheduler.rearm() is idempotent
+    // and reads fresh volatile refs itself.
+    goScheduler.rearm()
   }), 'dsh-model-sync: settings/document-updated')
 
   // The modelSync service stays exposed for UIs that want direct access. The
@@ -763,10 +832,15 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
                 })
                 return { kind: 'success', text: formatGoEjectReport(result) } satisfies CommandResult
               }
-              const round = await runGoRound({ adopt: sub === 'adopt' })
+              // Route manual rounds through the scheduler so they share the
+              // single-flight lock with timer-driven rounds. A second trigger
+              // while a round is in flight is skipped and reported (design
+              // §14.6), never queued. The report text is the round's own text,
+              // unchanged, for real rounds.
+              const outcome = await goScheduler.triggerManual({ adopt: sub === 'adopt' })
               return {
-                kind: round.reason === 'source-failed' ? 'error' : 'success',
-                text: round.text,
+                kind: outcome.reason === 'source-failed' ? 'error' : 'success',
+                text: outcome.text,
               } satisfies CommandResult
             } catch (error) {
               const message = error instanceof Error ? error.message : String(error)

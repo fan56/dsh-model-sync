@@ -16,6 +16,10 @@ import {
   GO_OWNERSHIP_STORE_SERVICE,
   GO_OVERRIDE_STORER_SERVICE,
 } from '../lib/opencode-go-sync.js'
+import {
+  GO_SCHEDULER_RANDOM_SERVICE,
+  GO_SCHEDULER_TIMERS_SERVICE,
+} from '../lib/opencode-go-scheduler.js'
 
 let failed = 0
 let passed = 0
@@ -134,6 +138,10 @@ async function withHarness(fn, { initialRoutes = {}, configOverrides = {}, paylo
     [GO_OWNERSHIP_STORE_SERVICE]: createFileOwnershipStore(tempAccessor),
     [GO_OVERRIDE_STORER_SERVICE]: tempAccessor,
     [GO_FETCH_SERVICE]: fetchImpl,
+    // P1c-2: keep the go scheduler dormant in this command-path test — no real
+    // timer may fire an extra round (the jitter window is otherwise 0–5s).
+    [GO_SCHEDULER_TIMERS_SERVICE]: { setTimeout: () => ({ stub: true }), clearTimeout: () => {} },
+    [GO_SCHEDULER_RANDOM_SERVICE]: { next: () => 0 },
     credentials: {
       describe: async () => ({ configured: true }),
       resolve: async () => (apiKey === undefined ? undefined : { value: apiKey }),
