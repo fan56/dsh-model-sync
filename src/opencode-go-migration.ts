@@ -24,10 +24,17 @@ export type RouteWriterCaller = 'go' | 'zen' | 'pi.dev'
 /** Effective owner of a route (`none` = migration gate closed). */
 export type GoRouteOwner = 'go' | 'zen' | 'pi.dev' | 'none'
 
-/** Migration record persisted by `/model-sync migrate apply` (P1d-2). P1d-1 only reads it. */
+/** Migration record persisted by `/model-sync migrate apply` (P1d-2). */
 export interface MigrationRecord {
   legacyFingerprint?: string
+  /** sha256(canonical({ identity, appliedManagedIds })) — §14.7.4 two-level fingerprint. */
   appliedFingerprint?: string
+  /** sha256 of the stable identity fields of the go sections at apply/last own write. */
+  appliedIdentity?: string
+  /** Route set `appliedIdentity` was computed over — later-added routes must not drift. */
+  appliedIdentityRoutes?: string[]
+  /** Per-route sorted ledger-managed ids captured with `appliedFingerprint`. */
+  appliedManagedIds?: Record<string, string[]>
   planHash?: string
   appliedAt?: number
   backupPath?: string
@@ -38,16 +45,26 @@ export interface MigrationRecord {
 
 export interface MigrationStatus {
   state: MigrationState
-  /** sha256 of the canonical `opencode-go*` provider sections currently in settings. */
+  /** sha256 of the canonical FULL `opencode-go*` sections (legacy-shape compat only). */
   fingerprint: string
+  /** sha256 of the current stable identity fields of the go sections. */
+  identity: string
   appliedFingerprint?: string
+  appliedIdentity?: string
+  appliedManagedIds?: Record<string, string[]>
   legacyFingerprint?: string
   applying: boolean
+  /** Identity matches but the stored full fingerprint is stale → self-heal (§14.7.4). */
+  fingerprintHealed: boolean
+  /** Fingerprint the healed record should carry. */
+  expectedFingerprint: string
 }
 
-/** Read-only seam; the migrate command (P1d-2) will add a write method. */
+/** Migration record seam. `write` is optional so read-only test stores keep working. */
 export interface MigrationStateStore {
   read(): Promise<MigrationRecord | undefined>
+  /** Queue-serialized atomic slot replacement (same models-store queue as the ledger). */
+  write?(record: MigrationRecord): Promise<void>
 }
 
 export interface RouteWriterConfig {
@@ -124,16 +141,73 @@ export function fingerprintGoRoutes(
   return fingerprintSection(readGoProviderSections(source, routes) ?? {})
 }
 
+// --- Two-level applied fingerprint (§14.7.4) --------------------------------
+//
+// Only STABLE fields take part in drift detection:
+//   appliedIdentity   = sha256(canonical({ <route>: {api, baseURL, displayName,
+//                                          apiKeyEnv} }))     — from settings
+//   appliedManagedIds = { <route>: sorted ids in the ownership ledger }  — from ledger
+//   appliedFingerprint = sha256(canonical({ appliedIdentity, appliedManagedIds }))
+//
+// Excluded on purpose: models[] capacity/capability fields (name,
+// contextWindow, maxTokens, input, reasoningEfforts, compat — all rewritten
+// every sync round), user-owned ids, model order, modelOverrides, and any
+// time/usage field. Those are handled by the managed-vs-user-owned repair
+// rules, never by closing the gate. Identity fields are never rewritten by a
+// sync round, and the ledger ids change only through our own successful
+// writes (which immediately re-persist the fingerprint), so a normal sync
+// cannot create an identity-level mismatch. An external identity edit →
+// `drifted`; an external models edit → still `applied`.
+const IDENTITY_FIELDS = ['api', 'baseURL', 'displayName', 'apiKeyEnv'] as const
+
+/** Identity map: only the four stable fields of each present go section. */
+export function goIdentityOf(sections: Record<string, unknown> | undefined): Record<string, Record<string, unknown>> {
+  const out: Record<string, Record<string, unknown>> = {}
+  for (const [route, section] of Object.entries(sections ?? {})) {
+    if (!isRecord(section)) continue
+    const entry: Record<string, unknown> = {}
+    for (const field of IDENTITY_FIELDS) {
+      if (section[field] !== undefined) entry[field] = section[field]
+    }
+    out[route] = entry
+  }
+  return out
+}
+
+/**
+ * Hash of the current route identities — stable across ordinary sync rounds.
+ * `routes` restricts the compared set: a record keeps the route set it was
+ * written with, so routes created later by a sync round never look like drift.
+ */
+export function fingerprintGoIdentity(
+  sections: Record<string, unknown> | undefined,
+  routes?: readonly string[],
+): string {
+  const all = goIdentityOf(sections)
+  if (routes === undefined) return fingerprintSection(all)
+  return fingerprintSection(Object.fromEntries(routes.map((route) => [route, all[route] ?? {}])))
+}
+
+/** Full applied fingerprint = sha256(canonical({ identity, managedIds })). */
+export function appliedFingerprintOf(
+  identity: string,
+  managedIds: Record<string, string[]> | undefined,
+): string {
+  return fingerprintSection({ identity, managedIds: managedIds ?? {} })
+}
+
 function hasInlineModels(sections: Record<string, unknown>, chatRoute: string): boolean {
   const chat = sections[chatRoute]
   return isRecord(chat) && Array.isArray(chat.models)
 }
 
 /**
- * Determine migration state from the current section fingerprint + record.
- * Order matters: absent → applied (fingerprint match) → recorded legacy/drifted →
- * unrecorded legacy form (§14.1). `drifted` means a record exists but the
- * current fingerprint matches neither applied nor legacy.
+ * Determine migration state (§14.1 / §14.7.4). Order matters: absent →
+ * identity-based applied/drifted (new records) → full-fingerprint match
+ * (legacy records written before the two-level split) → recorded legacy/drifted
+ * → unrecorded legacy form. Only an IDENTITY mismatch is `drifted`: a models
+ * edit (capacity fields, user-owned ids, order) leaves identity intact and is
+ * repaired by the writer instead of closing the gate.
  */
 export function migrationStateOf(
   sections: Record<string, unknown> | undefined,
@@ -142,6 +216,11 @@ export function migrationStateOf(
 ): MigrationState {
   if (sections === undefined || Object.keys(sections).length === 0) return 'absent'
   const fingerprint = fingerprintSection(sections)
+  if (record?.appliedIdentity !== undefined) {
+    return fingerprintGoIdentity(sections, record.appliedIdentityRoutes) === record.appliedIdentity
+      ? 'applied' : 'drifted'
+  }
+  // Backward compatibility with the pre-§14.7.4 full-section fingerprint.
   if (record?.appliedFingerprint !== undefined && fingerprint === record.appliedFingerprint) return 'applied'
   if (record !== undefined && (record.appliedFingerprint !== undefined || record.legacyFingerprint !== undefined)) {
     if (record.legacyFingerprint !== undefined && fingerprint === record.legacyFingerprint) {
@@ -152,19 +231,37 @@ export function migrationStateOf(
   return hasInlineModels(sections, chatRoute) ? 'legacy-inline' : 'legacy-inherit'
 }
 
-/** Full status from a settings descriptor (or a raw providers object) + record. */
+/**
+ * Full status from a settings descriptor (or raw providers object) + record.
+ * `currentManagedIds`, when supplied, comes from the live ownership ledger and
+ * drives the §14.7.4 self-heal check (identity matches but the stored full
+ * fingerprint is stale because the fingerprint write failed after a commit).
+ */
 export function migrationStatusOf(
   source: SettingsDescriptor | Record<string, unknown> | undefined,
   record: MigrationRecord | undefined,
   routes?: readonly string[],
+  currentManagedIds?: Record<string, string[]>,
 ): MigrationStatus {
   const sections = readGoProviderSections(source, routes)
+  // Compare only the route set the record was written with — routes added by a
+  // later sync round must not invalidate an otherwise unchanged identity.
+  const identity = fingerprintGoIdentity(sections, record?.appliedIdentityRoutes)
+  const managedIds = currentManagedIds ?? record?.appliedManagedIds ?? {}
+  const expectedFingerprint = appliedFingerprintOf(identity, managedIds)
   return {
     state: migrationStateOf(sections, record, routes?.[0] ?? GO_SLOT_ROUTES.chat),
     fingerprint: fingerprintSection(sections ?? {}),
+    identity,
+    appliedIdentity: record?.appliedIdentity,
+    appliedManagedIds: record?.appliedManagedIds,
     appliedFingerprint: record?.appliedFingerprint,
     legacyFingerprint: record?.legacyFingerprint,
     applying: record?.applying === true,
+    fingerprintHealed: record?.appliedIdentity !== undefined
+      && identity === record.appliedIdentity
+      && record.appliedFingerprint !== expectedFingerprint,
+    expectedFingerprint,
   }
 }
 
@@ -219,10 +316,13 @@ export function routeWriter(
         reason: `skipped-route-owner: none (migration applying; ${MIGRATION_GATE_HINT})`,
       }
     }
+    // §14.7.4: a record with `appliedIdentity` is judged applied by IDENTITY
+    // match alone — models edits must not close the gate. Legacy records fall
+    // back to the full-section fingerprint equality they were written with.
     if (migration.state === 'applied'
-      && migration.appliedFingerprint !== undefined
-      && migration.fingerprint === migration.appliedFingerprint) {
-      return { decision: 'write', owner: 'go', reason: 'owner=go (migration applied; fingerprint matched)' }
+      && ((migration.appliedIdentity !== undefined && migration.identity === migration.appliedIdentity)
+        || (migration.appliedFingerprint !== undefined && migration.fingerprint === migration.appliedFingerprint))) {
+      return { decision: 'write', owner: 'go', reason: 'owner=go (migration applied; identity/fingerprint matched)' }
     }
     if (migration.state === 'absent') {
       return { decision: 'write', owner: 'go', reason: 'owner=go (absent; no pre-existing section to migrate)' }
@@ -252,7 +352,7 @@ export function routeWriter(
 // Injected store (production adapter reads the same models-store JSON)
 // ---------------------------------------------------------------------------
 
-/** Build a read-only migration store over the models-store raw-slot accessor. */
+/** Build a migration store over the models-store raw-slot accessor. */
 export function createFileMigrationStateStore(accessor: ModelsStoreAccessor): MigrationStateStore {
   return {
     async read(): Promise<MigrationRecord | undefined> {
@@ -264,6 +364,11 @@ export function createFileMigrationStateStore(accessor: ModelsStoreAccessor): Mi
       }
       if (!isRecord(raw)) return undefined
       return raw as unknown as MigrationRecord
+    },
+    async write(record: MigrationRecord): Promise<void> {
+      // writeRaw is queue-serialized atomic temp+rename, i.e. the SAME queue
+      // that persists the ownership ledger (§14.7.4: settings → ledger → fingerprint).
+      await accessor.writeRaw(GO_MIGRATION_STORE_KEY, record as unknown as Record<string, unknown>)
     },
   }
 }

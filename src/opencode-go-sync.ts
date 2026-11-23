@@ -17,6 +17,7 @@ import { fetchGoOfficialModels, type GoFetchLike, type GoSourceResult } from './
 import {
   ejectGoRoutes,
   writeGoPlan,
+  type GoCanWriteDecision,
   type GoEjectResult,
   type GoOverrideStorer,
   type GoOwnershipStore,
@@ -68,6 +69,16 @@ export interface GoRoundDeps {
    * index.ts always passes the real status read from the settings + record.
    */
   migration?: MigrationStatus
+  /**
+   * §14.7.5: re-read the PERSISTED migration status for the second gate, called
+   * before every mutate. Production passes `loadMigrationStatus`; without it
+   * there is NO second gate (pure writer-mechanics callers) — the round-level
+   * snapshot is never reused. A failed re-read is reported as
+   * `canWrite-unavailable` and skips the route (fail closed).
+   */
+  reloadMigration?: () => Promise<MigrationStatus>
+  /** §14.7.4: forward the post-own-write managed ids to the record persister. */
+  onOwnWrite?: (route: string, managedIds: string[]) => Promise<void>
 }
 
 export type GoRoundReason = 'disabled' | 'settings-unavailable' | 'no-key' | 'source-failed' | 'aborted' | 'migration-gate' | 'completed'
@@ -170,7 +181,10 @@ export async function runGoSyncRound(deps: GoRoundDeps): Promise<GoSyncRoundResu
   // M-4 migration gate + single writer (§14.6 / §14.7, ADR-008). All go routes
   // share one authority decision; when none of them may be written the round
   // short-circuits BEFORE the source fetch (zero side effects, explicit report).
-  const migration = deps.migration ?? { state: 'absent' as const, fingerprint: '', applying: false }
+  const migration: MigrationStatus = deps.migration ?? {
+    state: 'absent', fingerprint: '', identity: '', applying: false,
+    fingerprintHealed: false, expectedFingerprint: '',
+  }
   const authority = { caller: 'go' as const, goEnabled: config.enabled, goRoutes: Object.values(routes) }
   const decisions = Object.values(routes).map((route) => ({ route, decision: routeWriter(route, authority, migration) }))
   const blocked = decisions.filter((entry) => entry.decision.decision === 'skip')
@@ -231,6 +245,22 @@ export async function runGoSyncRound(deps: GoRoundDeps): Promise<GoSyncRoundResu
   // lands during readOwnership/planning must still produce a zero-write round.
   if (deps.signal?.aborted) return abortedResult(source)
 
+  // §14.7.5: the second gate ALWAYS re-reads the persisted status on every
+  // call — the round-level `migration` snapshot is never reused here. Without
+  // a live reader there is no second gate (pure writer-mechanics callers); a
+  // failed re-read is fail-closed with a `canWrite-unavailable` report line.
+  const reloadMigration = deps.reloadMigration
+  const canWrite = reloadMigration === undefined
+    ? undefined
+    : async (route: string): Promise<GoCanWriteDecision> => {
+      try {
+        const current = await reloadMigration()
+        return { allow: routeWriter(route, authority, current).decision === 'write' }
+      } catch {
+        return { allow: false, reason: 'canWrite-unavailable' }
+      }
+    }
+
   let write: GoWriteResult
   try {
     write = await writeGoPlan(plan, {
@@ -241,10 +271,8 @@ export async function runGoSyncRound(deps: GoRoundDeps): Promise<GoSyncRoundResu
       keyFingerprint: source.keyFingerprint,
       confirmRemovals: config.confirmRemovals,
       adoptExisting: config.adoptExisting,
-      // §14.7.2 item 4: the routeWriter decision is re-checked immediately
-      // before each mutate — a reentry that slipped past the event handler
-      // still cannot hand a go route to another writer.
-      canWrite: (route: string) => routeWriter(route, authority, migration).decision === 'write',
+      canWrite,
+      onOwnWrite: deps.onOwnWrite,
     })
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)

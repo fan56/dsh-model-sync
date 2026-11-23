@@ -77,12 +77,31 @@ export interface GoWriterDeps {
   /** Optional models-store seam for override fold + unset (store-first). */
   overrideStorer?: GoOverrideStorer
   /**
-   * §14.7.2 double gate: called immediately before each route's settings.mutate.
-   * Returning false produces a `skipped-route-owner` report line and leaves the
-   * route completely untouched (including the ownership ledger). Production
-   * wiring re-runs routeWriter here; absent means no second gate (unit writers).
+   * §14.7.5 second gate: called immediately before EACH mutate (and again on a
+   * SETTINGS_CONFLICT retry). Must re-read the persisted migration status —
+   * never reuse the round-level snapshot. A false result leaves the route
+   * untouched (including the ledger); `reason: 'canWrite-unavailable'` is
+   * reported when the status re-read itself failed (fail closed). Absent means
+   * no second gate (pure unit writers). A plain boolean is accepted for tests.
    */
-  canWrite?: (route: string) => boolean
+  canWrite?: (route: string) =>
+    | boolean
+    | GoCanWriteDecision
+    | Promise<boolean>
+    | Promise<GoCanWriteDecision>
+  /**
+   * §14.7.4: called ONLY after a route's settings.mutate AND its ledger commit
+   * both succeeded, with the ledger-managed ids just committed. The callback
+   * re-persists `appliedFingerprint` through the same store queue. Never called
+   * for a failed write, a no-change round, or another writer's no-op success.
+   */
+  onOwnWrite?: (route: string, managedIds: string[]) => Promise<void> | void
+}
+
+export interface GoCanWriteDecision {
+  allow: boolean
+  /** `canWrite-unavailable` when the live status re-read failed. */
+  reason?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +198,43 @@ function isConflictError(err: unknown): boolean {
 
 function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
+}
+
+/** Normalize the second-gate seam (boolean shorthand or structured decision). */
+async function canWriteDecision(deps: GoWriterDeps, route: string): Promise<GoCanWriteDecision | undefined> {
+  if (deps.canWrite === undefined) return undefined
+  const raw = await deps.canWrite(route)
+  return typeof raw === 'boolean' ? { allow: raw } : raw
+}
+
+/** Non-silent skip for a route whose authority was revoked before its mutate. */
+function skipByCanWrite(
+  result: GoWriteResult,
+  report: GoPlanReportEntry[],
+  planned: GoPlannedRoute,
+  decision: GoCanWriteDecision,
+): void {
+  const reason = decision.reason ?? 'route-authority'
+  result.routes.push({ route: planned.route, slot: planned.slot, status: 'skipped', reason })
+  report.push({
+    level: decision.reason === 'canWrite-unavailable' ? 'warn' : 'info',
+    code: decision.reason === 'canWrite-unavailable' ? 'canWrite-unavailable' : 'skipped-route-owner',
+    route: planned.route,
+    slot: planned.slot,
+    message: `route ${planned.route} skipped by routeWriter (${reason}); no settings write`,
+  })
+}
+
+/** §14.7.4: persist the new applied fingerprint only after settings+ledger success. */
+async function recordOwnWrite(deps: GoWriterDeps, route: string, managedIds: string[]): Promise<void> {
+  if (deps.onOwnWrite === undefined) return
+  try {
+    await deps.onOwnWrite(route, managedIds)
+  } catch (err) {
+    // Settings + ledger already landed; a failed fingerprint write is healed at
+    // the next round (§14.7.4 fingerprint-healed), never a failed route.
+    deps.logger.warn('appliedFingerprint update failed for %s: %s', route, errorText(err))
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -292,18 +348,13 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
       continue
     }
 
-    // Single-writer second gate (§14.7.2): a route whose authority was revoked
+    // Single-writer second gate (§14.7.5): re-read the persisted status here,
+    // never reuse the round-level snapshot. A route whose authority was revoked
     // between the round gate and this point is skipped with a report line —
     // never silently, never touched (not even the ledger).
-    if (deps.canWrite?.(planned.route) === false) {
-      result.routes.push({ route: planned.route, slot: planned.slot, status: 'skipped', reason: 'route-authority' })
-      report.push({
-        level: 'info',
-        code: 'skipped-route-owner',
-        route: planned.route,
-        slot: planned.slot,
-        message: `route ${planned.route} skipped by routeWriter (single-writer / migration gate); no settings write`,
-      })
+    const gate = await canWriteDecision(deps, planned.route)
+    if (gate !== undefined && !gate.allow) {
+      skipByCanWrite(result, report, planned, gate)
       continue
     }
 
@@ -446,6 +497,14 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
           failedReason = 'mutate-rejected'
           logger.warn('mutate failed for %s: %s', planned.route, errorText(err))
         } else {
+          // §14.7.5: re-run the second gate BEFORE the retry mutate. The live
+          // migration status may have flipped during the first attempt; the
+          // round-level decision and the first gate result are both stale now.
+          const retryGate = await canWriteDecision(deps, planned.route)
+          if (retryGate !== undefined && !retryGate.allow) {
+            skipByCanWrite(result, report, planned, retryGate)
+            continue
+          }
           // SETTINGS_CONFLICT: re-read the revision, rebuild the ops against the
           // fresh descriptor, and retry exactly once (existing writer style).
           logger.info('SETTINGS_CONFLICT for %s; retrying once', planned.route)
@@ -485,7 +544,14 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
       continue
     }
 
-    await persistLedger(ownershipStore, key, planned.unset, nextEntry, logger, report, planned.route)
+    // §14.7.4: settings mutate + ledger commit both succeeded — only now
+    // re-persist the applied fingerprint (same store queue as the ledger), with
+    // the managed id set we just committed. Failed/no-change routes never get
+    // here, so a partial failure leaves their fingerprint untouched.
+    const ledgerCommitted = await persistLedger(ownershipStore, key, planned.unset, nextEntry, logger, report, planned.route)
+    if (ledgerCommitted) {
+      await recordOwnWrite(deps, planned.route, planned.unset ? [] : Object.keys(nextEntry.managed).sort())
+    }
     result.routes.push({
       route: planned.route,
       slot: planned.slot,
@@ -497,6 +563,7 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
   return result
 }
 
+/** Returns true only when the ledger commit landed (gates the fingerprint update). */
 async function persistLedger(
   store: GoOwnershipStore,
   key: string,
@@ -505,10 +572,11 @@ async function persistLedger(
   logger: Logger,
   report: GoPlanReportEntry[],
   route: string,
-): Promise<void> {
+): Promise<boolean> {
   try {
     if (unset) await store.delete(key)
     else await store.write(key, entry)
+    return true
   } catch (err) {
     // Settings already landed; a failed ledger write degrades to "no ledger"
     // next round, which is the safe direction (never delete without a hash).
@@ -519,6 +587,7 @@ async function persistLedger(
       route,
       message: `route ${route} written but ownership ledger could not be persisted`,
     })
+    return false
   }
 }
 

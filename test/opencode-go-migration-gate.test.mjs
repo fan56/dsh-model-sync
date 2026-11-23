@@ -9,7 +9,12 @@
 
 import assert from 'node:assert/strict'
 import { apply } from '../lib/index.js'
-import { fingerprintSection } from '../lib/opencode-go-migration.js'
+import {
+  appliedFingerprintOf,
+  fingerprintGoIdentity,
+  fingerprintSection,
+} from '../lib/opencode-go-migration.js'
+import { planGoRouteFields } from '../lib/opencode-go-planner.js'
 import { createFileOwnershipStore } from '../lib/opencode-go-store.js'
 import {
   GO_FETCH_SERVICE,
@@ -114,7 +119,9 @@ function makeConfig(overrides = {}) {
  * - undefined / 'none' → no record (un-migrated)
  * - { applying: true, ... } → M-5 applying state
  */
-function createHarness({ initialRoutes = {}, migrationRecord = 'applied', configOverrides = {} } = {}) {
+function createHarness({
+  initialRoutes = {}, migrationRecord = 'applied', configOverrides = {}, payloads,
+} = {}) {
   const settings = mockSettings(initialRoutes)
   const logs = []
   const fetchCalls = []
@@ -122,11 +129,16 @@ function createHarness({ initialRoutes = {}, migrationRecord = 'applied', config
   const timers = []
   const state = { definitions: [], disposers: [], provided: {} }
 
+  // A plain-object record is mutable through the injected write seam, so an
+  // integration test can observe the appliedFingerprint the writer persisted.
+  let storedRecord = migrationRecord !== undefined && migrationRecord !== 'applied'
+    && migrationRecord !== 'none' && typeof migrationRecord !== 'function'
+    ? structuredClone(migrationRecord)
+    : undefined
   const migrationStore = {
     async read() {
       if (migrationRecord === 'applied') {
-        // simulate an already-migrated profile whose appliedFingerprint tracks
-        // the current go sections
+        // legacy test mode: appliedFingerprint tracks the current go sections
         const sections = Object.fromEntries(
           [...settings.state].filter(([route]) => route.startsWith('opencode-go')),
         )
@@ -134,18 +146,29 @@ function createHarness({ initialRoutes = {}, migrationRecord = 'applied', config
       }
       if (migrationRecord === undefined || migrationRecord === 'none') return undefined
       if (typeof migrationRecord === 'function') return migrationRecord()
-      return migrationRecord
+      return storedRecord === undefined ? undefined : structuredClone(storedRecord)
     },
+    async write(next) { storedRecord = structuredClone(next) },
+    get record() { return storedRecord === undefined ? undefined : structuredClone(storedRecord) },
   }
-  const noopOwnership = { async read() { return undefined }, async write() {}, async delete() {} }
+  // Real in-memory ledger: the writer's managed-id commits are visible to the
+  // live migration-status reads (§14.7.4 fingerprint contract).
+  const ledgerData = new Map()
+  const ownership = {
+    async read(key) { const value = ledgerData.get(key); return value === undefined ? undefined : structuredClone(value) },
+    async write(key, entry) { ledgerData.set(key, structuredClone(entry)) },
+    async delete(key) { ledgerData.delete(key) },
+  }
   const fetchImpl = async (url) => {
     fetchCalls.push(url)
-    return { status: 200, json: async () => structuredClone(OFFICIAL) }
+    const payload = payloads === undefined ? OFFICIAL
+      : payloads[Math.min(fetchCalls.length - 1, payloads.length - 1)] ?? OFFICIAL
+    return { status: 200, json: async () => structuredClone(payload) }
   }
   const services = {
     settings,
     [GO_MIGRATION_STORE_SERVICE]: migrationStore,
-    [GO_OWNERSHIP_STORE_SERVICE]: noopOwnership,
+    [GO_OWNERSHIP_STORE_SERVICE]: ownership,
     [GO_OVERRIDE_STORER_SERVICE]: { async read() { return undefined }, async updateOverrides() {} },
     [GO_FETCH_SERVICE]: fetchImpl,
     [GO_SCHEDULER_TIMERS_SERVICE]: {
@@ -192,7 +215,7 @@ function createHarness({ initialRoutes = {}, migrationRecord = 'applied', config
   }
   const dispose = () => { for (const d of state.disposers) d() }
 
-  return { settings, logs, fetchCalls, timers, state, invoke, emitDocumentUpdated, dispose, services }
+  return { settings, logs, fetchCalls, timers, state, invoke, emitDocumentUpdated, dispose, services, migrationStore }
 }
 
 const idsOf = (settings, route) => settings.state.get(route)?.models?.map((m) => m.id) ?? []
@@ -321,6 +344,112 @@ await checkAsync('V24 dispose regression: pending go timer after dispose never w
   await Promise.resolve()
   assert.equal(h.settings.mutations.length, mutationsBefore, 'disposed scheduler wrote nothing')
   assert.deepEqual(h.fetchCalls, [], 'disposed scheduler ran no fetch')
+})
+
+// ---------------------------------------------------------------------------
+// §14.7.4 / §14.7.5: identity fingerprint, self-heal, live second gate
+// ---------------------------------------------------------------------------
+
+const GO_KEY = 'OPENCODE_GO_API_KEY'
+const CHAT_FIELDS = planGoRouteFields('chat', [{
+  baseUrls: { 'chat-completions': 'https://opencode.ai/inference/go/openai/v1' },
+}], GO_KEY)
+const GO_ROUTES = ['opencode-go', 'opencode-go-msg', 'opencode-go-resp', 'opencode-go-google']
+const INITIAL = {
+  'opencode-go': {
+    ...CHAT_FIELDS,
+    models: [{ id: 'hy4-flash-free', name: 'hy4' }, { id: 'seed', name: 'seed' }],
+  },
+}
+const seededRecord = (sections) => {
+  const routes = Object.keys(sections)
+  const identity = fingerprintGoIdentity(sections, routes)
+  const managedIds = Object.fromEntries(GO_ROUTES.map((route) => [route, []]))
+  return {
+    appliedIdentity: identity,
+    appliedIdentityRoutes: routes,
+    appliedManagedIds: managedIds,
+    appliedFingerprint: appliedFingerprintOf(identity, managedIds),
+  }
+}
+
+await checkAsync('§14.7.4: own write after apply never drifts; upstream addition still writes next round', async () => {
+  const withNew = {
+    object: 'list',
+    data: [...OFFICIAL.data, {
+      id: 'brand-new', name: 'brand-new',
+      api: { 'chat-completions': { base_url: 'https://opencode.ai/inference/go/openai/v1' } },
+      inputModalities: ['text'],
+    }],
+  }
+  const h = createHarness({
+    initialRoutes: INITIAL, migrationRecord: seededRecord(INITIAL), payloads: [OFFICIAL, withNew],
+  })
+  const first = await h.invoke('go')
+  assert.ok(!first.text.includes('migration gate'), first.text)
+  assert.ok(h.settings.mutations.length > 0, 'own write landed after apply')
+  const stored = h.migrationStore.record
+  assert.equal(stored.appliedIdentity, seededRecord(INITIAL).appliedIdentity, 'identity untouched by our write')
+  assert.ok(stored.appliedManagedIds['opencode-go'].includes('hy4-flash-free'), 'ledger ids captured')
+  assert.notEqual(stored.appliedFingerprint, seededRecord(INITIAL).appliedFingerprint, 'fingerprint re-persisted after commit')
+
+  const second = await h.invoke('go')
+  assert.ok(!second.text.includes('migration gate'), second.text)
+  assert.ok(idsOf(h.settings, 'opencode-go').includes('brand-new'), 'upstream addition written — gate stayed open')
+  h.dispose()
+})
+
+await checkAsync('§14.7.4: external identity edit → drifted, zero writes and zero fetch', async () => {
+  const h = createHarness({ initialRoutes: INITIAL, migrationRecord: seededRecord(INITIAL) })
+  h.settings.state.get('opencode-go').api = 'anthropic-messages' // external identity edit
+  const before = h.settings.mutations.length
+  const result = await h.invoke('go')
+  assert.match(result.text, /migration gate: drifted/, result.text)
+  assert.equal(h.settings.mutations.length, before, 'zero settings writes')
+  assert.deepEqual(h.fetchCalls, [], 'gate short-circuits before the source request')
+  h.dispose()
+})
+
+await checkAsync('§14.7.4: external models edit → gate stays open and models are repaired', async () => {
+  const h = createHarness({ initialRoutes: INITIAL, migrationRecord: seededRecord(INITIAL) })
+  h.settings.state.get('opencode-go').models.push({ id: 'user-added', name: 'user-added' })
+  const before = h.settings.mutations.length
+  const result = await h.invoke('go')
+  assert.ok(!result.text.includes('migration gate'), result.text)
+  assert.ok(h.settings.mutations.length > before, 'repair write landed')
+  assert.ok(idsOf(h.settings, 'opencode-go').includes('user-added'), 'models edit handled by owner semantics, not closure')
+  h.dispose()
+})
+
+await checkAsync('§14.7.4: stale appliedFingerprint with matching identity self-heals without closing the gate', async () => {
+  const record = { ...seededRecord(INITIAL), appliedFingerprint: 'stale' }
+  const h = createHarness({ initialRoutes: INITIAL, migrationRecord: record })
+  const result = await h.invoke('go')
+  assert.ok(!result.text.includes('migration gate'), result.text)
+  assert.ok(h.settings.mutations.length > 0, 'healed round still writes')
+  assert.ok(h.logs.some((line) => line.includes('fingerprint-healed')), `heal logged; logs=${JSON.stringify(h.logs)}`)
+  assert.notEqual(h.migrationStore.record.appliedFingerprint, 'stale', 'fingerprint rewritten in the store')
+  h.dispose()
+})
+
+await checkAsync('§14.7.5: live status re-read failure skips the mutate with canWrite-unavailable', async () => {
+  const h = createHarness({ initialRoutes: INITIAL, migrationRecord: seededRecord(INITIAL) })
+  const store = h.migrationStore
+  const originalRead = store.read.bind(store)
+  let reads = 0
+  store.read = async () => {
+    reads += 1
+    // Reads before the source fetch (scheduler/round gate) succeed; the second
+    // gate's live re-read happens after the fetch and finds a corrupt store.
+    if (h.fetchCalls.length > 0) throw new Error('migration store corrupted mid-round')
+    return originalRead()
+  }
+  const before = h.settings.mutations.length
+  const result = await h.invoke('go')
+  assert.ok(reads >= 2, 'second gate re-read the persisted store')
+  assert.equal(h.settings.mutations.length, before, 'zero settings mutate on re-read failure')
+  assert.match(result.text, /canWrite-unavailable/, result.text)
+  h.dispose()
 })
 
 if (failed > 0) {

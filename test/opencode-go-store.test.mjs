@@ -10,6 +10,7 @@ import { join } from 'node:path'
 import { loadModelsStore, resetModelsStoreCache } from '../lib/remote-catalog.js'
 import { createFileOwnershipStore } from '../lib/opencode-go-store.js'
 import { goOwnershipKey } from '../lib/opencode-go-planner.js'
+import { createFileMigrationStateStore, GO_MIGRATION_STORE_KEY } from '../lib/opencode-go-migration.js'
 
 let failed = 0
 let passed = 0
@@ -93,6 +94,25 @@ await checkAsync('keyFingerprint isolation: another key cannot read or delete th
   await store.delete(k1)
   assert.equal(await store.read(k1), undefined)
   assert.deepEqual(await store.read(k2), entry('under-key-two'), 'deleting one key leaves the other intact')
+}))
+
+await checkAsync('migration record write shares the atomic queue with the ledger', () => withTemp(async ({ dir, file }) => {
+  const accessor = loadModelsStore(file)
+  const migration = createFileMigrationStateStore(accessor)
+  const ledger = createFileOwnershipStore(accessor)
+  const record = {
+    appliedIdentity: 'identity-hash',
+    appliedIdentityRoutes: ['opencode-go'],
+    appliedManagedIds: { 'opencode-go': ['a'] },
+    appliedFingerprint: 'fingerprint-hash',
+  }
+  const key = goOwnershipKey('opencode-go', 'fp-one')
+  await Promise.all([migration.write(record), ledger.write(key, entry('hy4'))])
+  assert.deepEqual(await migration.read(), record)
+  assert.deepEqual(await ledger.read(key), entry('hy4'))
+  const doc = JSON.parse(await readFile(file, 'utf8'))
+  assert.deepEqual(doc[GO_MIGRATION_STORE_KEY], record, 'fingerprint slot persisted atomically')
+  assert.deepEqual(await readdir(dir), ['models-store.json'], 'no temp files left behind')
 }))
 
 if (failed > 0) {

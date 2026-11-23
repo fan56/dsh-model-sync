@@ -633,6 +633,106 @@ await checkAsync('conflict: a second conflict is reported as failed, not retried
 })
 
 // ---------------------------------------------------------------------------
+// 8b. §14.7.5 second gate + §14.7.4 fingerprint persistence
+// ---------------------------------------------------------------------------
+
+await checkAsync('second gate: canWrite=false before the only mutate → zero write, skip report, no ledger', async () => {
+  const plan = planGoRoutes({ keyFingerprint: KEY, entries: [chatEntry('hy4')], currentRoutes: {}, ownership: {} })
+  const settings = createMockSettings()
+  const store = createMockStore()
+  let calls = 0
+  const out = await writeGoPlan(plan, deps(settings, store, {
+    canWrite: async () => { calls += 1; return false },
+  }))
+  assert.equal(calls, 1, 'gate was actually consulted')
+  assert.equal(settings.mutations.length, 0, 'zero settings mutate')
+  assert.deepEqual(out.writtenRoutes, [])
+  assert.equal(store.writes.length, 0, 'ledger untouched')
+  assert.equal(out.routes[0].status, 'skipped')
+  assert.equal(out.routes[0].reason, 'route-authority')
+  assert.ok(out.report.some((e) => e.code === 'skipped-route-owner'), 'skip is reported, never silent')
+})
+
+await checkAsync('second gate: state flips mid-round → only the first route writes, rest skipped', async () => {
+  const plan = planGoRoutes({
+    keyFingerprint: KEY,
+    entries: [chatEntry('hy4'), msgEntry('qwen4-max'), respEntry('grok-4.7')],
+    currentRoutes: {}, ownership: {},
+  })
+  const settings = createMockSettings()
+  const store = createMockStore()
+  let calls = 0
+  const out = await writeGoPlan(plan, deps(settings, store, {
+    canWrite: () => { calls += 1; return calls === 1 }, // live status flips to drifted
+  }))
+  assert.equal(calls, 3, 'one gate check per route')
+  assert.deepEqual(out.writtenRoutes, ['opencode-go'], 'only the route checked before the flip wrote')
+  assert.equal(out.routes.filter((r) => r.reason === 'route-authority').length, 2)
+})
+
+await checkAsync('second gate: canWrite-unavailable is fail-closed and reported distinctly', async () => {
+  const plan = planGoRoutes({ keyFingerprint: KEY, entries: [chatEntry('hy4')], currentRoutes: {}, ownership: {} })
+  const out = await writeGoPlan(plan, deps(createMockSettings(), createMockStore(), {
+    canWrite: () => ({ allow: false, reason: 'canWrite-unavailable' }),
+  }))
+  assert.equal(out.routes[0].reason, 'canWrite-unavailable')
+  assert.ok(out.report.some((e) => e.code === 'canWrite-unavailable'))
+})
+
+await checkAsync('second gate: SETTINGS_CONFLICT retry re-runs canWrite before the retry mutate', async () => {
+  const plan = planGoRoutes({ keyFingerprint: KEY, entries: [chatEntry('hy4')], currentRoutes: {}, ownership: {} })
+  const settings = createMockSettings({ conflictOnce: ['opencode-go'] })
+  const store = createMockStore()
+  let calls = 0
+  const out = await writeGoPlan(plan, deps(settings, store, {
+    canWrite: () => { calls += 1; return calls === 1 }, // flip after the first attempt
+  }))
+  assert.equal(calls, 2, 'gate re-run on the retry path')
+  assert.equal(settings.mutations.length, 1, 'the retry mutate never happened')
+  assert.deepEqual(out.writtenRoutes, [])
+  assert.equal(out.routes[0].reason, 'route-authority')
+  assert.ok(out.report.some((e) => e.code === 'skipped-route-owner'))
+})
+
+await checkAsync('fingerprint: onOwnWrite only after settings+ledger success, per-route on partial failure', async () => {
+  const plan = planGoRoutes({
+    keyFingerprint: KEY,
+    entries: [chatEntry('hy4'), msgEntry('qwen4-max'), respEntry('grok-4.7')],
+    currentRoutes: {}, ownership: {},
+  })
+  const settings = createMockSettings({ throwFor: { 'opencode-go-msg': new Error('validation refused') } })
+  const store = createMockStore()
+  const owned = []
+  const out = await writeGoPlan(plan, deps(settings, store, {
+    onOwnWrite: (route, ids) => { owned.push({ route, ids }) },
+  }))
+  assert.equal(out.writtenRoutes.length, 2)
+  assert.deepEqual(owned.map((e) => e.route).sort(), ['opencode-go', 'opencode-go-resp'])
+  assert.ok(owned.every((e) => e.ids.length === 1), 'managed ids recorded from the committed ledger')
+  assert.ok(!owned.some((e) => e.route === 'opencode-go-msg'), 'failed route never updates the fingerprint')
+})
+
+await checkAsync('fingerprint: no-change round and failed ledger commit do not call onOwnWrite', async () => {
+  const plan = planGoRoutes({ keyFingerprint: KEY, entries: [chatEntry('hy4')], currentRoutes: {}, ownership: {} })
+  const settings = createMockSettings()
+  const store = createMockStore()
+  let owned = 0
+  const writer = () => deps(settings, store, { onOwnWrite: () => { owned += 1 } })
+  const first = await writeGoPlan(plan, writer())
+  assert.equal(first.writtenRoutes.length, 1)
+  assert.equal(owned, 1, 'successful own write updated once')
+  const second = await writeGoPlan(plan, writer())
+  assert.equal(second.routes[0].status, 'no-change')
+  assert.equal(owned, 1, 'no-change round does not update the fingerprint')
+
+  const failingLedger = { ...createMockStore(), async write() { throw new Error('ledger full') } }
+  owned = 0
+  const out = await writeGoPlan(plan, deps(createMockSettings(), failingLedger, { onOwnWrite: () => { owned += 1 } }))
+  assert.equal(out.writtenRoutes.length, 1, 'settings still landed')
+  assert.equal(owned, 0, 'ledger commit failed → fingerprint not updated')
+})
+
+// ---------------------------------------------------------------------------
 // 9. Ledger keyed by <route>#<keyFingerprint> (§6.1 / ADR-004)
 // ---------------------------------------------------------------------------
 

@@ -93,14 +93,19 @@ import {
 import { runGoDiagnostic, formatGoDiagnosticReport } from './opencode-go-diagnose.ts'
 import {
   GO_MIGRATION_STORE_SERVICE,
+  appliedFingerprintOf,
   createModelsStoreMigrationStateStore,
+  fingerprintGoIdentity,
   isGoRoute,
   MIGRATION_GATE_HINT,
   migrationStatusOf,
+  readGoProviderSections,
   routeWriter,
+  type MigrationRecord,
   type MigrationStatus,
   type MigrationStateStore,
 } from './opencode-go-migration.ts'
+import { goOwnershipKey } from './opencode-go-planner.ts'
 
 export const name = 'dsh-model-sync'
 
@@ -438,19 +443,65 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
   }
   const settingsForWrite = (): SettingsService | undefined => settingsForWriteFrom(ctx)
 
-  /** Read current migration status: section fingerprint from settings + record from the injected store. */
-  const loadMigrationStatus = async (): Promise<MigrationStatus> => {
-    const desc = rawSettings()?.describe().find((d) => d.ns === 'llm-pi-ai')
-    const store = (ctx.get(GO_MIGRATION_STORE_SERVICE) as MigrationStateStore | undefined)
+  const migrationStore = (): MigrationStateStore =>
+    (ctx.get(GO_MIGRATION_STORE_SERVICE) as MigrationStateStore | undefined)
       ?? createModelsStoreMigrationStateStore()
-    let record
+  const ownershipStoreForRound = (): GoOwnershipStore =>
+    (ctx.get(GO_OWNERSHIP_STORE_SERVICE) as GoOwnershipStore | undefined)
+      ?? createModelsStoreOwnershipStore()
+
+  /**
+   * Read current migration status from the persisted record + live settings +
+   * (when a key fingerprint is available) the live ownership ledger.
+   * `strict` rethrows a record read failure so the §14.7.5 second gate can fail
+   * closed with `canWrite-unavailable`; the normal path degrades to "no record"
+   * (conservative legacy detection) as before.
+   */
+  const loadMigrationStatus = async (
+    opts: { keyFingerprint?: string; strict?: boolean } = {},
+  ): Promise<MigrationStatus> => {
+    const desc = rawSettings()?.describe().find((d) => d.ns === 'llm-pi-ai')
+    const store = migrationStore()
+    let record: MigrationRecord | undefined
     try {
       record = await store.read()
-    } catch {
+    } catch (err) {
+      if (opts.strict === true) throw err
       record = undefined // unreadable ⇒ conservative legacy detection
     }
     const goRoutes = Object.values(readGoRuntimeConfig(config).value.routes ?? {})
-    return migrationStatusOf(desc, record, goRoutes)
+    let managedIds: Record<string, string[]> | undefined
+    if (opts.keyFingerprint !== undefined) {
+      const ownership = ownershipStoreForRound()
+      managedIds = {}
+      for (const route of goRoutes) {
+        try {
+          const entry = await ownership.read(goOwnershipKey(route, opts.keyFingerprint))
+          managedIds[route] = entry === undefined ? [] : Object.keys(entry.managed ?? {}).sort()
+        } catch {
+          managedIds[route] = [] // unreadable ledger ⇒ no managed ids (never delete)
+        }
+      }
+    }
+    const status = migrationStatusOf(desc, record, goRoutes, managedIds)
+    // §14.7.4 self-heal: identity matches but the stored full fingerprint is
+    // stale because the fingerprint persist failed after settings+ledger landed.
+    // Rewrite it in the same queue instead of closing the gate forever.
+    if (status.fingerprintHealed && typeof store.write === 'function') {
+      try {
+        ctx.logger.info('model-sync: fingerprint-healed (identity matched; stale appliedFingerprint)')
+        await store.write({
+          ...(record ?? {}),
+          appliedManagedIds: managedIds ?? record?.appliedManagedIds,
+          appliedFingerprint: status.expectedFingerprint,
+        })
+        status.appliedFingerprint = status.expectedFingerprint
+        status.fingerprintHealed = false
+      } catch (err) {
+        ctx.logger.warn('model-sync: fingerprint-healed write failed: %s', err instanceof Error ? err.message : String(err))
+      }
+    }
+    return status
   }
 
   // -----------------------------------------------------------------------
@@ -789,15 +840,17 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
     const { value } = readGoRuntimeConfig(config)
     const settings = settingsForWrite()
     const desc = settings?.describe().find((d) => d.ns === 'llm-pi-ai')
-    const migration = await loadMigrationStatus()
     const apiKey = await resolveRouteCredentialValue(
       ctx as unknown as NativeCredentialContext,
       desc,
       'opencode-go',
       value.ref,
     )
-    const ownershipStore = (ctx.get(GO_OWNERSHIP_STORE_SERVICE) as GoOwnershipStore | undefined)
-      ?? createModelsStoreOwnershipStore()
+    // The ledger is keyed by the same credential fingerprint the source uses;
+    // deriving it here lets the status read include the live managed-id set.
+    const keyFingerprint = fingerprintKey(typeof apiKey === 'string' ? apiKey.trim() : '')
+    const migration = await loadMigrationStatus({ keyFingerprint })
+    const ownershipStore = ownershipStoreForRound()
     // The existing models-store accessor already satisfies GoOverrideStorer
     // (read(route).overrides + updateOverrides); the service seam lets tests
     // point both stores at a temp dir instead of the real ~/.dsh.
@@ -815,6 +868,34 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
       fetchImpl: ctx.get(GO_FETCH_SERVICE) as GoFetchLike | undefined,
       signal: options.signal,
       migration,
+      // §14.7.5: the second gate re-reads the persisted record on each mutate
+      // (strict: a failed read skips the route with canWrite-unavailable).
+      reloadMigration: () => loadMigrationStatus({ keyFingerprint, strict: true }),
+      // §14.7.4: settings → ledger → fingerprint, all through the same
+      // models-store queue; only successful own writes reach this callback.
+      onOwnWrite: async (route, managedIds) => {
+        const store = migrationStore()
+        if (typeof store.write !== 'function') return // read-only injected store
+        let record: MigrationRecord | undefined
+        try {
+          record = await store.read()
+        } catch {
+          return // cannot merge safely; the next round's self-heal covers it
+        }
+        const goRoutes = Object.values(value.routes ?? {})
+        const liveDesc = rawSettings()?.describe().find((d) => d.ns === 'llm-pi-ai')
+        const sections = readGoProviderSections(liveDesc, goRoutes)
+        const appliedIdentityRoutes = record?.appliedIdentityRoutes ?? Object.keys(sections ?? {})
+        const identity = fingerprintGoIdentity(sections, appliedIdentityRoutes)
+        const appliedManagedIds = { ...(record?.appliedManagedIds ?? {}), [route]: [...managedIds].sort() }
+        await store.write({
+          ...(record ?? {}),
+          appliedIdentity: identity,
+          appliedIdentityRoutes,
+          appliedManagedIds,
+          appliedFingerprint: appliedFingerprintOf(identity, appliedManagedIds),
+        })
+      },
     })
   }
 

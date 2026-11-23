@@ -4,6 +4,8 @@
 
 import assert from 'node:assert/strict'
 import {
+  appliedFingerprintOf,
+  fingerprintGoIdentity,
   fingerprintSection,
   readGoProviderSections,
   fingerprintGoRoutes,
@@ -171,6 +173,63 @@ check('isGoRoute recognises default and custom route ids', () => {
   assert.equal(isGoRoute('opencode-go-custom'), true)
   assert.equal(isGoRoute('opencode-zen'), false)
   assert.equal(isGoRoute('opencode-zen', ['opencode-zen']), true)
+})
+
+// ---------------------------------------------------------------------------
+// §14.7.4 two-level fingerprint: identity-only drift + self-heal
+// ---------------------------------------------------------------------------
+
+check('identity fingerprint covers only api/baseURL/displayName/apiKeyEnv, not models', () => {
+  const base = { 'opencode-go': { api: 'openai', baseURL: 'u', displayName: 'd', apiKeyEnv: 'K' } }
+  const withModels = {
+    'opencode-go': {
+      api: 'openai', baseURL: 'u', displayName: 'd', apiKeyEnv: 'K',
+      models: [{ id: 'a', name: 'A', contextWindow: 8192, maxTokens: 100, input: ['text'], reasoningEfforts: ['low'], compat: {} }],
+      modelOverrides: { a: { displayName: 'user' } },
+    },
+  }
+  const reordered = { 'opencode-go': { apiKeyEnv: 'K', displayName: 'd', baseURL: 'u', api: 'openai' } }
+  assert.equal(fingerprintGoIdentity(base), fingerprintGoIdentity(withModels), 'models edits never change identity')
+  assert.equal(fingerprintGoIdentity(base), fingerprintGoIdentity(reordered), 'key order irrelevant')
+  assert.notEqual(fingerprintGoIdentity(base), fingerprintGoIdentity({ 'opencode-go': { ...base['opencode-go'], api: 'anthropic' } }), 'api edit changes identity')
+  const newFp = appliedFingerprintOf(fingerprintGoIdentity(base), { 'opencode-go': ['b', 'a'] })
+  assert.notEqual(newFp, appliedFingerprintOf(fingerprintGoIdentity(base), { 'opencode-go': ['a', 'b'] }), 'managed ids are canonical-sorted')
+})
+
+check('applied record with identity match stays applied after models edit; identity edit → drifted', () => {
+  const identity = fingerprintGoIdentity({ 'opencode-go': { api: 'openai', apiKeyEnv: 'K' } })
+  const record = {
+    appliedIdentity: identity,
+    appliedManagedIds: { 'opencode-go': ['a'] },
+    appliedFingerprint: appliedFingerprintOf(identity, { 'opencode-go': ['a'] }),
+  }
+  const sameIdentityNewModels = { 'opencode-go': { api: 'openai', apiKeyEnv: 'K', models: [{ id: 'z', name: 'Z' }] } }
+  assert.equal(migrationStateOf(sameIdentityNewModels, record), 'applied', 'models edit does not close the gate')
+  const changedIdentity = { 'opencode-go': { api: 'anthropic', apiKeyEnv: 'K', models: [{ id: 'z' }] } }
+  assert.equal(migrationStateOf(changedIdentity, record), 'drifted', 'identity edit closes the gate')
+
+  const cfg = { caller: 'go', goEnabled: true }
+  assert.equal(routeWriter('opencode-go', cfg, migrationStatusOf(desc(sameIdentityNewModels), record)).decision, 'write')
+  assert.equal(routeWriter('opencode-go', cfg, migrationStatusOf(desc(changedIdentity), record)).decision, 'skip')
+})
+
+check('self-heal: identity match with stale appliedFingerprint marks fingerprintHealed and computes the repair value', () => {
+  const sections = { 'opencode-go': { api: 'openai', apiKeyEnv: 'K' } }
+  const identity = fingerprintGoIdentity(sections)
+  const managed = { 'opencode-go': ['a', 'b'] }
+  const expected = appliedFingerprintOf(identity, managed)
+  const record = { appliedIdentity: identity, appliedManagedIds: managed, appliedFingerprint: 'stale' }
+  const live = migrationStatusOf(desc(sections), record, undefined, managed)
+  assert.equal(live.state, 'applied')
+  assert.equal(live.fingerprintHealed, true)
+  assert.equal(live.expectedFingerprint, expected)
+  const consistent = migrationStatusOf(desc(sections), { ...record, appliedFingerprint: expected }, undefined, managed)
+  assert.equal(consistent.fingerprintHealed, false)
+  const editedIdentity = migrationStatusOf(
+    desc({ 'opencode-go': { api: 'anthropic', apiKeyEnv: 'K' } }), record, undefined, managed,
+  )
+  assert.equal(editedIdentity.fingerprintHealed, false, 'identity drift is not a heal case')
+  assert.equal(editedIdentity.state, 'drifted')
 })
 
 if (failed > 0) {
