@@ -863,7 +863,12 @@ function isConflictError(err: unknown): boolean {
 }
 
 function errorText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
+  // Prefer a structured `message` so re-wrapped plain-object errors still carry
+  // the actionable text (lock path / retry advice) instead of "[object Object]".
+  // Error instances already expose `message`; everything else falls back to
+  // String(err) exactly as before.
+  const message = (err as { message?: unknown } | null | undefined)?.message
+  return typeof message === 'string' ? message : String(err)
 }
 
 /** Set ops that write exactly the target fields + models for one route. */

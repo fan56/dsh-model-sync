@@ -739,6 +739,47 @@ await checkAsync('P2-5: apply → 3 go rounds (no-change + upstream change + rev
   h.dispose()
 })
 
+// ---------------------------------------------------------------------------
+// N4-b — plain-object lock error on the B2 apply/ledger path keeps actionable
+// text in the user-visible output (same口径 as the writer-side N4 fix).
+// ---------------------------------------------------------------------------
+
+await checkAsync('N4-b: plain-object DSH_STORE_LOCK_TIMEOUT on ledger write is readable (no [object Object]) and never counts as success', async () => {
+  const LOCK_PATH = '/tmp/hash.dsh-store.lock'
+  const advice = 'The store was NOT modified. Retry the operation; if it keeps failing, check other running dsh processes.'
+  // A non-Error plain object thrown from the ownership store's write(): the
+  // migrate path must lift its structured `message` instead of degrading to
+  // String(err) === "[object Object]"; classification / fail-closed unchanged.
+  const plainLockError = {
+    name: 'StoreLockTimeoutError',
+    code: 'DSH_STORE_LOCK_TIMEOUT',
+    lockPath: LOCK_PATH,
+    message: `Timed out after 2000ms waiting for the models-store lock (${LOCK_PATH}). ${advice}`,
+  }
+  const h = createHarness({ initialRoutes: { 'opencode-go': LEGACY_CHAT } })
+  const originalWrite = h.ownership.write
+  h.ownership.write = async () => { throw plainLockError }
+
+  const plan = parsePlan((await h.invoke('migrate plan')).text)
+  const result = await h.invoke(`migrate apply --plan ${plan.planHash} --confirm ${plan.confirmCode} --ack-managed`)
+
+  // Not counted as success: refused, no fingerprint, no ledger entry committed.
+  assert.equal(result.kind, 'error', result.text)
+  assert.match(result.text, /migrate apply refused \(write-failed\)/, 'apply is reported as a failure, not a success')
+  assert.equal(h.migrationStore.record?.appliedFingerprint, undefined, 'no appliedFingerprint on failure')
+  assert.equal(h.migrationStore.record?.applying, false, 'applying flag cleared after failure')
+  assert.equal(h.ownership.data.size, 0, 'no ledger entry committed')
+
+  // Readable user-visible text: structured message lifted, actionable fields kept.
+  assert.equal(result.text.includes('[object Object]'), false, 'user-visible text must not degrade to [object Object]')
+  assert.ok(result.text.includes(LOCK_PATH), 'user-visible text must carry the lock path')
+  assert.ok(result.text.includes('Retry the operation'), 'user-visible text must carry the retry advice')
+  assert.ok(result.text.includes('check other running dsh processes'), 'user-visible text must carry the process advice')
+
+  h.ownership.write = originalWrite
+  h.dispose()
+})
+
 if (failed > 0) {
   console.error(`\n${failed} test(s) failed, ${passed} passed`)
   process.exit(1)
