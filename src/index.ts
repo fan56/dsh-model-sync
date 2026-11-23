@@ -91,6 +91,16 @@ import {
   type SettingsUpdateSeam,
 } from './legacy-import.ts'
 import { runGoDiagnostic, formatGoDiagnosticReport } from './opencode-go-diagnose.ts'
+import {
+  GO_MIGRATION_STORE_SERVICE,
+  createModelsStoreMigrationStateStore,
+  isGoRoute,
+  MIGRATION_GATE_HINT,
+  migrationStatusOf,
+  routeWriter,
+  type MigrationStatus,
+  type MigrationStateStore,
+} from './opencode-go-migration.ts'
 
 export const name = 'dsh-model-sync'
 
@@ -333,11 +343,10 @@ function readGoRuntimeConfig(config: ModelSyncConfigValue): { enabled: boolean; 
  * field (default 60, floor 15, enforced by the scheduler); the startup delay is
  * the shared top-level field the design names for startup jitter.
  *
- * IMPORTANT (P1c-2): `enabled` defaults to false — the design §6.2.6 value.
- * The migration gate (§14.6 M-4) is P1d and NOT implemented yet, so a true
- * default would let the timer write to un-migrated hand-written routes before
- * exit criteria are met. Keep this false until P1d lands: 待 P1d 迁移门落地后
- * 再评估是否放开默认值. All scheduler paths are gated by this value.
+ * `enabled` defaults to false — the design §6.2.6 value, unchanged by P1d-1.
+ * Migration zero-write is now enforced independently by routeWriter (§14.6 /
+ * §14.7) on every write path, so this default is a product choice, not the
+ * only protection. All scheduler paths are still gated by this value.
  */
 function readGoSchedulerConfig(config: ModelSyncConfigValue): GoSchedulerConfig {
   const raw = config as unknown as Record<string, unknown>
@@ -350,12 +359,99 @@ function readGoSchedulerConfig(config: ModelSyncConfigValue): GoSchedulerConfig 
   }
 }
 
+// ---------------------------------------------------------------------------
+// P1d-1: own-write reentry marker + migration status reads (design §14.7.2)
+// ---------------------------------------------------------------------------
+
+/** Revision-stamped marker of the last settings write this plugin performed. */
+interface OwnWriteMarker {
+  ns: string
+  revision: number
+  at: number
+}
+
+interface OwnWriteTracker {
+  /** Called after a successful settings.mutate, with the post-write revision. */
+  record(ns: string): void
+  /** True when a document-updated event is the echo of our own write. */
+  matches(ns: string, eventRevision?: number): boolean
+}
+
+/**
+ * Revision-keyed (not time-window-keyed) reentry marker. `readRevision` reads
+ * the live descriptor after a mutate, so the marker always holds the revision
+ * the host stamped on OUR write; a later event for the same ns+revision can
+ * only be that write's echo (§14.7.2 items 1/5). `now` is injected so tests
+ * never depend on a wall clock.
+ */
+function createOwnWriteTracker(
+  readRevision: (ns: string) => number | undefined,
+  now: () => number,
+): OwnWriteTracker {
+  let last: OwnWriteMarker | undefined
+  const tracker: OwnWriteTracker = {
+    record(ns) {
+      const revision = readRevision(ns)
+      if (revision !== undefined) last = { ns, revision, at: now() }
+    },
+    matches(ns, eventRevision) {
+      if (last === undefined || last.ns !== ns) return false
+      if (eventRevision !== undefined) return eventRevision === last.revision
+      const current = readRevision(ns)
+      return current !== undefined && current === last.revision
+    },
+  }
+  return tracker
+}
+
+function settingsRevision(settings: SettingsService | undefined, ns: string): number | undefined {
+  return settings?.describe().find((desc) => desc.ns === ns)?.revision
+}
+
 export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise<void> {
   // On dsh 0.1.7 the resolved Config arrives as apply()'s second argument:
   // every volatile field is a stable reference (see VolatileRef), so the
   // reads below are live views — no scope.get() and no scope.watch() (both
   // removed from dsh-settings; the hot-reload notification moved to the
   // settings/document-updated event, subscribed at the bottom of apply()).
+
+  // P1d-1: one reentry marker shared by every write path. `rawSettings()` is
+  // resolved per call so a host that mounts the settings service after this
+  // plugin still works; the thin wrapper records the post-mutate revision for
+  // the document-updated reentry check (§14.7.2). Every settings-writing path
+  // below goes through `settingsForWrite*` — never a bare ctx.get('settings').
+  const rawSettings = (): SettingsService | undefined => ctx.get('settings') as SettingsService | undefined
+  const ownWrite = createOwnWriteTracker(
+    (ns) => settingsRevision(rawSettings(), ns),
+    () => Date.now(),
+  )
+  const settingsForWriteFrom = (context: Context): SettingsService | undefined => {
+    const raw = context.get('settings') as SettingsService | undefined
+    if (raw === undefined) return undefined
+    return {
+      describe: () => raw.describe(),
+      mutate: async (ns, ops, expectedRevision) => {
+        await raw.mutate(ns, ops, expectedRevision)
+        ownWrite.record(ns)
+      },
+    }
+  }
+  const settingsForWrite = (): SettingsService | undefined => settingsForWriteFrom(ctx)
+
+  /** Read current migration status: section fingerprint from settings + record from the injected store. */
+  const loadMigrationStatus = async (): Promise<MigrationStatus> => {
+    const desc = rawSettings()?.describe().find((d) => d.ns === 'llm-pi-ai')
+    const store = (ctx.get(GO_MIGRATION_STORE_SERVICE) as MigrationStateStore | undefined)
+      ?? createModelsStoreMigrationStateStore()
+    let record
+    try {
+      record = await store.read()
+    } catch {
+      record = undefined // unreadable ⇒ conservative legacy detection
+    }
+    const goRoutes = Object.values(readGoRuntimeConfig(config).value.routes ?? {})
+    return migrationStatusOf(desc, record, goRoutes)
+  }
 
   // -----------------------------------------------------------------------
   // Overlay mode sync (existing behavior)
@@ -431,7 +527,7 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
     config: ModelSyncConfigValue,
     force: boolean,
   ): Promise<string> => {
-    const settings = ctx.get('settings') as SettingsService | undefined
+    const settings = settingsForWrite()
     const logger = ctx.logger as unknown as Logger
     const store = loadModelsStore()
     const lines: string[] = []
@@ -442,9 +538,33 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
       ? [...managedRoutes]
       : DEFAULT_ROUTES
 
+    // P1d-1 single writer: while opencode.go.enabled=true the legacy pi.dev
+    // path must NEVER write an `opencode-go*` route — not even in `absent` /
+    // `applied` state (that belongs to go sync), and especially not when the
+    // migration gate is closed. Login-triggered/manual/auto all funnel through
+    // this one loop (design §14.7.1, ADR-008).
+    const { value: goCfg } = readGoRuntimeConfig(config)
+    const goRouteIds = Object.values(goCfg.routes ?? {})
+    const piDevAuthority = { caller: 'pi.dev' as const, goEnabled: goCfg.enabled, goRoutes: goRouteIds }
+    let piDevMigration: MigrationStatus | undefined
+
     const gateDesc = settings?.describe().find((d) => d.ns === 'llm-pi-ai')
     const gateCtx = ctx as RouteCredentialContext
     for (const route of routes) {
+      // Single-writer gate before ANY fetch/translate/mutate for go routes.
+      // A skip always produces a report line (never silent, §14.7.1).
+      if (goCfg.enabled && isGoRoute(route, goRouteIds)) {
+        piDevMigration ??= await loadMigrationStatus()
+        const decision = routeWriter(route, piDevAuthority, piDevMigration)
+        if (decision.decision === 'skip') {
+          const hint = piDevMigration.state === 'absent' || piDevMigration.state === 'applied'
+            ? ''
+            : `; ${MIGRATION_GATE_HINT}`
+          lines.push(`${route}: skipped — ${decision.reason}${hint}`)
+          continue
+        }
+      }
+
       // Layer 1 follows llm-pi-ai's resolveApiKey: prefer the credentials seam.
       // Layer 2 follows its authContextFrom(ctx).env(): launch environment,
       // or process.env when the service is absent. Both miss → skip fetch,
@@ -667,8 +787,9 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
   // -----------------------------------------------------------------------
   const runGoRound = async (options: { adopt?: boolean; signal?: AbortSignal } = {}): Promise<GoSyncRoundResult> => {
     const { value } = readGoRuntimeConfig(config)
-    const settings = ctx.get('settings') as SettingsService | undefined
+    const settings = settingsForWrite()
     const desc = settings?.describe().find((d) => d.ns === 'llm-pi-ai')
+    const migration = await loadMigrationStatus()
     const apiKey = await resolveRouteCredentialValue(
       ctx as unknown as NativeCredentialContext,
       desc,
@@ -693,6 +814,7 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
       apiKey,
       fetchImpl: ctx.get(GO_FETCH_SERVICE) as GoFetchLike | undefined,
       signal: options.signal,
+      migration,
     })
   }
 
@@ -726,6 +848,8 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
     report: (text) => {
       for (const line of text.split('\n')) ctx.logger.info('model-sync: %s', line)
     },
+    // M-5: drop (never queue) any round while a migration apply holds the routes.
+    isApplying: async () => (await loadMigrationStatus()).applying,
   })
   ctx.effect(() => () => goScheduler.dispose(), 'dsh-model-sync: go scheduler dispose')
   // A changed credential invalidates any accumulated backoff: a fixed key must
@@ -775,20 +899,26 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
   // settings/document-updated event (the 0.1.7 replacement for scope.watch).
   startupTimer = setTimeout(runAuto, Math.max(0, config.startupDelaySeconds.get() ?? 5) * 1000)
   armInterval(config.intervalMinutes.get() ?? 240)
-  ctx.effect(() => ctx.on('settings/document-updated', (ns) => {
-    // Only this plugin's entry (the bundle-patch id) re-arms the timers; the
-    // handler is idempotent — the refs already carry the new values, so the
-    // next round reads them fresh. Never throws: an interval re-arm is two
-    // timer calls, and a throwing settings listener is a host-side incident.
+  ctx.effect(() => ctx.on('settings/document-updated', (ns, revision) => {
+    // P1d-1 §14.7.2: if this event is the echo of a settings.mutate we just
+    // performed, only refresh status — schedule NO round (the V23 race was a
+    // go write echo triggering the legacy pi.dev auto round ~1s later).
+    if (ownWrite.matches(ns, typeof revision === 'number' ? revision : undefined)) {
+      ctx.logger.info('model-sync: reentry-ignored (ns=%s revision=%s); no round scheduled', ns, revision)
+      void loadMigrationStatus() // refresh state only; no timer, no runAuto
+      return
+    }
+    // Only this plugin's own config entry (the bundle-patch id) re-arms timers;
+    // the handler is idempotent — the refs already carry the new values, so the
+    // next round reads them fresh. A foreign ns (including llm-pi-ai writes by
+    // other actors) never schedules a round here.
     if (ns !== OWN_ENTRY_ID) return
     armInterval(config.intervalMinutes.get() ?? 0)
-    // Clear any pending startup timer before setting a new one
-    if (startupTimer !== undefined) clearTimeout(startupTimer)
-    startupTimer = setTimeout(runAuto, 1000)
-    // P1c-2: live re-arm of the go scheduler on config edits (interval/enabled
-    // changes take effect without a remount). goScheduler.rearm() is idempotent
-    // and reads fresh volatile refs itself.
+    // §14.7.2 item 2: remove the old "immediate +1s runAuto". Config edits now
+    // only re-arm the normal interval; an immediate round needs an explicit
+    // /model-sync. (P1c-2 go scheduler still re-arms idempotently.)
     goScheduler.rearm()
+    void loadMigrationStatus()
   }), 'dsh-model-sync: settings/document-updated')
 
   // The modelSync service stays exposed for UIs that want direct access. The
@@ -826,7 +956,7 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
             try {
               if (sub === 'eject') {
                 const { value } = readGoRuntimeConfig(config)
-                const settings = cmdCtx.get('settings') as SettingsService | undefined
+                const settings = settingsForWriteFrom(cmdCtx)
                 const desc = settings?.describe().find((d) => d.ns === 'llm-pi-ai')
                 const apiKey = await resolveRouteCredentialValue(
                   cmdCtx as unknown as NativeCredentialContext,

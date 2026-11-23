@@ -76,6 +76,13 @@ export interface GoWriterDeps {
   adoptExisting?: boolean
   /** Optional models-store seam for override fold + unset (store-first). */
   overrideStorer?: GoOverrideStorer
+  /**
+   * §14.7.2 double gate: called immediately before each route's settings.mutate.
+   * Returning false produces a `skipped-route-owner` report line and leaves the
+   * route completely untouched (including the ownership ledger). Production
+   * wiring re-runs routeWriter here; absent means no second gate (unit writers).
+   */
+  canWrite?: (route: string) => boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +289,21 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
   for (const planned of plan.routes) {
     if (planned.skip) {
       result.routes.push({ route: planned.route, slot: planned.slot, status: 'skipped', reason: 'planner-skip' })
+      continue
+    }
+
+    // Single-writer second gate (§14.7.2): a route whose authority was revoked
+    // between the round gate and this point is skipped with a report line —
+    // never silently, never touched (not even the ledger).
+    if (deps.canWrite?.(planned.route) === false) {
+      result.routes.push({ route: planned.route, slot: planned.slot, status: 'skipped', reason: 'route-authority' })
+      report.push({
+        level: 'info',
+        code: 'skipped-route-owner',
+        route: planned.route,
+        slot: planned.slot,
+        message: `route ${planned.route} skipped by routeWriter (single-writer / migration gate); no settings write`,
+      })
       continue
     }
 

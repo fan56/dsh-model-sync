@@ -24,6 +24,7 @@ import {
 } from './opencode-go-writer.ts'
 import type { SettingsModelProfile } from './translate.ts'
 import type { Logger, SettingsDescriptor, SettingsService } from './writer.ts'
+import { routeWriter, type MigrationStatus } from './opencode-go-migration.ts'
 
 /**
  * Cordis service names used only as injection seams. Both are optional:
@@ -61,9 +62,15 @@ export interface GoRoundDeps {
   observedAt?: number
   /** Plugin-lifetime signal; aborted mid-round stops the fetch and blocks the writer. */
   signal?: AbortSignal
+  /**
+   * Current migration status (§14.1). Defaults to `absent` for direct unit
+   * callers that only exercise writer mechanics; the production wiring in
+   * index.ts always passes the real status read from the settings + record.
+   */
+  migration?: MigrationStatus
 }
 
-export type GoRoundReason = 'disabled' | 'settings-unavailable' | 'no-key' | 'source-failed' | 'aborted' | 'completed'
+export type GoRoundReason = 'disabled' | 'settings-unavailable' | 'no-key' | 'source-failed' | 'aborted' | 'migration-gate' | 'completed'
 
 export interface GoSyncRoundResult {
   ok: boolean
@@ -160,6 +167,24 @@ export async function runGoSyncRound(deps: GoRoundDeps): Promise<GoSyncRoundResu
     }
   }
 
+  // M-4 migration gate + single writer (§14.6 / §14.7, ADR-008). All go routes
+  // share one authority decision; when none of them may be written the round
+  // short-circuits BEFORE the source fetch (zero side effects, explicit report).
+  const migration = deps.migration ?? { state: 'absent' as const, fingerprint: '', applying: false }
+  const authority = { caller: 'go' as const, goEnabled: config.enabled, goRoutes: Object.values(routes) }
+  const decisions = Object.values(routes).map((route) => ({ route, decision: routeWriter(route, authority, migration) }))
+  const blocked = decisions.filter((entry) => entry.decision.decision === 'skip')
+  if (blocked.length === decisions.length) {
+    return {
+      ok: false,
+      reason: 'migration-gate',
+      text: [
+        'opencode-go: migration gate — zero settings writes, no /v1/models request',
+        ...blocked.map(({ route, decision }) => `  [info] ${decision.reason}; route=${route}`),
+      ].join('\n'),
+    }
+  }
+
   let source: GoSourceResult
   try {
     source = await fetchGoOfficialModels({
@@ -216,6 +241,10 @@ export async function runGoSyncRound(deps: GoRoundDeps): Promise<GoSyncRoundResu
       keyFingerprint: source.keyFingerprint,
       confirmRemovals: config.confirmRemovals,
       adoptExisting: config.adoptExisting,
+      // §14.7.2 item 4: the routeWriter decision is re-checked immediately
+      // before each mutate — a reentry that slipped past the event handler
+      // still cannot hand a go route to another writer.
+      canWrite: (route: string) => routeWriter(route, authority, migration).decision === 'write',
     })
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)

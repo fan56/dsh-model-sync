@@ -100,6 +100,7 @@ function makeHarness(overrides = {}) {
       return runImpl(req)
     },
     report: (text) => reports.push({ at: clock.now, text }),
+    isApplying: overrides.isApplying,
   })
   return {
     clock, reports, runs, scheduler, cfg,
@@ -239,6 +240,28 @@ await check('manual + timer triggers during an in-flight round are skipped and r
   await first
   assert.equal(h.scheduler.isInFlight, false)
   assert.deepEqual(h.clock.pending, [60 * 60_000], 'one successor interval after the round')
+})
+
+// P1d-1 M-5: a migration apply owns the routes; auto/manual rounds drop.
+await check('applying migration: auto + manual rounds are skipped, not queued', async () => {
+  let applying = true
+  const h = makeHarness({ config: { startupDelaySeconds: 5 }, isApplying: async () => applying })
+  h.scheduler.start()
+  await h.clock.advance(5000)
+  assert.equal(h.runs.length, 0, 'applying dropped the auto round before runRound')
+  assert.equal(h.reports.length, 1)
+  assert.match(h.reports[0].text, /migration apply in progress/)
+  assert.match(h.reports[0].text, /no queue, no retry/)
+
+  const manual = await h.scheduler.triggerManual()
+  assert.equal(manual.skipped, true)
+  assert.equal(manual.reason, 'migration-applying')
+  assert.equal(h.runs.length, 0, 'applying also drops manual rounds')
+
+  applying = false
+  const after = await h.scheduler.triggerManual()
+  assert.equal(after.skipped, false, 'releasing applying lets rounds through again')
+  assert.equal(h.runs.length, 1)
 })
 
 await check('manual adopt flag is forwarded to the round', async () => {
@@ -386,7 +409,7 @@ await check('enabled=false: zero triggers, manual skipped with reason', async ()
   assert.equal(manual.skipped, true)
   assert.equal(manual.reason, 'disabled')
   assert.match(manual.text, /disabled — set opencode\.go\.enabled=true/)
-  assert.match(manual.text, /Migration gate is P1d/)
+  assert.match(manual.text, /routeWriter on every write path/, 'report points to the independent migration gate')
   assert.equal(h.runs.length, 0, 'manual trigger runs no round either')
 })
 

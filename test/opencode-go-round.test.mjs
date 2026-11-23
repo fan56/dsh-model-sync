@@ -17,6 +17,10 @@ import {
   GO_OVERRIDE_STORER_SERVICE,
 } from '../lib/opencode-go-sync.js'
 import {
+  GO_MIGRATION_STORE_SERVICE,
+  fingerprintSection,
+} from '../lib/opencode-go-migration.js'
+import {
   GO_SCHEDULER_RANDOM_SERVICE,
   GO_SCHEDULER_TIMERS_SERVICE,
 } from '../lib/opencode-go-scheduler.js'
@@ -123,7 +127,7 @@ function makeConfig(overrides = {}) {
   return config
 }
 
-async function withHarness(fn, { initialRoutes = {}, configOverrides = {}, payload = officialPayload, apiKey = KEY } = {}) {
+async function withHarness(fn, { initialRoutes = {}, configOverrides = {}, payload = officialPayload, apiKey = KEY, migrationRecord } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-go-round-'))
   const storeFile = join(dir, 'models-store.json')
   const settings = mockSettings(initialRoutes)
@@ -134,10 +138,26 @@ async function withHarness(fn, { initialRoutes = {}, configOverrides = {}, paylo
     return { status: 200, json: async () => structuredClone(payload) }
   }
   const tempAccessor = loadModelsStore(storeFile)
+  // P1d-1: by default simulate an already-migrated profile whose
+  // appliedFingerprint tracks the current go sections, so these writer-mechanics
+  // tests keep exercising write/idempotency instead of the migration gate.
+  // Gate-specific tests pass an explicit legacy record via `migrationRecord`.
+  const migrationStore = {
+    async read() {
+      if (migrationRecord !== undefined) {
+        return typeof migrationRecord === 'function' ? migrationRecord() : migrationRecord
+      }
+      const sections = Object.fromEntries(
+        [...settings.state].filter(([route]) => route.startsWith('opencode-go')),
+      )
+      return { appliedFingerprint: fingerprintSection(sections) }
+    },
+  }
   const services = {
     [GO_OWNERSHIP_STORE_SERVICE]: createFileOwnershipStore(tempAccessor),
     [GO_OVERRIDE_STORER_SERVICE]: tempAccessor,
     [GO_FETCH_SERVICE]: fetchImpl,
+    [GO_MIGRATION_STORE_SERVICE]: migrationStore,
     // P1c-2: keep the go scheduler dormant in this command-path test — no real
     // timer may fire an extra round (the jitter window is otherwise 0–5s).
     [GO_SCHEDULER_TIMERS_SERVICE]: { setTimeout: () => ({ stub: true }), clearTimeout: () => {} },

@@ -13,9 +13,8 @@
 // Last-good safety: scheduling never persists anything. Backoff state is an
 // in-memory streak only. A failed round returns before the writer, so settings
 // and the ownership ledger keep their last-good values (design §6.3 "离线:
-// settings 中 last-good 继续可用"; M-4 zero-write is P1d and NOT implemented
-// here — the `enabled=false` default is what currently protects un-migrated
-// hand-written routes).
+// settings 中 last-good 继续可用"). M-4 zero-write is enforced by routeWriter
+// inside the round (P1d-1); this layer only adds the M-5 `applying` drop.
 
 import type { GoFailureKind } from './opencode-go-source.ts'
 
@@ -28,7 +27,7 @@ export type GoTrigger = 'startup' | 'interval' | 'backoff' | 'manual'
 
 /** The subset of Config the scheduler reads (live, via a callback). */
 export interface GoSchedulerConfig {
-  /** Master switch. Design §6.2.6 default false; kept false until P1d (migration gate). */
+  /** Master switch. Design §6.2.6 default false (unchanged by P1d-1). */
   enabled: boolean
   /** go.intervalMinutes — default 60, floor 15 (design §6.3 / ADR-007). */
   intervalMinutes: number
@@ -74,6 +73,12 @@ export interface GoSchedulerDeps {
   runRound: (request: GoRoundRequest) => Promise<GoRoundOutcome>
   /** Sink for the per-round report (auto rounds have no caller to return it to). */
   report: (text: string) => void
+  /**
+   * M-5: while a migration apply is in progress every round drops immediately
+   * (no queue, no retry). Optional so existing scheduling-unit tests stay pure;
+   * index.ts wires it to the migration record's `applying` flag.
+   */
+  isApplying?: () => boolean | Promise<boolean>
 }
 
 /** A scheduled or manually triggered round result, including skips. */
@@ -123,9 +128,11 @@ export function goSchedulerSkipReport(reason: string, trigger: GoTrigger): strin
     case 'disabled':
       // Keep the legacy phrase "disabled — set opencode.go.enabled=true" so
       // manual /model-sync go reports stay byte-compatible with P1c-1.
-      return `${when}: skipped — opencode.go sync is disabled — set opencode.go.enabled=true; no request, no settings write. Migration gate is P1d: the disabled default is what currently protects un-migrated hand-written routes.`
+      return `${when}: skipped — opencode.go sync is disabled — set opencode.go.enabled=true; no request, no settings write. (The migration gate is enforced separately by routeWriter on every write path.)`
     case 'already-in-flight':
       return `${when}: skipped — a go round is already in flight (single-flight); no queue, no retry, no settings write (design §14.6).`
+    case 'migration-applying':
+      return `${when}: skipped — migration apply in progress (M-5); no queue, no retry, no settings write (design §14.6).`
     case 'disposed':
       return `${when}: skipped — scheduler disposed (plugin unload); no request, no settings write.`
     default:
@@ -150,6 +157,7 @@ export class GoScheduler {
   private readonly random: GoSchedulerRandom
   private readonly runRound: (request: GoRoundRequest) => Promise<GoRoundOutcome>
   private readonly report: (text: string) => void
+  private readonly isApplying?: () => boolean | Promise<boolean>
 
   private handle: GoTimerHandle | undefined
   private started = false
@@ -166,6 +174,7 @@ export class GoScheduler {
     this.random = deps.random
     this.runRound = deps.runRound
     this.report = deps.report
+    this.isApplying = deps.isApplying
   }
 
   /** Arm the startup timer. No-op when disabled — zero triggers at enabled=false. */
@@ -256,6 +265,10 @@ export class GoScheduler {
     if (this.disposed) return this.skip('disposed', trigger)
     if (!this.config().enabled) return this.skip('disabled', trigger)
     if (this.inFlight) return this.skip('already-in-flight', trigger)
+    // M-5: an in-progress migration owns the routes; drop the round now rather
+    // than racing a half-applied settings document. Same non-queueing rule as
+    // the single-flight lock (§14.6).
+    if (this.isApplying !== undefined && await this.isApplying() === true) return this.skip('migration-applying', trigger)
 
     // The timer that fired is now consumed; a new one is armed after the round.
     this.cancel()
