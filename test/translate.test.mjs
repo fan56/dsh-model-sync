@@ -203,9 +203,10 @@ check('maxTokens: base-less entries keep maxTokens', () => {
 // Drop logic: opencode-go mixed-protocol entries
 // ---------------------------------------------------------------------------
 // The three test-ghost-* fixture ids exist in no pi-ai catalog, which makes
-// them permanently base-less on this mixed-protocol route. (Real ids —
-// glm-5.3, gpt-5.6-luna, qwen3.8-max — were catalog-absent once and are
-// base-matching now, so tests must not anchor on them.)
+// them permanently base-less on this mixed-protocol route. (Real ids drift
+// both ways: glm-5.3, gpt-5.6-luna, qwen3.8-max were catalog-absent once and
+// are base-matching now; glm-5.2 left the catalog in pi-ai 1.6.0 and is
+// base-less now — so tests must not anchor on a fixed drop count.)
 check('base-less: opencode-go test-ghost-a is dropped (mixed-protocol route)', () => {
   const builtinIds = new Set(opencodeGoBuiltin.map(b => b.id))
   const result = translateEntries(
@@ -337,8 +338,16 @@ check('drop: dropUnserviceable=true returns non-empty entries with aborted=false
 
   assert.ok(result.entries.length > 0, 'should return entries when dropUnserviceable=true')
   assert.equal(result.aborted, false, 'aborted should be false when dropUnserviceable=true')
-  // 3 base-less entries on mixed-protocol route are dropped
-  assert.equal(result.dropped.length, 3, '3 drops expected — base-less entries on mixed-protocol route')
+  // opencode-go is mixed-protocol, so every base-less fixture id is dropped.
+  // Derive the expected count from the current snapshot: glm-5.2 left the
+  // builtin catalog in pi-ai 1.6.0 and joins the three test-ghost-* ids.
+  const expectedDroppedIds = opencodeGo.models.filter(m => !builtinIds.has(m.id)).map(m => m.id)
+  assert.equal(result.dropped.length, expectedDroppedIds.length,
+    `${expectedDroppedIds.length} drops expected — base-less entries on mixed-protocol route`)
+  assert.deepEqual(result.dropped.map(d => d.id).sort(), expectedDroppedIds.slice().sort(),
+    'dropped ids should be exactly the base-less opencode-go fixture ids')
+  assert.ok(result.dropped.some(d => d.id === 'glm-5.2'),
+    'glm-5.2 is no longer builtin on opencode-go and must be dropped')
   assert.ok(result.dropped.every(d => d.reason.includes('mixed-protocol')), 'all drops should be mixed-protocol')
 })
 
