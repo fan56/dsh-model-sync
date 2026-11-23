@@ -50,7 +50,20 @@ import {
 import { BUILTIN_CATALOG_SNAPSHOT } from './builtin-catalog-snapshot.ts'
 import { refreshLiveCatalog, getLiveBuiltinCatalogForRoute } from './live-catalog.ts'
 import { checkRouteCredential, deriveKeyRef, type RouteCredentialContext } from './route-credential.ts'
-import { OPENCODE_GO_MODELS_URL, OPENCODE_GO_DEFAULT_INTERVAL_MINUTES } from './opencode-go-source.ts'
+import { OPENCODE_GO_MODELS_URL, OPENCODE_GO_DEFAULT_INTERVAL_MINUTES, fingerprintKey, type GoFetchLike } from './opencode-go-source.ts'
+import { GO_SLOT_ROUTES, type GoRouteSlot } from './opencode-go-grouping.ts'
+import { createModelsStoreOwnershipStore } from './opencode-go-store.ts'
+import {
+  GO_FETCH_SERVICE,
+  GO_OWNERSHIP_STORE_SERVICE,
+  GO_OVERRIDE_STORER_SERVICE,
+  formatGoEjectReport,
+  runGoEject,
+  runGoSyncRound,
+  type GoSyncRoundResult,
+  type GoSyncRuntimeConfig,
+} from './opencode-go-sync.ts'
+import type { GoOverrideStorer, GoOwnershipStore } from './opencode-go-writer.ts'
 import {
   PROVIDER_NATIVE_ENDPOINTS,
   fetchProviderNativeModels,
@@ -257,6 +270,50 @@ const DEFAULT_ROUTES = [
  *  the plugin syncs when `managedRoutes` is empty. Not part of the public
  *  runtime surface; subject to change without notice. */
 export const DEFAULT_ROUTES_LIST = DEFAULT_ROUTES
+
+// ---------------------------------------------------------------------------
+// P1c go config / dependency helpers (design §6.2.6)
+// ---------------------------------------------------------------------------
+
+/** Read a volatile Config leaf, tolerating hosts/tests that hand a plain value. */
+function readVolatile<T>(slot: unknown, fallback: T): T {
+  if (slot === undefined) return fallback
+  if (typeof slot === 'object' && slot !== null && typeof (slot as { get?: unknown }).get === 'function') {
+    return (slot as { get(): T }).get()
+  }
+  return slot as T
+}
+
+/**
+ * Project the go Config subset for one round. Reads the live volatile refs, so
+ * a settings edit takes effect on the next round without a remount. The
+ * defensive shape also keeps older/partial fake configs (no `opencode` block)
+ * on the default zero-behavior path instead of throwing during apply().
+ */
+function readGoRuntimeConfig(config: ModelSyncConfigValue): { enabled: boolean; value: GoSyncRuntimeConfig } {
+  const raw = config as unknown as Record<string, unknown>
+  const opencode = raw.opencode as Record<string, unknown> | undefined
+  const go = opencode?.go as Record<string, unknown> | undefined
+  const rawRoutes = go?.routes as Record<string, unknown> | undefined
+  const routes = Object.fromEntries(
+    (Object.keys(GO_SLOT_ROUTES) as GoRouteSlot[]).map((slot) => [
+      slot,
+      readVolatile(rawRoutes?.[slot], GO_SLOT_ROUTES[slot]),
+    ]),
+  ) as GoSyncRuntimeConfig['routes']
+  return {
+    enabled: readVolatile(go?.enabled, false),
+    value: {
+      enabled: readVolatile(go?.enabled, false),
+      ref: readVolatile(go?.ref, deriveKeyRef('opencode-go')),
+      modelsUrl: readVolatile(go?.modelsUrl, OPENCODE_GO_MODELS_URL),
+      routes,
+      pinnedModels: readVolatile(go?.pinnedModels, [] as readonly string[]),
+      confirmRemovals: readVolatile(go?.confirmRemovals, 2),
+      adoptExisting: readVolatile(go?.adoptExisting, false),
+    },
+  }
+}
 
 export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise<void> {
   // On dsh 0.1.7 the resolved Config arrives as apply()'s second argument:
@@ -568,6 +625,40 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
     return syncOverlay(config, llm, force)
   }
 
+  // -----------------------------------------------------------------------
+  // P1c go round: source → planner → writer, all deps from cordis seams.
+  // No timer here (P1c-2); the /model-sync command is the only trigger.
+  // -----------------------------------------------------------------------
+  const runGoRound = async (options: { adopt?: boolean } = {}): Promise<GoSyncRoundResult> => {
+    const { value } = readGoRuntimeConfig(config)
+    const settings = ctx.get('settings') as SettingsService | undefined
+    const desc = settings?.describe().find((d) => d.ns === 'llm-pi-ai')
+    const apiKey = await resolveRouteCredentialValue(
+      ctx as unknown as NativeCredentialContext,
+      desc,
+      'opencode-go',
+      value.ref,
+    )
+    const ownershipStore = (ctx.get(GO_OWNERSHIP_STORE_SERVICE) as GoOwnershipStore | undefined)
+      ?? createModelsStoreOwnershipStore()
+    // The existing models-store accessor already satisfies GoOverrideStorer
+    // (read(route).overrides + updateOverrides); the service seam lets tests
+    // point both stores at a temp dir instead of the real ~/.dsh.
+    const overrideStorer = (ctx.get(GO_OVERRIDE_STORER_SERVICE) as GoOverrideStorer | undefined)
+      ?? loadModelsStore()
+    return runGoSyncRound({
+      settings,
+      ownershipStore,
+      overrideStorer,
+      logger: ctx.logger as unknown as Logger,
+      // The explicit `adopt` command honours the master switch: disabled means
+      // zero writes (design §6.2.6). runGoSyncRound checks `enabled` first.
+      config: options.adopt === true ? { ...value, adoptExisting: true } : value,
+      apiKey,
+      fetchImpl: ctx.get(GO_FETCH_SERVICE) as GoFetchLike | undefined,
+    })
+  }
+
   /** Auto rounds log the same report the /model-sync command shows. */
   const runAuto = (): void => {
     // A rejected round (service lookups mid-dispose, a refused mutate) must
@@ -636,8 +727,52 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
     cmdCtx.effect(() => {
       const definition: CommandDefinition = {
         name: 'model-sync',
-        description: 'Force one model-list sync round from the pi.dev gateway into settings (dsh-model-sync)',
+        description: 'Force one model-list sync round from the pi.dev gateway into settings; go subcommands: go|status (one full opencode-go round), adopt go, eject go',
         handler: async (invocation) => {
+          const args = invocation.rawInput.trim().split(/\s+/).filter((part) => part.length > 0)
+          const [sub, scope] = args
+          // Design §7.1 keeps bare `/model-sync` (pi.dev settings sync) exactly
+          // as it was. The go subcommands are additive: `go`/`status` run one
+          // full go round, `adopt go` runs it with adoption, `eject go` undoes
+          // plugin ownership (design §14.1 / §14.4). Status stays the read-only
+          // `/opencode-status` command — it is never a write trigger.
+          if ((sub === 'go' || sub === 'status' || sub === 'adopt' || sub === 'eject')
+            && (scope === undefined || scope === 'go')) {
+            try {
+              if (sub === 'eject') {
+                const { value } = readGoRuntimeConfig(config)
+                const settings = cmdCtx.get('settings') as SettingsService | undefined
+                const desc = settings?.describe().find((d) => d.ns === 'llm-pi-ai')
+                const apiKey = await resolveRouteCredentialValue(
+                  cmdCtx as unknown as NativeCredentialContext,
+                  desc,
+                  'opencode-go',
+                  value.ref,
+                )
+                if (apiKey === undefined || apiKey.trim() === '') {
+                  return { kind: 'error', text: `model-sync eject go: no credential value for ${value.ref}; cannot derive the ledger key` } satisfies CommandResult
+                }
+                const ownershipStore = (cmdCtx.get(GO_OWNERSHIP_STORE_SERVICE) as GoOwnershipStore | undefined)
+                  ?? createModelsStoreOwnershipStore()
+                const result = await runGoEject({
+                  routes: Object.values(value.routes),
+                  keyFingerprint: fingerprintKey(apiKey),
+                  settings,
+                  ownershipStore,
+                  logger: cmdCtx.logger as unknown as Logger,
+                })
+                return { kind: 'success', text: formatGoEjectReport(result) } satisfies CommandResult
+              }
+              const round = await runGoRound({ adopt: sub === 'adopt' })
+              return {
+                kind: round.reason === 'source-failed' ? 'error' : 'success',
+                text: round.text,
+              } satisfies CommandResult
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error)
+              return { kind: 'error', text: `model-sync ${sub} failed: ${message}` } satisfies CommandResult
+            }
+          }
           const ignored = invocation.rawInput.trim().length > 0
             ? 'The sync scope is decided by the model-sync managedRoutes config; the argument is ignored.\n'
             : ''

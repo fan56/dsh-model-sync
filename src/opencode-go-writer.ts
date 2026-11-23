@@ -67,6 +67,13 @@ export interface GoWriterDeps {
   keyFingerprint: string
   /** go.confirmRemovals; default 2 (schema min 2, design §6.2.6). */
   confirmRemovals?: number
+  /**
+   * go.adoptExisting / `/model-sync adopt go` (design §14.1). With no prior
+   * ledger the writer claims only desired∩current by default; adopt also
+   * claims the route's pre-existing models so they become deletion candidates
+   * on later rounds (still subject to the two-round confirmation + 3 gates).
+   */
+  adoptExisting?: boolean
   /** Optional models-store seam for override fold + unset (store-first). */
   overrideStorer?: GoOverrideStorer
 }
@@ -348,11 +355,20 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
     // First-round conservative claim (§6.2.4 / A3): with no prior ledger claim
     // the desired∩current id set, recording the hash of the value we write —
     // never claim ids outside the official desired set (qwen4-max / grok-4.7
-    // stay user-owned until adopt).
-    if (prior === undefined) {
+    // stay user-owned until adopt). `adoptExisting` (design §14.1) explicitly
+    // opts those pre-existing ids into the ledger; they still leave via the
+    // two-round confirmation and the three deletion gates, never immediately.
+    if (prior === undefined || deps.adoptExisting === true) {
       for (const desired of desiredProfiles) {
         if (currentById.has(desired.id)) {
           nextManaged[desired.id] = { hash: profileHash(desired) }
+        }
+      }
+      if (deps.adoptExisting === true) {
+        for (const model of current) {
+          if (nextManaged[model.id] === undefined) {
+            nextManaged[model.id] = { hash: profileHash(model) }
+          }
         }
       }
     }

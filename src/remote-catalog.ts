@@ -198,6 +198,19 @@ export interface ModelsStoreAccessor {
     overrides: Record<string, Record<string, unknown>>,
   ): Promise<void>
   delete(providerId: string): Promise<void>
+  /**
+   * Read an opaque top-level slot of the same document. The opencode-go
+   * ownership ledger stores its entries under keys shaped
+   * `<route>#<keyFingerprint>` (design §6.1 / ADR-004); those keys never
+   * collide with a provider route id. Raw reads stay strict — an unreadable
+   * file throws, so callers can decide whether to fail closed or degrade to
+   * "no ledger" (store loss degrades to never-delete).
+   */
+  readRaw(key: string): Promise<Record<string, unknown> | undefined>
+  /** Queue-serialized replacement of one opaque slot (atomic temp+rename). */
+  writeRaw(key: string, value: Record<string, unknown>): Promise<void>
+  /** Queue-serialized removal of one opaque slot. */
+  deleteRaw(key: string): Promise<void>
 }
 
 /**
@@ -361,6 +374,41 @@ export function loadModelsStore(storePath?: string): ModelsStoreAccessor {
           doc = {}
         }
         delete doc[providerId]
+        await writeDoc(doc)
+      }),
+    // Opaque-slot API used by the go ownership ledger. It deliberately shares
+    // the SAME queue and atomic writeDoc as the fetch cache: a ledger write and
+    // a concurrent `update`/`updateOverrides` can never clobber each other's
+    // slots in models-store.json. Keys carrying `#` are ledger entries, not
+    // route ids, so `read(route)`/`update(route)` never see them.
+    readRaw: async (key: string): Promise<Record<string, unknown> | undefined> => {
+      const value = (await readDoc())[key]
+      return value !== undefined && typeof value === 'object' && !Array.isArray(value)
+        ? value as unknown as Record<string, unknown>
+        : undefined
+    },
+    writeRaw: (key: string, value: Record<string, unknown>): Promise<void> =>
+      enqueue(async () => {
+        let doc: ModelsStore
+        try {
+          doc = await readDoc()
+        } catch {
+          // A corrupt/unreadable doc is replaced atomically by writeDoc below;
+          // this is the same self-heal contract as `write`/`update`.
+          doc = {}
+        }
+        ;(doc as unknown as Record<string, unknown>)[key] = value
+        await writeDoc(doc)
+      }),
+    deleteRaw: (key: string): Promise<void> =>
+      enqueue(async () => {
+        let doc: ModelsStore
+        try {
+          doc = await readDoc()
+        } catch {
+          doc = {}
+        }
+        delete (doc as unknown as Record<string, unknown>)[key]
         await writeDoc(doc)
       }),
   }

@@ -107,8 +107,10 @@ export async function resolveRouteCredentialValue(
   ctx: NativeCredentialContext,
   desc: RouteCredentialSettingsDescriptor | undefined,
   route: string,
+  /** Explicit ref from the go/zen Config contract; wins over the settings/derived ref. */
+  refOverride?: string,
 ): Promise<string | undefined> {
-  const declared = getRawUserApiKeyEnv(desc, route)
+  const declared = refOverride ?? getRawUserApiKeyEnv(desc, route)
   const ref = declared ?? deriveKeyRef(route)
   const REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 

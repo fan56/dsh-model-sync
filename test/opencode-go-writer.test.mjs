@@ -407,6 +407,84 @@ await checkAsync('deletion: confirmRemovals=3 waits three consecutive absent rou
   assert.equal(findSetModels(settings.mutations.at(-1), 'opencode-go').some((m) => m.id === 'drop-b'), false)
 })
 
+// C1 (verification 21 §3.2c): an upstream regression must reset the absence
+// counter. Mutation M-C (deleting the reset loop) passed all 26 P1b tests, so
+// this scenario is pinned permanently: absent → regression → absent again must
+// still need TWO rounds, i.e. the second absence is count 1, never a delete.
+await checkAsync('deletion: model regression clears missing counter and never deletes', async () => {
+  const keep = profile('keep-a')
+  const drop = profile('drop-b')
+  const current = [keep, drop]
+  const managed = { 'keep-a': { hash: profileHash(keep) }, 'drop-b': { hash: profileHash(drop) } }
+  const ledgerKey = key('opencode-go')
+  const settings = createMockSettings({ routes: { 'opencode-go': { models: structuredClone(current) } } })
+  const store = createMockStore({
+    [ledgerKey]: { managed: structuredClone(managed), preManagedSnapshot: structuredClone(current) },
+  })
+  const round = (entries) => {
+    const plan = planGoRoutes({
+      keyFingerprint: KEY,
+      entries,
+      currentRoutes: currentRoutesFrom(settings, ['opencode-go']),
+      ownership: structuredClone(Object.fromEntries(store.data)),
+    })
+    return writeGoPlan(plan, deps(settings, store))
+  }
+
+  // R1: drop-b absent → counted once, still written.
+  const out1 = await round([chatEntry('keep-a')])
+  assert.equal(store.data.get(ledgerKey).missing?.['drop-b'], 1)
+  assert.equal(out1.report.some((e) => e.code === 'deleted'), false)
+  assert.equal(findSetModels(settings.mutations.at(-1), 'opencode-go').some((m) => m.id === 'drop-b'), true)
+
+  // R2: upstream regression — drop-b is desired again → counter cleared, no delete.
+  const out2 = await round([chatEntry('keep-a'), chatEntry('drop-b')])
+  assert.equal(store.data.get(ledgerKey).missing?.['drop-b'], undefined, 'regression must clear the counter')
+  assert.equal(out2.report.some((e) => e.code === 'deleted' || e.code === 'deletion-pending'), false)
+  assert.equal(findSetModels(settings.mutations.at(-1), 'opencode-go').some((m) => m.id === 'drop-b'), true)
+
+  // R3: absent again → starts over at 1, still kept (confirmRemovals=2).
+  const out3 = await round([chatEntry('keep-a')])
+  assert.equal(store.data.get(ledgerKey).missing?.['drop-b'], 1, 'counter restarts at 1 after regression')
+  assert.equal(out3.report.some((e) => e.code === 'deleted'), false)
+  assert.equal(findSetModels(settings.mutations.at(-1), 'opencode-go').some((m) => m.id === 'drop-b'), true)
+})
+
+// C3 (design §14.1 / verification 21 §9): adoptExisting is a real writer input.
+// It claims the route's pre-existing ids into the ledger (no immediate delete);
+// a later round can then remove them through the normal double confirmation.
+await checkAsync('adoptExisting claims pre-existing ids; removal waits for a later confirmed round', async () => {
+  const legacy = profile('qwen4-max')
+  const official = chatEntry('hy4')
+  const settings = createMockSettings({ routes: { 'opencode-go': { models: [structuredClone(legacy)] } } })
+  const store = createMockStore()
+  const ledgerKey = key('opencode-go')
+
+  const adoptPlan = planGoRoutes({
+    keyFingerprint: KEY,
+    entries: [official],
+    currentRoutes: { 'opencode-go': routeState([structuredClone(legacy)]) },
+    ownership: {},
+  })
+  const adoptOut = await writeGoPlan(adoptPlan, deps(settings, store, { adoptExisting: true }))
+  const adopted = store.data.get(ledgerKey)
+  assert.ok(adopted.managed['qwen4-max'] !== undefined, 'adopt claims the pre-existing id')
+  assert.ok(adopted.managed.hy4 !== undefined, 'official desired id is claimed too')
+  assert.equal(adoptOut.report.some((e) => e.code === 'deleted'), false, 'adopt never deletes in its own round')
+  assert.deepEqual(findSetModels(settings.mutations[0], 'opencode-go').map((m) => m.id), ['hy4', 'qwen4-max'])
+
+  const nextPlan = planGoRoutes({
+    keyFingerprint: KEY,
+    entries: [official],
+    currentRoutes: currentRoutesFrom(settings, ['opencode-go']),
+    ownership: structuredClone(Object.fromEntries(store.data)),
+  })
+  const nextOut = await writeGoPlan(nextPlan, deps(settings, store))
+  assert.equal(nextOut.report.some((e) => e.code === 'deletion-pending'), true, 'claimed id is now a deletion candidate')
+  assert.equal(store.data.get(ledgerKey).missing?.['qwen4-max'], 1)
+  assert.equal(findSetModels(settings.mutations.at(-1), 'opencode-go').some((m) => m.id === 'qwen4-max'), true)
+})
+
 // ---------------------------------------------------------------------------
 // 6. Three deletion gates, one at a time (§6.2.4 / V6)
 // ---------------------------------------------------------------------------
