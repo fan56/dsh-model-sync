@@ -138,7 +138,7 @@ function makeConfig(overrides = {}) {
   return config
 }
 
-async function withHarness(fn, { initialRoutes = {}, configOverrides = {}, payload = officialPayload, apiKey = KEY, migrationRecord, onFetch } = {}) {
+async function withHarness(fn, { initialRoutes = {}, configOverrides = {}, payload = officialPayload, apiKey = KEY, migrationRecord, onFetch, serviceOverrides = {}, migrationWrite } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-go-round-'))
   const storeFile = join(dir, 'models-store.json')
   const settings = mockSettings(initialRoutes)
@@ -166,6 +166,9 @@ async function withHarness(fn, { initialRoutes = {}, configOverrides = {}, paylo
       )
       return { appliedFingerprint: fingerprintSection(sections) }
     },
+    // O1 harness seam: inject a failing migration-record write (S1/S1b).
+    // Absent by default so the existing read-only-store behaviour is unchanged.
+    ...(migrationWrite !== undefined ? { async write(record) { await migrationWrite(record) } } : {}),
   }
   const services = {
     [GO_OWNERSHIP_STORE_SERVICE]: createFileOwnershipStore(tempAccessor),
@@ -183,6 +186,9 @@ async function withHarness(fn, { initialRoutes = {}, configOverrides = {}, paylo
       unset: async () => { credentialWrites.push('unset') },
     },
     launchEnvironment: { get: () => undefined },
+    // O1: let a test replace the ownership store with a failing one so the
+    // "settings landed but ledger did not" shape reaches the real command.
+    ...serviceOverrides,
   }
   const state = { definitions: [], disposers: [] }
   const ctx = {
@@ -312,7 +318,7 @@ function memoryOwnershipStore() {
   }
 }
 
-function directGoRound(settings, { ownershipStore = memoryOwnershipStore(), onFetch, onOwnWrite } = {}) {
+function directGoRound(settings, { ownershipStore = memoryOwnershipStore(), onFetch, onOwnWrite, migration, reloadMigration, payload = officialPayload, adoptExisting = false } = {}) {
   return runGoSyncRound({
     settings,
     ownershipStore,
@@ -324,13 +330,15 @@ function directGoRound(settings, { ownershipStore = memoryOwnershipStore(), onFe
       routes: { chat: 'opencode-go', msg: 'opencode-go-msg', resp: 'opencode-go-resp' },
       pinnedModels: [],
       confirmRemovals: 2,
-      adoptExisting: false,
+      adoptExisting,
     },
     apiKey: KEY,
     observedAt: 0,
+    ...(migration !== undefined ? { migration } : {}),
+    ...(reloadMigration !== undefined ? { reloadMigration } : {}),
     fetchImpl: async () => {
       if (onFetch !== undefined) await onFetch()
-      return { status: 200, json: async () => structuredClone(officialPayload) }
+      return { status: 200, json: async () => structuredClone(payload) }
     },
     onOwnWrite,
   })
@@ -523,6 +531,168 @@ await checkAsync('N1: a normal unchanged-revision round still writes all three r
   assert.deepEqual(second.write.writtenRoutes, [])
   assert.equal(settings.mutations.length, 3, 'second round is a no-change round')
   assert.equal(owned, 3)
+})
+
+// ---------------------------------------------------------------------------
+// O1-minimal (P2): truthful reporting end-to-end. Scenarios S1/S1b/S2/S3/S7
+// from review 51 §7. All offline seams; no real ~/.dsh, no SIGKILL (the
+// "crash between mutate and ledger" shape is simulated with a failing store).
+// ---------------------------------------------------------------------------
+
+const APPLIED_MIGRATION = {
+  state: 'applied',
+  fingerprint: 'fp',
+  identity: 'id',
+  appliedFingerprint: 'fp',
+  appliedIdentity: 'id',
+  applying: false,
+  fingerprintHealed: false,
+  expectedFingerprint: 'fp',
+}
+const LEGACY_MIGRATION = {
+  state: 'legacy-inline',
+  fingerprint: '',
+  identity: '',
+  applying: false,
+  fingerprintHealed: false,
+  expectedFingerprint: '',
+}
+
+await checkAsync('O1 #1 (S1): ledger write fails after settings landed → command kind=error with truthful code', () => withHarness(async ({ invoke, settings }) => {
+  const result = await invoke('go')
+  assert.equal(result.kind, 'error', `command must be error, got: ${result.text}`)
+  assert.match(result.text, /settings-written-unaccounted/)
+  assert.match(result.text, /user-owned/)
+  assert.match(result.text, /\/model-sync adopt go/)
+  assert.equal(settings.mutations.length, 3, 'all three settings writes landed')
+}, { serviceOverrides: { [GO_OWNERSHIP_STORE_SERVICE]: {
+  async read() { return undefined },
+  async write() { throw new Error('ledger full') },
+  async delete() { throw new Error('ledger full') },
+} } }))
+
+await checkAsync('O1 #1 (S1b): migration record write fails → gap is reported, never silent', () => withHarness(async ({ invoke }) => {
+  const result = await invoke('go')
+  // Record gap is not a failedRoute (fingerprint-healed next round), so kind
+  // stays success — but the truthful report code must be visible in text.
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /settings-written-unaccounted/)
+  assert.match(result.text, /migration record could not be persisted/)
+  assert.match(result.text, /\/model-sync adopt go/)
+}, { migrationWrite: () => { throw new Error('record store full') } }))
+
+await checkAsync('O1 #1 (S1 gate): a round with no migration record leaves the next round gated', async () => {
+  const settings = mockSettings({ 'opencode-go': { models: [{ id: 'hy4-flash-free', name: 'hy4' }] } })
+  const result = await directGoRound(settings, { migration: LEGACY_MIGRATION })
+  assert.equal(result.reason, 'migration-gate', `report=${result.text}`)
+  assert.deepEqual(settings.mutations, [], 'legacy-inline keeps the gate shut; zero writes')
+  assert.match(result.text, /migration gate/)
+})
+
+await checkAsync('O1 #2 (K1, seam-simulated crash): settings written before a ledger failure are kept as user-owned next round', async () => {
+  const settings = mockSettings()
+  const failing = {
+    async read() { return undefined },
+    async write() { throw new Error('process interrupted before ledger commit') },
+    async delete() { throw new Error('process interrupted before ledger commit') },
+  }
+  const first = await directGoRound(settings, { ownershipStore: failing })
+  assert.equal(first.reason, 'write-failed')
+  assert.equal(first.write.failedRoutes.length, 3, 'every route whose ledger failed is a failed route')
+  assert.ok(first.write.failedRoutes.every((f) => f.reason === 'settings-written-unaccounted'))
+  assert.match(first.text, /settings-written-unaccounted/)
+  assert.equal(settings.mutations.length, 3, 'all three settings writes landed before the ledger failure')
+
+  // Next process / round sees no ledger for these models → user-owned, kept.
+  const second = await directGoRound(settings, { ownershipStore: memoryOwnershipStore(), migration: APPLIED_MIGRATION })
+  assert.equal(second.reason, 'completed')
+  assert.ok(second.write.report.some((e) => e.code === 'kept-user-owned'), 'unaccounted models are user-owned next round')
+  assert.ok(modelsOf(settings, 'opencode-go').includes('hy4-flash-free'), 'no model is deleted without a ledger hash')
+})
+
+await checkAsync('O1 #3 (S2): migrated + new model + ledger failure → new model stays user-owned and is not deleted when upstream drops it', async () => {
+  const settings = mockSettings()
+  const failing = {
+    async read() { return undefined },
+    async write() { throw new Error('ledger full') },
+    async delete() { throw new Error('ledger full') },
+  }
+  const withNew = {
+    ...officialPayload,
+    data: [...officialPayload.data, { id: 'new-model', name: 'new', api: { 'chat-completions': { base_url: BASE_CHAT } }, inputModalities: ['text'] }],
+  }
+  const first = await directGoRound(settings, { ownershipStore: failing, migration: APPLIED_MIGRATION, payload: withNew })
+  assert.equal(first.reason, 'write-failed')
+  assert.match(first.text, /settings-written-unaccounted/)
+  assert.ok(modelsOf(settings, 'opencode-go').includes('new-model'), 'new model was written')
+  assert.equal(first.write.report.some((e) => e.code === 'added' && e.id === 'new-model'), false, 'no misleading added line')
+
+  // Upstream removes the new model; without a ledger hash it must be kept.
+  const withoutNew = { ...officialPayload }
+  const second = await directGoRound(settings, { ownershipStore: memoryOwnershipStore(), migration: APPLIED_MIGRATION, payload: withoutNew })
+  assert.ok(second.write.report.some((e) => e.code === 'kept-user-owned' && e.id === 'new-model'), 'kept as user-owned')
+  assert.ok(modelsOf(settings, 'opencode-go').includes('new-model'), 'upstream removal must not delete it')
+})
+
+await checkAsync('O1 #6 (S7): command text never says "no settings write" after an earlier route landed', async () => {
+  const settings = mockSettings()
+  const store = memoryOwnershipStore()
+  let bumped = false
+  const wrappedStore = {
+    ...store,
+    async read(key) {
+      if (!bumped && [...store.map.keys()].length > 0) {
+        bumped = true
+        settings.userEdit('opencode-go-msg', [{ id: 'user-edit', name: 'user' }])
+      }
+      return store.read(key)
+    },
+  }
+  const result = await directGoRound(settings, { ownershipStore: wrappedStore })
+  assert.equal(bumped, true, 'the mid-round edit seam fired')
+  assert.equal(result.reason, 'settings-changed-during-sync')
+  assert.match(result.text, /already written this round: \[opencode-go\]/, 'written route is named')
+  assert.match(result.text, /discarded with no settings write: \[opencode-go-msg,?\s*opencode-go-resp\]/, 'discarded routes are named')
+  assert.doesNotMatch(result.text, /no settings write, no ownership ledger change/, 'no false zero-write claim')
+})
+
+await checkAsync('O1 #5 (S4a/S4b): deletion self-heals across two confirmed rounds, no unset residue', async () => {
+  // Round 1 adopts the pre-existing chat model into the ledger so it has a
+  // hash for the deletion gates. Without that hash the writer would keep it.
+  const settings = mockSettings({ 'opencode-go': { models: [{ id: 'hy4-flash-free', name: 'hy4' }] } })
+  const store = memoryOwnershipStore()
+  // Keep a second chat model so the chat route is never `upstream-empty`
+  // (that guard keeps last-good without evaluating deletion candidates).
+  const keepChat = { id: 'keep-chat', name: 'keep', api: { 'chat-completions': { base_url: BASE_CHAT } }, inputModalities: ['text'] }
+  const baseWithTwoChat = { ...officialPayload, data: [...officialPayload.data, keepChat] }
+  const first = await directGoRound(settings, { ownershipStore: store, adoptExisting: true, payload: baseWithTwoChat })
+  assert.equal(first.reason, 'completed')
+  assert.ok(modelsOf(settings, 'opencode-go').includes('hy4-flash-free'))
+  const pruned = { ...baseWithTwoChat, data: baseWithTwoChat.data.filter((e) => e.id !== 'hy4-flash-free') }
+  const second = await directGoRound(settings, { ownershipStore: store, payload: pruned })
+  assert.equal(second.reason, 'completed')
+  assert.ok(second.write.report.some((e) => e.code === 'deletion-pending' && e.id === 'hy4-flash-free'), `round 1 of 2 keeps with pending: ${second.text}`)
+  assert.ok(modelsOf(settings, 'opencode-go').includes('hy4-flash-free'), 'not deleted after one round')
+  const third = await directGoRound(settings, { ownershipStore: store, payload: pruned })
+  assert.equal(third.reason, 'completed')
+  assert.equal(modelsOf(settings, 'opencode-go').includes('hy4-flash-free'), false, 'confirmed deletion applied')
+  assert.equal(settings.state.has('opencode-go'), true, 'other models keep the route; no unset residue')
+})
+
+await checkAsync('O1 #3 (sync): second-gate skip carries the real migration-gate reason, not generic route-authority', async () => {
+  const settings = mockSettings()
+  const result = await directGoRound(settings, {
+    migration: APPLIED_MIGRATION, // round-level gate is open...
+    reloadMigration: async () => LEGACY_MIGRATION, // ...but it flips by the writer's second gate
+  })
+  assert.equal(result.reason, 'completed', 'skips are not failedRoutes')
+  assert.equal(result.write.routes.length, 3)
+  const skipped = result.write.routes.filter((r) => r.status === 'skipped')
+  assert.equal(skipped.length, 3, 'every route was skipped by the live gate')
+  assert.ok(skipped.every((r) => r.reason.includes('migration gate: legacy-inline')), `real reason must pass through: ${JSON.stringify(skipped)}`)
+  assert.ok(!skipped.some((r) => r.reason === 'route-authority'), 'no generic route-authority collapse')
+  assert.match(result.text, /migration gate: legacy-inline/, 'report text carries the real reason')
+  assert.deepEqual(settings.mutations, [], 'skipped routes never mutate settings')
 })
 
 if (failed > 0) {

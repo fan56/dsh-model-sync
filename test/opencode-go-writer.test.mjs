@@ -112,6 +112,8 @@ function createMockSettings({
   return {
     mutations,
     state,
+    /** Test seam: simulate an external settings edit landing mid-round. */
+    bumpRevision() { currentRevision += 1 },
     describe() {
       const providers = {}
       for (const [route, data] of state) providers[route] = structuredClone(data)
@@ -207,7 +209,12 @@ const currentRoutesFrom = (settings, routes) => Object.fromEntries(routes.map((r
 // 1. Three-route settings write (§9.1 / §2.1 / §6.2.2)
 // ---------------------------------------------------------------------------
 
-await checkAsync('write: 3 routes set all five fields; msg baseURL drops the trailing /v1', async () => {
+// O1-minimal (design change): `displayName` is a display field, not an identity
+// field. The writer's OWNED_FIELDS now matches the planner's OWNERSHIP_FIELDS
+// (api/baseURL/apiKeyEnv) — displayName is never written by the sync writer.
+// The original intent (all OWNED fields + models per route; msg /v1 trim) is
+// preserved; only the displayName expectation changed with the design.
+await checkAsync('write: 3 routes set ownership fields + models; displayName is never written; msg baseURL drops the trailing /v1', async () => {
   const entries = [chatEntry('hy4'), msgEntry('qwen4-max'), respEntry('grok-4.7')]
   const plan = planGoRoutes({ keyFingerprint: KEY, entries, currentRoutes: {}, ownership: {} })
   const settings = createMockSettings()
@@ -219,9 +226,10 @@ await checkAsync('write: 3 routes set all five fields; msg baseURL drops the tra
   for (const mutation of settings.mutations) {
     const route = mutation.ops[0].path[1]
     const paths = mutation.ops.map((op) => op.path.join('.'))
-    for (const field of ['api', 'baseURL', 'displayName', 'apiKeyEnv', 'models']) {
+    for (const field of ['api', 'baseURL', 'apiKeyEnv', 'models']) {
       assert.ok(paths.includes(`providers.${route}.${field}`), `${route}.${field} missing`)
     }
+    assert.ok(!paths.includes(`providers.${route}.displayName`), 'displayName is display-only, never writer-owned')
     for (const op of mutation.ops) {
       if (op.op === 'set' && op.path[2] === 'models') assert.ok(op.value.length > 0, 'never write models: []')
     }
@@ -1040,7 +1048,11 @@ const lockTimeoutError = () => {
 }
 const asSource = () => ({ entries: [], keyFingerprint: KEY, payloadHash: 'abc' })
 
-await checkAsync('N2: lock timeout on ledger commit is actionable and excludes route from writtenRoutes', async () => {
+// O1-minimal: the lock timeout on the ledger commit happens AFTER settings
+// landed. The old `store-lock-timeout` code + "The store was NOT modified.
+// Retry the operation" text were misleading (retry cannot re-claim the route).
+// Keep the actionable error detail verbatim, but report the truthful new code.
+await checkAsync('N2/O1: lock timeout on ledger commit is truthful (settings landed, unaccounted) and still actionable', async () => {
   const plan = planGoRoutes({
     keyFingerprint: KEY, entries: [chatEntry('hy4')], currentRoutes: {}, ownership: {},
   })
@@ -1049,14 +1061,17 @@ await checkAsync('N2: lock timeout on ledger commit is actionable and excludes r
 
   assert.equal(out.writtenRoutes.length, 0, 'a lock-timeout route must not be counted as written')
   assert.deepEqual(out.routes.map((r) => r.status), ['failed'])
-  assert.deepEqual(out.failedRoutes.map((f) => f.reason), ['store-lock-timeout'])
-  const entry = out.report.find((e) => e.code === 'store-lock-timeout')
-  assert.ok(entry, 'an actionable report entry must be present')
+  assert.deepEqual(out.failedRoutes.map((f) => f.reason), ['settings-written-unaccounted'])
+  const entry = out.report.find((e) => e.code === 'settings-written-unaccounted')
+  assert.ok(entry, 'an actionable, truthful report entry must be present')
   assert.ok(entry.message.includes(LOCK_PATH), 'report must carry the lock path')
   const text = formatGoRoundReport(asSource(), out)
   assert.ok(text.includes(LOCK_PATH), 'user-visible text must name the lock path')
-  assert.ok(text.includes('Retry the operation'), 'user-visible text must carry the retry advice')
-  assert.ok(text.includes('check other running dsh processes'), 'user-visible text must carry the process advice')
+  assert.ok(text.includes('Retry the operation'), 'original error detail is kept verbatim for diagnosis')
+  assert.ok(text.includes('check other running dsh processes'), 'original process advice is kept')
+  assert.match(text, /settings were written but the ownership ledger was not updated/, 'truthful unaccounted state is stated')
+  assert.match(text, /user-owned/, 'next-round user-owned consequence is stated')
+  assert.match(text, /\/model-sync adopt go/, 'recovery command is stated')
 })
 
 await checkAsync('N2: lock timeout on override stage is actionable and does not mutate settings', async () => {
@@ -1081,7 +1096,11 @@ await checkAsync('N2: lock timeout on override stage is actionable and does not 
   assert.ok(text.includes('Retry the operation'), 'user-visible text must carry the retry advice')
 })
 
-await checkAsync('N2: non-lock ledger error keeps the existing generic handling', async () => {
+// O1-minimal: a non-lock ledger failure after a landed write is the exact
+// "settings written but not recorded" shape. The old generic warning did not
+// surface it in failedRoutes; now it is a truthful failure with the new code.
+// The distinction from a lock failure (no false store-lock-timeout) is kept.
+await checkAsync('N2/O1: non-lock ledger error after a landed write is truthful, not a false lock timeout', async () => {
   const plan = planGoRoutes({
     keyFingerprint: KEY, entries: [chatEntry('hy4')], currentRoutes: {}, ownership: {},
   })
@@ -1089,8 +1108,10 @@ await checkAsync('N2: non-lock ledger error keeps the existing generic handling'
   const out = await writeGoPlan(plan, deps(createMockSettings(), store))
 
   assert.equal(out.writtenRoutes.length, 1, 'a non-lock ledger failure still counts settings as landed')
-  assert.equal(out.report.some((e) => e.code === 'ledger-write-failed'), true, 'generic warning preserved')
+  assert.equal(out.report.some((e) => e.code === 'settings-written-unaccounted'), true, 'truthful unaccounted-write report')
   assert.equal(out.report.some((e) => e.code === 'store-lock-timeout'), false, 'no false lock-timeout')
+  assert.deepEqual(out.failedRoutes.map((f) => f.reason), ['settings-written-unaccounted'], 'visible as a real failure (command kind=error)')
+  assert.ok(out.report.find((e) => e.code === 'settings-written-unaccounted').message.includes('ledger full'), 'underlying error preserved')
 })
 
 // ---------------------------------------------------------------------------
@@ -1113,9 +1134,9 @@ await checkAsync('N4: plain-object lock error is readable (no [object Object]) a
   const out = await writeGoPlan(plan, deps(createMockSettings(), store))
 
   assert.equal(out.writtenRoutes.length, 0, 'plain-object lock error must still be fail-closed')
-  assert.deepEqual(out.failedRoutes.map((f) => f.reason), ['store-lock-timeout'])
-  const entry = out.report.find((e) => e.code === 'store-lock-timeout')
-  assert.ok(entry, 'an actionable report entry must be present')
+  assert.deepEqual(out.failedRoutes.map((f) => f.reason), ['settings-written-unaccounted'])
+  const entry = out.report.find((e) => e.code === 'settings-written-unaccounted')
+  assert.ok(entry, 'an actionable, truthful report entry must be present')
   assert.equal(entry.message.includes('[object Object]'), false, 'report message must not degrade to [object Object]')
 
   const text = formatGoRoundReport(asSource(), out)
@@ -1123,6 +1144,106 @@ await checkAsync('N4: plain-object lock error is readable (no [object Object]) a
   assert.ok(text.includes(LOCK_PATH), 'user-visible text must carry the lock path')
   assert.ok(text.includes('Retry the operation'), 'user-visible text must carry the retry advice')
   assert.ok(text.includes('check other running dsh processes'), 'user-visible text must carry the process advice')
+})
+
+// ---------------------------------------------------------------------------
+// O1-minimal (P2): truthful reporting + reason pass-through + identity field
+// ownership. These pin the new behaviour after the minimal fix.
+// ---------------------------------------------------------------------------
+
+await checkAsync('O1 #9: a displayName-only drift is a no-change; identity fields are never rewritten', async () => {
+  const entry = chatEntry('hy4')
+  const mapped = mapGoModelToProfile(entry)
+  const fields = planGoRouteFields('chat', [entry])
+  const settings = createMockSettings({
+    routes: {
+      'opencode-go': {
+        api: fields.api,
+        baseURL: fields.baseURL,
+        apiKeyEnv: fields.apiKeyEnv,
+        displayName: 'user-renamed-display',
+        models: [structuredClone(mapped)],
+      },
+    },
+  })
+  const plan = planGoRoutes({
+    keyFingerprint: KEY,
+    entries: [entry],
+    currentRoutes: { 'opencode-go': routeState([structuredClone(mapped)]) },
+    ownership: {},
+  })
+  const out = await writeGoPlan(plan, deps(settings, createMockStore()))
+  assert.equal(settings.mutations.length, 0, 'display-name drift must not trigger a settings mutate')
+  assert.deepEqual(out.routes.map((r) => r.status), ['no-change'])
+  assert.equal(settings.state.get('opencode-go').displayName, 'user-renamed-display', 'display name is left untouched')
+})
+
+await checkAsync('O1 #5: a written-but-unaccounted route does not advertise an added model', async () => {
+  const entry = chatEntry('hy4')
+  const plan = planGoRoutes({ keyFingerprint: KEY, entries: [entry], currentRoutes: {}, ownership: {} })
+  assert.equal(plan.report.some((e) => e.code === 'added'), true, 'the planner did flag a new model')
+  const settings = createMockSettings()
+  const store = { ...createMockStore(), async write() { throw new Error('ledger full') } }
+  const out = await writeGoPlan(plan, deps(settings, store))
+  assert.equal(settings.mutations.length, 1, 'settings were written')
+  assert.equal(out.report.some((e) => e.code === 'added'), false, 'no misleading added line for an unclaimed model')
+  assert.equal(out.report.some((e) => e.code === 'settings-written-unaccounted'), true, 'truthful code replaces it')
+})
+
+await checkAsync('O1 #3: second-gate skip carries the real routeWriter reason (not generic route-authority)', async () => {
+  const realReason = 'skipped-route-owner: none (migration gate: legacy-inline; run migrate plan/apply)'
+  const plan = planGoRoutes({ keyFingerprint: KEY, entries: [chatEntry('hy4')], currentRoutes: {}, ownership: {} })
+  const out = await writeGoPlan(plan, deps(createMockSettings(), createMockStore(), {
+    canWrite: () => ({ allow: false, reason: realReason }),
+  }))
+  assert.equal(out.routes[0].status, 'skipped')
+  assert.equal(out.routes[0].reason, realReason)
+  const entry = out.report.find((e) => e.route === 'opencode-go' && e.code === 'skipped-route-owner')
+  assert.ok(entry, 'skip is still reported, not silent')
+  assert.ok(entry.message.includes(realReason), 'skip message carries the real gate reason')
+})
+
+await checkAsync('O1 #6 (S7): abandon after an earlier landed route lists written vs discarded, not "zero writes"', async () => {
+  const entries = [chatEntry('hy4'), msgEntry('qwen4-max')]
+  const plan = planGoRoutes({ keyFingerprint: KEY, entries, currentRoutes: {}, ownership: {} })
+  const settings = createMockSettings()
+  const store = createMockStore()
+  let bumped = false
+  const wrappedStore = {
+    ...store,
+    async read(key) {
+      // After route 1 committed its ledger, bump the revision before route 2's
+      // pre-mutate descriptor re-read (reproduction path A from review 51 §5).
+      if (!bumped && store.writes.length > 0) {
+        bumped = true
+        settings.bumpRevision()
+      }
+      return store.read(key)
+    },
+  }
+  const out = await writeGoPlan(plan, deps(settings, wrappedStore, { expectedRevision: 1 }))
+  assert.equal(bumped, true, 'the mid-round edit seam fired')
+  assert.ok(out.settingsChanged, 'the round was abandoned')
+  assert.deepEqual(out.settingsLandedRoutes, ['opencode-go'], 'route 1 actually wrote settings')
+  const report = out.report.find((e) => e.code === 'settings-changed-during-sync')
+  assert.ok(report)
+  assert.match(report.message, /already written: \[opencode-go\]/, 'written route is named')
+  assert.match(report.message, /discarded \(no settings write\): \[opencode-go-msg\]/, 'discarded route is named')
+  assert.doesNotMatch(report.message, /zero settings writes/, 'no false zero-write claim')
+})
+
+await checkAsync('O1 #1: a migration record persist failure is visible (record gap is not silent)', async () => {
+  const plan = planGoRoutes({ keyFingerprint: KEY, entries: [chatEntry('hy4')], currentRoutes: {}, ownership: {} })
+  const settings = createMockSettings()
+  const out = await writeGoPlan(plan, deps(settings, createMockStore(), {
+    onOwnWrite: () => { throw new Error('record store full') },
+  }))
+  assert.equal(settings.mutations.length, 1, 'settings landed')
+  assert.equal(out.failedRoutes.length, 0, 'fingerprint-healed next round — never a failed route')
+  const entry = out.report.find((e) => e.code === 'settings-written-unaccounted')
+  assert.ok(entry, 'the record gap is reported, not silent')
+  assert.match(entry.message, /migration record could not be persisted/)
+  assert.match(entry.message, /\/model-sync adopt go/)
 })
 
 console.log(`\n${passed} passed, ${failed} failed`)

@@ -87,6 +87,10 @@ export type GoRoundReason =
   | 'aborted'
   | 'migration-gate'
   | 'settings-changed-during-sync'
+  // O1-minimal: one or more routes had failedRoutes (including the truthful
+  // "settings written but not recorded" case). The command surface reports
+  // kind:'error' for it, not a clean success.
+  | 'write-failed'
   | 'completed'
 
 export interface GoSyncRoundResult {
@@ -160,14 +164,24 @@ function settingsChangedResult(source: GoSourceResult, beforeRevision: number, a
 
 /**
  * B4/N1: the writer detected a settings revision change after the round was
- * validated — the plan went stale before any mutate landed. Same zero-write
- * semantics as the fetch-window case, but honest about WHEN the change landed.
+ * validated — the plan went stale. Usually no mutate landed, but a mid-loop
+ * race can leave earlier routes already written (S7); in that case report the
+ * written and discarded routes explicitly instead of claiming "no settings
+ * write". The zero-write wording is kept byte-identical when nothing landed.
  */
 function writerSettingsChangedResult(
   source: GoSourceResult,
   beforeRevision: number | undefined,
   afterRevision: number,
+  write: GoWriteResult,
 ): GoSyncRoundResult {
+  const landed = write.settingsLandedRoutes
+  const discarded = write.routes
+    .filter((r) => r.status === 'skipped' && r.reason === 'settings-changed-during-sync')
+    .map((r) => r.route)
+  const honesty = landed.length === 0
+    ? '  user edits were kept as-is: no settings write, no ownership ledger change, no fingerprint update'
+    : `  already written this round: [${landed.join(', ')}]; discarded with no settings write: [${discarded.length === 0 ? 'none' : discarded.join(', ')}]; no ownership ledger/fingerprint update for the discarded routes`
   return {
     ok: false,
     reason: 'settings-changed-during-sync',
@@ -175,7 +189,7 @@ function writerSettingsChangedResult(
     settingsChanged: { beforeRevision: beforeRevision ?? -1, afterRevision },
     text: [
       `opencode-go: settings changed during this sync round (llm-pi-ai revision ${String(beforeRevision)} -> ${afterRevision}); discarding the stale plan`,
-      '  user edits were kept as-is: no settings write, no ownership ledger change, no fingerprint update',
+      honesty,
       '  the next round re-reads the current settings and retries normally',
     ].join('\n'),
   }
@@ -338,7 +352,14 @@ export async function runGoSyncRound(deps: GoRoundDeps): Promise<GoSyncRoundResu
     : async (route: string): Promise<GoCanWriteDecision> => {
       try {
         const current = await reloadMigration()
-        return { allow: routeWriter(route, authority, current).decision === 'write' }
+        const decision = routeWriter(route, authority, current)
+        // O1-minimal: pass the routeWriter reason through to the writer's skip
+        // record/report. Previously every skip collapsed to `route-authority`,
+        // hiding the real gate/applying/owner decision that revoked authority.
+        return {
+          allow: decision.decision === 'write',
+          reason: decision.decision === 'skip' ? decision.reason : undefined,
+        }
       } catch {
         return { allow: false, reason: 'canWrite-unavailable' }
       }
@@ -379,10 +400,21 @@ export async function runGoSyncRound(deps: GoRoundDeps): Promise<GoSyncRoundResu
       source,
       write.settingsChanged.expectedRevision,
       write.settingsChanged.actualRevision,
+      write,
     )
   }
 
-  return { ok: write.failedRoutes.length === 0, reason: 'completed', source, write, text: formatGoRoundReport(source, write) }
+  // O1-minimal: a round with failedRoutes is never a clean `completed` success,
+  // even though some routes may have written settings. The command surface maps
+  // this reason to kind:'error'. (Only source failures back off — see scheduler.)
+  const hasFailedRoutes = write.failedRoutes.length > 0
+  return {
+    ok: !hasFailedRoutes,
+    reason: hasFailedRoutes ? 'write-failed' : 'completed',
+    source,
+    write,
+    text: formatGoRoundReport(source, write),
+  }
 }
 
 /** Stable, testable report text: source summary, per-route outcome, plan notes. */

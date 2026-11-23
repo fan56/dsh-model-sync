@@ -35,7 +35,22 @@ import {
 } from './writer.ts'
 
 const SETTINGS_CONFLICT = 'SETTINGS_CONFLICT'
-const OWNED_FIELDS = ['api', 'baseURL', 'displayName', 'apiKeyEnv'] as const
+// O1-minimal: `displayName` is a display field, NOT an identity/ownership field.
+// It is deliberately kept out of this set so it matches the planner's
+// OWNERSHIP_FIELDS (detectConflict), which never checks it. A display-name-only
+// upstream change must not make the writer rewrite the route's identity fields.
+const OWNED_FIELDS = ['api', 'baseURL', 'apiKeyEnv'] as const
+
+// O1-minimal: a settings.mutate can land while the ledger/record write after it
+// fails. That route is NOT a clean success (no ledger => next round keeps it as
+// user-owned) and NOT a lock-only failure either (retrying does nothing). Report
+// it truthfully with its own code + reason + actionable advice.
+const UNACCOUNTED_CODE = 'settings-written-unaccounted'
+const UNACCOUNTED_ADVICE = 'settings were written but the ownership ledger was not updated; the next round will keep this route as user-owned (no refresh, no deletion); re-claim it with `/model-sync adopt go`'
+// Settings + ledger landed, but the migration record persist failed (S1).
+// This is not a failed route (fingerprint-healed next round), but it must not
+// be silent: the next round may see the route as un-migrated and close the gate.
+const RECORD_ADVICE = 'settings and the ownership ledger landed but the migration record could not be persisted; the next round may treat this route as un-migrated and close the gate; re-claim it with `/model-sync adopt go`'
 
 // ---------------------------------------------------------------------------
 // Injected seams
@@ -134,6 +149,12 @@ export interface GoWriteResult {
   /** Routes whose mutate failed, with an honest reason. */
   failedRoutes: { route: string; reason: string }[]
   /**
+   * O1-minimal: routes whose settings.mutate landed this round, whether or not
+   * the ledger commit after it succeeded. Used for an honest N1-abandon report
+   * (a route may have been written before the round was abandoned).
+   */
+  settingsLandedRoutes: string[]
+  /**
    * B4/N1: set when the round was abandoned because the host settings revision
    * moved mid-round. The caller must report this as
    * `settings-changed-during-sync` and treat the round as a zero-write no-op.
@@ -219,6 +240,12 @@ function isStoreLockTimeout(err: unknown): boolean {
  * keep it verbatim in the report and in the failed-route reason so the user
  * sees an actionable cause instead of a generic failure. The route is marked
  * `failed` and deliberately NOT added to `writtenRoutes`.
+ *
+ * O1-minimal: when `settingsLanded` is true the timeout happened on the ledger
+ * AFTER settings were written. The stock "The store was NOT modified. Retry the
+ * operation" text is then misleading (retry will not re-claim the route), so
+ * the report uses the truthful `settings-written-unaccounted` code and carries
+ * the advice. The original error detail is still kept verbatim for diagnosis.
  */
 function recordLockTimeout(
   result: GoWriteResult,
@@ -226,17 +253,20 @@ function recordLockTimeout(
   planned: GoPlannedRoute,
   err: unknown,
   phase: string,
+  settingsLanded = false,
 ): void {
-  const reason = 'store-lock-timeout'
+  const reason = settingsLanded ? UNACCOUNTED_CODE : 'store-lock-timeout'
   const detail = errorText(err)
   result.routes.push({ route: planned.route, slot: planned.slot, status: 'failed', reason })
   result.failedRoutes.push({ route: planned.route, reason })
   report.push({
     level: 'error',
-    code: 'store-lock-timeout',
+    code: reason,
     route: planned.route,
     slot: planned.slot,
-    message: `route ${planned.route} ${phase} hit a store lock timeout: ${detail}`,
+    message: settingsLanded
+      ? `route ${planned.route} ${phase} hit a store lock timeout after settings were written: ${detail}. ${UNACCOUNTED_ADVICE}`
+      : `route ${planned.route} ${phase} hit a store lock timeout: ${detail}`,
   })
 }
 
@@ -288,15 +318,22 @@ async function recordOwnWrite(
       deps.logger.warn('appliedFingerprint lock timeout for %s: %s', route, errorText(err))
       report.push({
         level: 'warn',
-        code: 'store-lock-timeout',
+        code: UNACCOUNTED_CODE,
         route,
-        message: `route ${route} appliedFingerprint re-persist hit a store lock timeout: ${errorText(err)}`,
+        message: `route ${route} appliedFingerprint re-persist hit a store lock timeout: ${errorText(err)}. ${RECORD_ADVICE}`,
       })
       return
     }
     // Settings + ledger already landed; a failed fingerprint write is healed at
-    // the next round (§14.7.4 fingerprint-healed), never a failed route.
+    // the next round (§14.7.4 fingerprint-healed), never a failed route. O1:
+    // still report it truthfully instead of leaving the record gap silent.
     deps.logger.warn('appliedFingerprint update failed for %s: %s', route, errorText(err))
+    report.push({
+      level: 'warn',
+      code: UNACCOUNTED_CODE,
+      route,
+      message: `route ${route} ${RECORD_ADVICE} (record error: ${errorText(err)})`,
+    })
   }
 }
 
@@ -320,6 +357,9 @@ function abandonForSettingsChange(
     ...result.routes.map((status) => status.route),
     ...result.failedRoutes.map((failed) => failed.route),
     ...result.writtenRoutes,
+    // O1-minimal (S7): a mutate may have landed even if its ledger commit then
+    // failed. Count it as touched and report it as already written.
+    ...result.settingsLandedRoutes,
   ])
   for (const planned of plan.routes) {
     if (planned.skip || touched.has(planned.route)) continue
@@ -330,10 +370,20 @@ function abandonForSettingsChange(
       reason: 'settings-changed-during-sync',
     })
   }
+  // O1-minimal (S7): never claim "zero settings writes" when a mutate already
+  // landed earlier in this round. List written vs discarded routes explicitly;
+  // keep the original zero-write wording byte-identical when nothing landed.
+  const landed = result.settingsLandedRoutes
+  const discarded = plan.routes
+    .filter((p) => !p.skip && !touched.has(p.route))
+    .map((p) => p.route)
+  const writeState = landed.length === 0
+    ? 'zero settings writes, no ledger/fingerprint update'
+    : `already written: [${landed.join(', ')}]; discarded (no settings write): [${discarded.length === 0 ? 'none' : discarded.join(', ')}]; no ledger/fingerprint update for discarded routes`
   report.push({
     level: 'warn',
     code: 'settings-changed-during-sync',
-    message: `llm-pi-ai revision ${String(expectedRevision)} -> ${actualRevision} during this round; stale plan discarded (zero settings writes, no ledger/fingerprint update); the next round re-reads current settings`,
+    message: `llm-pi-ai revision ${String(expectedRevision)} -> ${actualRevision} during this round; stale plan discarded (${writeState}); the next round re-reads current settings`,
   })
   result.report = associateGoMoves(report)
   return result
@@ -423,8 +473,11 @@ async function stageOverrides(
 export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promise<GoWriteResult> {
   const { settings, ownershipStore, logger, keyFingerprint } = deps
   const confirmRemovals = Math.max(2, deps.confirmRemovals ?? 2)
-  const result: GoWriteResult = { routes: [], writtenRoutes: [], failedRoutes: [], report: [] }
+  const result: GoWriteResult = { routes: [], writtenRoutes: [], failedRoutes: [], settingsLandedRoutes: [], report: [] }
   const report = plan.report.map((entry) => ({ ...entry }))
+  // O1-minimal: routes whose settings landed but whose ledger did not commit.
+  // Their planner `added` lines must be suppressed (they were not claimed).
+  const unaccounted = new Set<string>()
 
   for (const conflict of plan.conflicts) {
     result.routes.push({
@@ -655,6 +708,7 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
       try {
         await settings.mutate('llm-pi-ai', built.ops, live?.revision ?? desc.revision)
         settingsLanded = true
+        result.settingsLandedRoutes.push(planned.route)
         // Our own write advances the document revision. Re-read it so later
         // routes compare against this new baseline instead of the stale
         // round-level revision (otherwise every subsequent route would look
@@ -707,6 +761,7 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
             await stageOverrides(deps.overrideStorer, planned.route, retryBuilt.settingsOverrides)
             await settings.mutate('llm-pi-ai', retryBuilt.ops, fresh.revision)
             settingsLanded = true
+            result.settingsLandedRoutes.push(planned.route)
             failedReason = undefined
           } catch (retryErr) {
             if (isStoreLockTimeout(retryErr)) {
@@ -736,13 +791,24 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
     // re-persist the applied fingerprint (same store queue as the ledger), with
     // the managed id set we just committed. Failed/no-change routes never get
     // here, so a partial failure leaves their fingerprint untouched.
-    const commit = await persistLedger(ownershipStore, key, planned.unset, nextEntry, logger, report, planned.route)
+    const commit = await persistLedger(ownershipStore, key, planned.unset, nextEntry, logger, report, planned.route, settingsLanded)
     if (commit.lockTimeout !== undefined) {
       // Settings may have landed, but without a committed ledger this round is
       // NOT a success: report the actionable lock error and exclude the route
       // from writtenRoutes (and from the fingerprint update).
-      recordLockTimeout(result, report, planned, commit.lockTimeout, 'ledger commit')
+      recordLockTimeout(result, report, planned, commit.lockTimeout, 'ledger commit', settingsLanded)
+      if (settingsLanded) unaccounted.add(planned.route)
       continue
+    }
+    if (!commit.committed) {
+      // O1-minimal: settings landed but the ledger did not. This is a real
+      // (non-lock) failure — surface it in failedRoutes so the command result
+      // is `kind:'error'` and the route is not advertised as a clean success.
+      result.failedRoutes.push({
+        route: planned.route,
+        reason: settingsLanded ? UNACCOUNTED_CODE : 'ledger-write-failed',
+      })
+      if (settingsLanded) unaccounted.add(planned.route)
     }
     if (commit.committed) {
       await recordOwnWrite(deps, planned.route, planned.unset ? [] : Object.keys(nextEntry.managed).sort(), report)
@@ -755,7 +821,16 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
     })
   }
 
-  result.report = associateGoMoves(report)
+  // O1-minimal: never advertise an `added` model on a route that was skipped,
+  // failed, or written-but-unaccounted. The model was not claimed in the ledger,
+  // so the next round will treat it as user-owned (S1/S2 report-text trap).
+  const notClaimed = new Set([
+    ...result.routes.filter((r) => r.status === 'skipped' || r.status === 'failed').map((r) => r.route),
+    ...unaccounted,
+  ])
+  const honestReport = report.filter((entry) =>
+    !(entry.code === 'added' && entry.route !== undefined && notClaimed.has(entry.route)))
+  result.report = associateGoMoves(honestReport)
   return result
 }
 
@@ -768,6 +843,7 @@ async function persistLedger(
   logger: Logger,
   report: GoPlanReportEntry[],
   route: string,
+  settingsLanded = false,
 ): Promise<LedgerCommitResult> {
   try {
     if (unset) await store.delete(key)
@@ -780,15 +856,25 @@ async function persistLedger(
       logger.warn('ownership store lock timeout for %s: %s', key, errorText(err))
       return { committed: false, lockTimeout: err }
     }
-    // Settings already landed; a failed ledger write degrades to "no ledger"
-    // next round, which is the safe direction (never delete without a hash).
+    // A failed ledger write degrades to "no ledger" next round, which is the
+    // safe direction (never delete without a hash). But when settings already
+    // landed this is NOT a clean success: say so truthfully (O1-minimal).
     logger.warn('ownership store write failed for %s: %s', key, errorText(err))
-    report.push({
-      level: 'warn',
-      code: 'ledger-write-failed',
-      route,
-      message: `route ${route} written but ownership ledger could not be persisted`,
-    })
+    if (settingsLanded) {
+      report.push({
+        level: 'error',
+        code: UNACCOUNTED_CODE,
+        route,
+        message: `route ${route} ${UNACCOUNTED_ADVICE} (ledger write error: ${errorText(err)})`,
+      })
+    } else {
+      report.push({
+        level: 'warn',
+        code: 'ledger-write-failed',
+        route,
+        message: `route ${route} written but ownership ledger could not be persisted`,
+      })
+    }
     return { committed: false }
   }
 }

@@ -1340,6 +1340,11 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
                 // text carries the actionable "settings changed, next round
                 // retries" guidance; no backoff is scheduled for it.
                 || outcome.reason === 'settings-changed-during-sync'
+                // O1-minimal: failedRoutes (e.g. settings written but the ledger
+                // failed) are a real failure even if other routes wrote. Callers
+                // that only read `kind` must see `error`; the actionable reason
+                // and the new report code are carried in `text`.
+                || outcome.reason === 'write-failed'
               return {
                 kind: failed ? 'error' : 'success',
                 text: outcome.text,

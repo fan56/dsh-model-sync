@@ -780,6 +780,105 @@ await checkAsync('N4-b: plain-object DSH_STORE_LOCK_TIMEOUT on ledger write is r
   h.dispose()
 })
 
+// ---------------------------------------------------------------------------
+// O1-minimal (P2) — S3 (refresh + ledger failure → rollback hash-mismatch),
+// S8a (apply failure after writes → truthful "writes reverted" text), and
+// S8c (stuck `applying` is recoverable). All offline; no real ~/.dsh.
+// ---------------------------------------------------------------------------
+
+await checkAsync('O1 #4 (S3): refresh + ledger failure → rollback refused hash-mismatch; healthy control rolls back', async () => {
+  const makeRound = (breakLedger) => {
+    const roundEntries = [...OFFICIAL.map((e) => ({ ...e }))]
+    const h = createHarness({ initialRoutes: { 'opencode-go': structuredClone(LEGACY_CHAT) }, roundEntries })
+    return { h, roundEntries }
+  }
+  const runRefresh = async (h, roundEntries, breakLedger) => {
+    const plan = parsePlan((await h.invoke('migrate plan --adopt')).text)
+    const applied = await h.invoke(`migrate apply --adopt --plan ${plan.planHash} --confirm ${plan.confirmCode} --ack-managed`)
+    assert.equal(applied.kind, 'success', applied.text)
+    const chatKey = [...h.ownership.data.keys()].find((k) => k.startsWith('opencode-go#'))
+    const changedId = Object.keys(h.ownership.data.get(chatKey).managed)[0]
+    const changedEntry = roundEntries.find((e) => e.id === changedId)
+    changedEntry.name = `${changedEntry.name} (upstream v2)`
+    if (breakLedger) {
+      const originalWrite = h.ownership.write
+      h.ownership.write = async () => { throw new Error('ledger full') }
+      const round = await h.invoke('go')
+      h.ownership.write = originalWrite
+      return { plan, round, changedId, changedEntry }
+    }
+    const round = await h.invoke('go')
+    return { plan, round, changedId, changedEntry }
+  }
+
+  // Broken ledger: settings carry the refreshed value, ledger hash stays old.
+  const bad = makeRound(true)
+  const broken = await runRefresh(bad.h, bad.roundEntries, true)
+  assert.equal(broken.round.kind, 'error', broken.round.text)
+  assert.match(broken.round.text, /settings-written-unaccounted/)
+  assert.equal(
+    bad.h.settings.state.get('opencode-go').models.find((m) => m.id === broken.changedId)?.name,
+    broken.changedEntry.name,
+    'the refreshed metadata did land in settings',
+  )
+  const refused = await bad.h.invoke(`migrate rollback --plan ${broken.plan.planHash}`)
+  assert.equal(refused.kind, 'error', refused.text)
+  assert.match(refused.text, /hash-mismatch/, 'rollback refuses a stale managed hash')
+
+  // Healthy control: same refresh with a working ledger, rollback succeeds.
+  const good = makeRound(false)
+  const healthy = await runRefresh(good.h, good.roundEntries, false)
+  assert.equal(healthy.round.kind, 'success', healthy.round.text)
+  const ok = await good.h.invoke(`migrate rollback --plan ${healthy.plan.planHash}`)
+  assert.equal(ok.kind, 'success', ok.text)
+  bad.h.dispose()
+  good.h.dispose()
+})
+
+await checkAsync('O1 #7 (S8a): apply failure after writes restores exact bytes and reports the rollback truthfully', async () => {
+  const before = structuredClone(LEGACY_CHAT)
+  const expected = JSON.stringify(before)
+  const h = createHarness({ initialRoutes: { 'opencode-go': structuredClone(before) } })
+  const plan = parsePlan((await h.invoke('migrate plan')).text)
+  // Fail at step 4 (after settings + ledger landed), so writes did happen.
+  const originalWrite = h.migrationStore.write
+  h.migrationStore.write = async (record) => {
+    if (record.appliedFingerprint !== undefined) throw new Error('record persist failed')
+    return originalWrite(record)
+  }
+  const result = await h.invoke(`migrate apply --plan ${plan.planHash} --confirm ${plan.confirmCode} --ack-managed`)
+  assert.equal(result.kind, 'error', result.text)
+  assert.match(result.text, /settings writes were rolled back/, 'truthful: writes happened then were reverted')
+  assert.doesNotMatch(result.text, /; zero writes/, 'no false zero-write claim')
+  assert.equal(JSON.stringify(h.settings.state.get('opencode-go')), expected, 'byte-identical section restored')
+  assert.equal(h.migrationStore.record?.applying, false, 'applying flag cleared')
+  assert.equal(h.ownership.data.size, 0, 'ledger entries dropped by the restore')
+  h.migrationStore.write = originalWrite
+  h.dispose()
+})
+
+await checkAsync('O1 #7 (S8c): a stuck applying flag still lets a later rollback recover', async () => {
+  const h = createHarness({ initialRoutes: { 'opencode-go': LEGACY_CHAT } })
+  const plan = parsePlan((await h.invoke('migrate plan')).text)
+  // Crash window: applying flag + captured backup, no settings/ledger change.
+  h.migrationStore.record = {
+    applying: true,
+    planHash: plan.planHash,
+    backup: {
+      planHash: plan.planHash,
+      capturedAt: 1,
+      routes: { 'opencode-go': { section: structuredClone(LEGACY_CHAT) } },
+    },
+  }
+  const during = await h.invoke('go')
+  assert.match(during.text, /applying|skipped/i, 'go round drops while applying')
+  assert.equal(h.settings.mutations.length, 0, 'no settings write while applying')
+  const rolled = await h.invoke(`migrate rollback --plan ${plan.planHash}`)
+  assert.equal(rolled.kind, 'success', rolled.text)
+  assert.equal(h.migrationStore.record.applying, false, 'applying flag cleared by recovery')
+  h.dispose()
+})
+
 if (failed > 0) {
   console.error(`\n${failed} test(s) failed, ${passed} passed`)
   process.exit(1)

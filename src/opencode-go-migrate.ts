@@ -1078,8 +1078,14 @@ export interface MigrateApplyResult {
   text: string
 }
 
-function applyFailure(reason: MigrateApplyReason, planHash: string, confirmCode: string, detail: string): MigrateApplyResult {
-  return { ok: false, reason, planHash, confirmCode, routes: [], actions: [], text: `migrate apply refused (${reason}): ${detail}; zero writes` }
+function applyFailure(reason: MigrateApplyReason, planHash: string, confirmCode: string, detail: string, writesReverted = false): MigrateApplyResult {
+  // O1-minimal: "zero writes" is only true for a refusal BEFORE the first
+  // mutate. When settings were written and then byte-restored, say so instead
+  // of misreporting a clean zero-write no-op.
+  const outcome = writesReverted
+    ? 'settings writes were rolled back to the pre-apply snapshot (bytes restored; no net change)'
+    : 'zero writes'
+  return { ok: false, reason, planHash, confirmCode, routes: [], actions: [], text: `migrate apply refused (${reason}): ${detail}; ${outcome}` }
 }
 
 export async function applyMigration(
@@ -1293,7 +1299,7 @@ export async function applyMigration(
     // Best-effort restore from the captured snapshot; re-lock and keep no fingerprint.
     await restoreOnApplyFailure(deps, backup, writtenRoutes, committedLedgerKeys, prior)
     deps.logger.warn('migrate apply rolled back after failure: %s', failure)
-    return applyFailure('write-failed', plan.planHash, plan.confirmCode, failure)
+    return applyFailure('write-failed', plan.planHash, plan.confirmCode, failure, writtenRoutes.length > 0)
   }
 
   // N1: count the settings writes that actually happened (`writtenRoutes`),
