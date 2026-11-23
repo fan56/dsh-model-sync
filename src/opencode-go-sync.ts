@@ -24,6 +24,12 @@ import {
 import type { SettingsModelProfile } from './translate.ts'
 import type { Logger, SettingsDescriptor, SettingsService } from './writer.ts'
 import { routeWriter, type MigrationStatus } from './opencode-go-migration.ts'
+import {
+  formatReconcileSummary,
+  reconcileJournals,
+  type GoJournalStore,
+  type ReconcileResult,
+} from './opencode-go-journal.ts'
 
 /**
  * Cordis service names used only as injection seams. Both are optional:
@@ -77,6 +83,18 @@ export interface GoRoundDeps {
   reloadMigration?: () => Promise<MigrationStatus>
   /** §14.7.4: forward the post-own-write managed ids to the record persister. */
   onOwnWrite?: (route: string, managedIds: string[]) => Promise<void>
+  /**
+   * O1/C2: file-backed write-ahead journal store. With `profileKey` and
+   * `keyFingerprint`, the round reconciles surviving journals BEFORE the
+   * migration gate (a closed gate must still self-heal). Omitted by pure unit
+   * callers — no journal, no reconciliation, pre-C2 behavior.
+   */
+  journalStore?: GoJournalStore
+  /** O1/C2: stable profile key used to scope reconciliation. */
+  profileKey?: string
+  /** O1/C2: current credential fingerprint; journals stamped with another key
+   * are orphans and are discarded, never replayed. */
+  keyFingerprint?: string
 }
 
 export type GoRoundReason =
@@ -105,6 +123,8 @@ export interface GoSyncRoundResult {
    * companion to the user-visible `text` (no write, no ledger/fingerprint).
    */
   settingsChanged?: { beforeRevision: number; afterRevision: number }
+  /** O1/C2: outcome of the pre-gate journal reconciliation (when wired). */
+  journal?: ReconcileResult
   /** Human-readable lines for `/model-sync` and the auto-round logger. */
   text: string
 }
@@ -248,25 +268,58 @@ export async function runGoSyncRound(deps: GoRoundDeps): Promise<GoSyncRoundResu
     }
   }
 
+  // O1/C2: reconcile BEFORE the migration gate. A crashed first write leaves
+  // sections present but no migration record → `legacy-inline` closes the gate
+  // forever; reconciliation runs even on that closed-gate round so the record
+  // can be re-committed and the gate reopened. It writes only the store/record
+  // (never settings) and validates profile scope + key fingerprint per slot.
+  let journalResult: ReconcileResult | undefined
+  let journalPrefix = ''
+  if (deps.journalStore !== undefined && deps.profileKey !== undefined && deps.keyFingerprint !== undefined) {
+    journalResult = await reconcileJournals({
+      journalStore: deps.journalStore,
+      ownershipStore,
+      settings,
+      profileKey: deps.profileKey,
+      keyFingerprint: deps.keyFingerprint,
+      logger,
+      onRecord: deps.onOwnWrite,
+    })
+    const summary = formatReconcileSummary(journalResult)
+    journalPrefix = [summary, ...journalResult.lines].filter((line) => line.length > 0).join('\n') + '\n'
+  }
+  const withJournal = (round: GoSyncRoundResult): GoSyncRoundResult =>
+    journalPrefix === '' ? round : { ...round, journal: journalResult, text: journalPrefix + round.text }
+
   // M-4 migration gate + single writer (§14.6 / §14.7, ADR-008). All go routes
   // share one authority decision; when none of them may be written the round
   // short-circuits BEFORE the source fetch (zero side effects, explicit report).
-  const migration: MigrationStatus = deps.migration ?? {
+  let migration: MigrationStatus = deps.migration ?? {
     state: 'absent', fingerprint: '', identity: '', applying: false,
     fingerprintHealed: false, expectedFingerprint: '',
+  }
+  // Reconciliation may have just re-persisted the migration record that was
+  // missing when this round's snapshot was taken. Re-read it so a reconciled
+  // S1 can reopen the gate in THIS round instead of waiting for another one.
+  if ((journalResult?.reconciled.length ?? 0) > 0 && deps.reloadMigration !== undefined) {
+    try {
+      migration = await deps.reloadMigration()
+    } catch {
+      // Keep the original snapshot; the next round re-reads it anyway.
+    }
   }
   const authority = { caller: 'go' as const, goEnabled: config.enabled, goRoutes: Object.values(routes) }
   const decisions = Object.values(routes).map((route) => ({ route, decision: routeWriter(route, authority, migration) }))
   const blocked = decisions.filter((entry) => entry.decision.decision === 'skip')
   if (blocked.length === decisions.length) {
-    return {
+    return withJournal({
       ok: false,
       reason: 'migration-gate',
       text: [
         'opencode-go: migration gate — zero settings writes, no /v1/models request',
         ...blocked.map(({ route, decision }) => `  [info] ${decision.reason}; route=${route}`),
       ].join('\n'),
-    }
+    })
   }
 
   // B4 (31, design §14.7.5): snapshot the host settings document revision
@@ -285,22 +338,22 @@ export async function runGoSyncRound(deps: GoRoundDeps): Promise<GoSyncRoundResu
     })
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
-    return { ok: false, reason: 'source-failed', text: `opencode-go: source error — ${message}; no settings write` }
+    return withJournal({ ok: false, reason: 'source-failed', text: `opencode-go: source error — ${message}; no settings write` })
   }
 
   if (!source.ok) {
     const error = source.error
-    return {
+    return withJournal({
       ok: false,
       reason: 'source-failed',
       source,
       text: `opencode-go: source failed (${error?.kind ?? 'unknown'}${error?.status !== undefined ? ` HTTP ${error.status}` : ''}) — ${error?.message ?? 'unknown error'}; kept last-good, no settings write`,
-    }
+    })
   }
 
   // The plugin may be disposed while the source request (or the ownership
   // reads below) is in flight. Never reach the writer after unload (§6.3 卸载).
-  if (deps.signal?.aborted) return abortedResult(source)
+  if (deps.signal?.aborted) return withJournal(abortedResult(source))
 
   // B4: re-read the descriptor AFTER the fetch. The plan must describe the
   // settings we are about to write, not the snapshot used to build the
@@ -310,15 +363,15 @@ export async function runGoSyncRound(deps: GoRoundDeps): Promise<GoSyncRoundResu
   // revision, not the stale merged models). Discard the whole round instead.
   const freshDesc = llmDescriptor(settings)
   if (freshDesc === undefined) {
-    return {
+    return withJournal({
       ok: false,
       reason: 'settings-unavailable',
       source,
       text: 'opencode-go: llm-pi-ai descriptor disappeared during the fetch; no settings write',
-    }
+    })
   }
   if (freshDesc.revision !== preFetchRevision) {
-    return settingsChangedResult(source, preFetchRevision, freshDesc.revision)
+    return withJournal(settingsChangedResult(source, preFetchRevision, freshDesc.revision))
   }
 
   // Plan from the post-fetch descriptor so the write target and the plan are
@@ -340,7 +393,7 @@ export async function runGoSyncRound(deps: GoRoundDeps): Promise<GoSyncRoundResu
 
   // Re-check immediately before the only settings mutation: a dispose that
   // lands during readOwnership/planning must still produce a zero-write round.
-  if (deps.signal?.aborted) return abortedResult(source)
+  if (deps.signal?.aborted) return withJournal(abortedResult(source))
 
   // §14.7.5: the second gate ALWAYS re-reads the persisted status on every
   // call — the round-level `migration` snapshot is never reused here. Without
@@ -381,40 +434,45 @@ export async function runGoSyncRound(deps: GoRoundDeps): Promise<GoSyncRoundResu
       expectedRevision: preFetchRevision,
       canWrite,
       onOwnWrite: deps.onOwnWrite,
+      // O1/C2: same journal store + profile scope used by the pre-gate
+      // reconciliation, so a surviving slot is written under the key the next
+      // round will look for.
+      journalStore: deps.journalStore,
+      profileKey: deps.profileKey,
     })
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
-    return {
+    return withJournal({
       ok: false,
       reason: 'source-failed',
       source,
       text: `opencode-go: writer error — ${message}; settings state is whatever landed before the error`,
-    }
+    })
   }
 
   // B4/N1: the writer abandoned the round because settings changed after
   // validation. Do NOT expose a `completed` write or a half-plan here — report
   // the same zero-write reason as the fetch-window guard.
   if (write.settingsChanged !== undefined) {
-    return writerSettingsChangedResult(
+    return withJournal(writerSettingsChangedResult(
       source,
       write.settingsChanged.expectedRevision,
       write.settingsChanged.actualRevision,
       write,
-    )
+    ))
   }
 
   // O1-minimal: a round with failedRoutes is never a clean `completed` success,
   // even though some routes may have written settings. The command surface maps
   // this reason to kind:'error'. (Only source failures back off — see scheduler.)
   const hasFailedRoutes = write.failedRoutes.length > 0
-  return {
+  return withJournal({
     ok: !hasFailedRoutes,
     reason: hasFailedRoutes ? 'write-failed' : 'completed',
     source,
     write,
     text: formatGoRoundReport(source, write),
-  }
+  })
 }
 
 /** Stable, testable report text: source summary, per-route outcome, plan notes. */

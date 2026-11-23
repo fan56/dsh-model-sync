@@ -59,6 +59,10 @@ import { OPENCODE_GO_MODELS_URL, OPENCODE_GO_DEFAULT_INTERVAL_MINUTES, fetchGoOf
 import { GO_SLOT_ROUTES, type GoRouteSlot } from './opencode-go-grouping.ts'
 import { createModelsStoreOwnershipStore } from './opencode-go-store.ts'
 import {
+  createModelsStoreJournalStore,
+  type GoJournalStore,
+} from './opencode-go-journal.ts'
+import {
   GO_FETCH_SERVICE,
   GO_OWNERSHIP_STORE_SERVICE,
   GO_OVERRIDE_STORER_SERVICE,
@@ -135,6 +139,8 @@ export const GO_MIGRATION_PUBLIC_CATALOG_SERVICE = 'goMigrationPublicCatalog'
 export const GO_MIGRATION_ADOPT_DISABLED_SERVICE = 'goMigrationAdoptDisabled'
 /** Optional override for the single-flight check (tests inject an in-flight mutex). */
 export const GO_MIGRATION_MUTEX_SERVICE = 'goMigrationMutex'
+/** O1/C2 seam: injected write-ahead journal store (tests use a temp-dir store). */
+export const GO_JOURNAL_STORE_SERVICE = 'goJournalStore'
 
 // dsh-settings 0.1.7 rewrote the seam: the runtime register(ns, schema) call
 // is gone, and a plugin's settings form is projected from its exported
@@ -491,6 +497,13 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
   const ownershipStoreForRound = (): GoOwnershipStore =>
     (ctx.get(GO_OWNERSHIP_STORE_SERVICE) as GoOwnershipStore | undefined)
       ?? createModelsStoreOwnershipStore(undefined, requireScopedProfileKey())
+  // O1/C2: the journal lives in the same models-store.json. An injected seam
+  // wins (tests use a temp-dir accessor); without a resolved profile identity
+  // there is NO journal — never fall back to the real default ~/.dsh from a
+  // host/test that supplied no identity (the ledger path fails closed too).
+  const journalStoreForRound = (): GoJournalStore | undefined =>
+    (ctx.get(GO_JOURNAL_STORE_SERVICE) as GoJournalStore | undefined)
+      ?? (profileKey === undefined ? undefined : createModelsStoreJournalStore())
 
   /**
    * Read current migration status from the persisted record + live settings +
@@ -946,6 +959,11 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
       fetchImpl: ctx.get(GO_FETCH_SERVICE) as GoFetchLike | undefined,
       signal: options.signal,
       migration,
+      // O1/C2: journal + reconciliation use the same profile/fingerprint as the
+      // ledger. Reconciliation runs before the gate inside runGoSyncRound.
+      journalStore: journalStoreForRound(),
+      profileKey,
+      keyFingerprint,
       // §14.7.5: the second gate re-reads the persisted record on each mutate
       // (strict: a failed read skips the route with canWrite-unavailable).
       reloadMigration: () => loadMigrationStatus({ keyFingerprint, strict: true }),
@@ -1123,6 +1141,10 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
       isSyncInFlight: (ctx.get(GO_MIGRATION_MUTEX_SERVICE) as (() => boolean) | undefined)
         ?? (() => goScheduler.isInFlight),
       applyReferenceRewrite: refWriter,
+      // O1/C2: apply/rollback clear this profile's journals so a stale slot
+      // cannot re-account settings that the migration just rewrote or undid.
+      journalStore: journalStoreForRound(),
+      profileKey,
     }
   }
 

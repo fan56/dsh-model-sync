@@ -33,6 +33,12 @@ import {
   type SettingsMutationOp,
   type SettingsService,
 } from './writer.ts'
+import {
+  goJournalKey,
+  journalContentHash,
+  type GoJournalStore,
+  type GoWriteJournal,
+} from './opencode-go-journal.ts'
 
 const SETTINGS_CONFLICT = 'SETTINGS_CONFLICT'
 // O1-minimal: `displayName` is a display field, NOT an identity/ownership field.
@@ -120,6 +126,19 @@ export interface GoWriterDeps {
    * for a failed write, a no-change round, or another writer's no-op success.
    */
   onOwnWrite?: (route: string, managedIds: string[]) => Promise<void> | void
+  /**
+   * O1/C2: write-ahead journal store. When present together with `profileKey`,
+   * each settings mutate is preceded by a journal slot recording the intended
+   * ledger entry + the post-write content hash; it is removed only after the
+   * ledger AND migration record both landed. The next round reconciles any
+   * surviving journal before the migration gate. Omitted by pure unit writers
+   * (no file-backed store) — those keep the pre-C2 behavior.
+   */
+  journalStore?: GoJournalStore
+  /** O1/C2: stable profile key for the journal slot (must match reconciliation). */
+  profileKey?: string
+  /** O1/C2: injectable clock for the journal timestamp; defaults to Date.now. */
+  now?: () => number
 }
 
 export interface GoCanWriteDecision {
@@ -301,16 +320,22 @@ function skipByCanWrite(
   })
 }
 
-/** §14.7.4: persist the new applied fingerprint only after settings+ledger success. */
+/**
+ * §14.7.4: persist the new applied fingerprint only after settings+ledger
+ * success. Returns true only when the record is actually persisted (or there
+ * is nothing to persist) — C2 keeps the journal open on false so the next
+ * round can re-persist it instead of silently closing the migration gate.
+ */
 async function recordOwnWrite(
   deps: GoWriterDeps,
   route: string,
   managedIds: string[],
   report: GoPlanReportEntry[],
-): Promise<void> {
-  if (deps.onOwnWrite === undefined) return
+): Promise<boolean> {
+  if (deps.onOwnWrite === undefined) return true
   try {
     await deps.onOwnWrite(route, managedIds)
+    return true
   } catch (err) {
     if (isStoreLockTimeout(err)) {
       // Settings + ledger already landed, so this is not a failed route, but a
@@ -322,7 +347,7 @@ async function recordOwnWrite(
         route,
         message: `route ${route} appliedFingerprint re-persist hit a store lock timeout: ${errorText(err)}. ${RECORD_ADVICE}`,
       })
-      return
+      return false
     }
     // Settings + ledger already landed; a failed fingerprint write is healed at
     // the next round (§14.7.4 fingerprint-healed), never a failed route. O1:
@@ -334,6 +359,55 @@ async function recordOwnWrite(
       route,
       message: `route ${route} ${RECORD_ADVICE} (record error: ${errorText(err)})`,
     })
+    return false
+  }
+}
+
+/** O1/C2: write the intent BEFORE settings.mutate so a later crash is recoverable. */
+async function writeJournal(
+  deps: GoWriterDeps,
+  key: string,
+  input: {
+    route: string
+    models: readonly SettingsModelProfile[]
+    entry: GoOwnershipEntry | undefined
+    unset: boolean
+    expectedRevision?: number
+  },
+): Promise<boolean> {
+  if (deps.journalStore === undefined || deps.profileKey === undefined) return false
+  const journal: GoWriteJournal = {
+    version: 1,
+    profileKey: deps.profileKey,
+    route: input.route,
+    keyFingerprint: deps.keyFingerprint,
+    modelIds: Object.keys(input.entry?.managed ?? {}).sort(),
+    contentHash: journalContentHash(input.models),
+    unset: input.unset,
+    at: deps.now?.() ?? Date.now(),
+  }
+  if (input.expectedRevision !== undefined) journal.expectedRevision = input.expectedRevision
+  if (input.entry !== undefined) journal.entry = input.entry
+  try {
+    await deps.journalStore.write(key, journal)
+    return true
+  } catch (err) {
+    // Journal persistence failure degrades to the pre-C2 path: do NOT block the
+    // settings write (that would change lock-timeout / gate semantics). The
+    // honest `settings-written-unaccounted` report still covers this rare
+    // residual window; the next round simply has no journal to reconcile.
+    deps.logger.warn('write-ahead journal write failed for %s: %s', input.route, errorText(err))
+    return false
+  }
+}
+
+/** O1/C2: remove a journal only after a fully accounted write (or an abandoned one). */
+async function deleteJournal(deps: GoWriterDeps, key: string | undefined): Promise<void> {
+  if (key === undefined || deps.journalStore === undefined) return
+  try {
+    await deps.journalStore.delete(key)
+  } catch (err) {
+    deps.logger.warn('write-ahead journal cleanup failed for %s: %s', key, errorText(err))
   }
 }
 
@@ -397,6 +471,8 @@ interface RouteOps {
   ops: SettingsMutationOp[]
   /** A non-empty settings overrides key was present (must be staged + unset). */
   settingsOverrides: Record<string, Record<string, unknown>> | undefined
+  /** The exact models array settings will hold after this mutate (C2 hash input). */
+  models: SettingsModelProfile[]
 }
 
 /**
@@ -425,6 +501,11 @@ async function buildRouteOps(
   const mergedModels = mergeOverrides(finalModels, overrides)
 
   const ops: SettingsMutationOp[] = []
+  // C2: the post-write models array (empty for an unset). We hash THIS on the
+  // journal; reconciliation hashes the models read back from settings and
+  // compares, so a user edit after our write is detected without ever writing
+  // settings from the reconciler.
+  let postWriteModels: SettingsModelProfile[] = []
   if (planned.unset) {
     // §9.4: an empty fully-managed route is removed wholesale — never `models: []`.
     ops.push({ op: 'unset', path: ['providers', planned.route] })
@@ -436,6 +517,7 @@ async function buildRouteOps(
     }
     const currentRaw = sortedModels(rawModels(desc, planned.route))
     const mergedSorted = sortedModels(mergedModels)
+    postWriteModels = mergedSorted
     const modelsEqual = overrides === undefined
       && currentRaw.length === mergedSorted.length
       && profilesEqual(currentRaw, mergedSorted)
@@ -448,7 +530,7 @@ async function buildRouteOps(
       ops.push({ op: 'unset', path: ['providers', planned.route, 'modelOverrides'] })
     }
   }
-  return ops.length === 0 ? undefined : { ops, settingsOverrides }
+  return ops.length === 0 ? undefined : { ops, settingsOverrides, models: postWriteModels }
 }
 
 async function stageOverrides(
@@ -704,6 +786,35 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
       }
     }
 
+    // O1/C2: journal the intent BEFORE the only settings mutate. A journal is
+    // kept on ANY failure after this point (mutate, ledger, record) so the next
+    // round can reconcile it. It is deleted only on a fully accounted success.
+    const jkey = deps.journalStore !== undefined && deps.profileKey !== undefined
+      ? goJournalKey(deps.profileKey, planned.route, keyFingerprint)
+      : undefined
+    let journalWritten = false
+    if (failedReason === undefined && jkey !== undefined) {
+      journalWritten = await writeJournal(deps, jkey, {
+        route: planned.route,
+        models: built.models,
+        entry: nextEntry,
+        unset: planned.unset,
+        expectedRevision: currentExpectedRevision,
+      })
+    }
+
+    // O1/C2: re-run the freshness check AFTER the journal store write, so the
+    // extra store I/O never widens the window between validation and mutate.
+    // If a user edit landed while we journaled, discard the journal (no mutate
+    // has run) and abandon the whole round with zero writes.
+    if (journalWritten && expectedRevision !== undefined) {
+      const afterJournal = findLlmDescriptor(settings)
+      if (afterJournal === undefined || afterJournal.revision !== currentExpectedRevision) {
+        await deleteJournal(deps, jkey)
+        return abandonForSettingsChange(result, report, plan, currentExpectedRevision, afterJournal?.revision ?? -1)
+      }
+    }
+
     if (failedReason === undefined) {
       try {
         await settings.mutate('llm-pi-ai', built.ops, live?.revision ?? desc.revision)
@@ -726,6 +837,9 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
           // edit that landed in the narrow gap before the mutate. Retrying with
           // the stale plan would delete the just-saved model — abandon the
           // whole round instead (no ledger/fingerprint, next round re-plans).
+          // No mutate landed for this route; drop the journal so reconciliation
+          // does not re-account an abandoned plan on the next round.
+          await deleteJournal(deps, jkey)
           const fresh = findLlmDescriptor(settings)
           return abandonForSettingsChange(result, report, plan, currentExpectedRevision, fresh?.revision ?? -1)
         } else {
@@ -757,6 +871,17 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
               }
               result.routes.push({ route: planned.route, slot: planned.slot, status: 'no-change' })
               continue
+            }
+            // O1/C2: the retry may write a different models array; refresh the
+            // journal so reconciliation hashes the value actually written.
+            if (jkey !== undefined && journalWritten) {
+              await writeJournal(deps, jkey, {
+                route: planned.route,
+                models: retryBuilt.models,
+                entry: nextEntry,
+                unset: planned.unset,
+                expectedRevision: currentExpectedRevision,
+              })
             }
             await stageOverrides(deps.overrideStorer, planned.route, retryBuilt.settingsOverrides)
             await settings.mutate('llm-pi-ai', retryBuilt.ops, fresh.revision)
@@ -811,7 +936,13 @@ export async function writeGoPlan(plan: GoPlanResult, deps: GoWriterDeps): Promi
       if (settingsLanded) unaccounted.add(planned.route)
     }
     if (commit.committed) {
-      await recordOwnWrite(deps, planned.route, planned.unset ? [] : Object.keys(nextEntry.managed).sort(), report)
+      const recordPersisted = await recordOwnWrite(
+        deps, planned.route, planned.unset ? [] : Object.keys(nextEntry.managed).sort(), report,
+      )
+      // C2: only a fully accounted write (settings + ledger + record) closes the
+      // journal. A failed record persist (S1b) keeps it so the next round's
+      // reconciliation re-persists the migration record and reopens the gate.
+      if (recordPersisted) await deleteJournal(deps, jkey)
     }
     if (settingsLanded) result.writtenRoutes.push(planned.route)
     result.routes.push({

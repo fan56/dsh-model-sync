@@ -49,6 +49,7 @@ import {
   type UnclaimedMigrationRecord,
 } from './opencode-go-migration.ts'
 import type { GoOwnershipStore } from './opencode-go-writer.ts'
+import type { GoJournalStore } from './opencode-go-journal.ts'
 import type { Logger, SettingsDescriptor, SettingsMutationOp, SettingsService } from './writer.ts'
 
 const OWNED_FIELDS = ['api', 'baseURL', 'displayName', 'apiKeyEnv'] as const
@@ -809,6 +810,26 @@ export interface MigrateDeps {
   isSyncInFlight?: () => boolean
   /** Optional: execute an opt-in rewrite of a verified reference key. Default: none. */
   applyReferenceRewrite?: (rewrite: ReferenceRewrite) => Promise<void>
+  /**
+   * O1/C2: after apply/rollback the profile's write-ahead journals are stale
+   * (the migration rewrote or undid those settings). Clearing them prevents a
+   * later round re-accounting a journal left by the pre-migration writer.
+   */
+  journalStore?: GoJournalStore
+  /** O1/C2: stable profile key whose journals are cleared. */
+  profileKey?: string
+}
+
+/** Best-effort: drop every write-ahead journal of this profile. */
+async function clearProfileJournals(deps: MigrateDeps): Promise<void> {
+  if (deps.journalStore === undefined || deps.profileKey === undefined) return
+  try {
+    await deps.journalStore.clearProfile(deps.profileKey)
+  } catch (err) {
+    // Advisory only: a surviving slot is re-validated (and discarded) by the
+    // next reconciliation, never replayed blindly. Never fail a migration for it.
+    deps.logger.warn('journal cleanup after migration failed: %s', errorText(err))
+  }
 }
 
 /**
@@ -1298,9 +1319,17 @@ export async function applyMigration(
   if (failure !== undefined) {
     // Best-effort restore from the captured snapshot; re-lock and keep no fingerprint.
     await restoreOnApplyFailure(deps, backup, writtenRoutes, committedLedgerKeys, prior)
+    // O1/C2: settings were restored to the pre-apply snapshot; any journal from
+    // the pre-migration writer is now stale. Drop it so a later round cannot
+    // re-account settings the apply just rolled back.
+    await clearProfileJournals(deps)
     deps.logger.warn('migrate apply rolled back after failure: %s', failure)
     return applyFailure('write-failed', plan.planHash, plan.confirmCode, failure, writtenRoutes.length > 0)
   }
+
+  // O1/C2: apply succeeded — its settings writes are fully accounted by the
+  // migration record + ledger. Any pre-migration journal is stale now.
+  await clearProfileJournals(deps)
 
   // N1: count the settings writes that actually happened (`writtenRoutes`),
   // not the per-route result rows (which now include truthful no-op `skipped`
@@ -1515,6 +1544,10 @@ export async function rollbackMigration(
     try {
       await mutateWithRetry(deps, item.ops)
     } catch (err) {
+      // Some rollback ops may already have landed. Drop this profile's journals
+      // so a later round cannot re-commit ledger/record for settings rollback
+      // is in the middle of undoing.
+      await clearProfileJournals(deps)
       return refuse('hash-mismatch', `${item.route}: settings mutate failed (${errorText(err)})`)
     }
   }
@@ -1533,6 +1566,10 @@ export async function rollbackMigration(
       applying: false,
     })
   }
+  // O1/C2: rollback rewrote settings back to the pre-migration snapshot; every
+  // journal of this profile describes a now-obsolete write. Clear them (this
+  // also removes key-rotation orphans) so no later round re-accounts them.
+  await clearProfileJournals(deps)
 
   return {
     ok: true,
