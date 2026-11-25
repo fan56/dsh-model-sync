@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.11.0] - 2026-11-25
 
 ### Added
 
@@ -261,7 +261,8 @@ Known limitations of the new one-shot `migrate-go` path (registered, not fixed i
 
 - First tagged release.
 
-[Unreleased]: https://github.com/fan56/dsh-model-sync/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/fan56/dsh-model-sync/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/fan56/dsh-model-sync/releases/tag/v0.11.0
 [0.4.1]: https://github.com/fan56/dsh-model-sync/releases/tag/v0.4.1
 [0.4.0]: https://github.com/fan56/dsh-model-sync/releases/tag/v0.4.0
 [0.3.1]: https://github.com/fan56/dsh-model-sync/releases/tag/v0.3.1
