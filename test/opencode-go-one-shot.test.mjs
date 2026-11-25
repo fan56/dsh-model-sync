@@ -5,8 +5,9 @@
 
 import assert from 'node:assert/strict'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { createRequire } from 'node:module'
 import {
   apply,
   GO_MIGRATION_ENTRIES_SERVICE,
@@ -672,6 +673,199 @@ await check('patch editor: flow tags / single-pair items / merge keys / anchors 
   }
 })
 
+// ---------------------------------------------------------------------------
+// Patch editor round 3: flow brackets pair BY TYPE (blocker), properly nested
+// single-line flow collections decode like the host, and the double-quote
+// escape domain is host-faithful with conservative refusal for anything the
+// decoder does not carry. Value assertions are cross-checked against the
+// HOST's own yaml@2 decoder (the package the dsh host parses profile patches
+// with), loaded read-only from the repo's pnpm store or the host profiles
+// closure; when neither exists the recorded expected values stand alone.
+// ---------------------------------------------------------------------------
+
+const requireForHostYaml = createRequire(import.meta.url)
+
+/** The host's yaml@2, or undefined when no read-only copy is reachable. */
+function loadHostYaml() {
+  for (const dir of [
+    new URL('../node_modules/.pnpm/yaml@2.9.1/node_modules/yaml/', import.meta.url).pathname,
+    join(homedir(), '.dsh', 'profiles', 'node_modules', 'yaml'),
+  ]) {
+    try { return requireForHostYaml(dir) } catch { /* try the next candidate */ }
+  }
+  return undefined
+}
+
+const hostYaml = loadHostYaml()
+
+/** Host decode of one flow value, or undefined when the host yaml is unavailable. */
+const hostDecode = (flowText) => {
+  if (hostYaml === undefined) return undefined
+  try { return hostYaml.parse('k: ' + flowText).k } catch { return 'HOST-REJECTED' }
+}
+
+function assertHostAgrees(flowText, ours, label) {
+  const theirs = hostDecode(flowText)
+  if (theirs === undefined) return // no host yaml reachable: recorded values stand alone
+  assert.deepEqual(ours, theirs, `${label}: must decode exactly like the host yaml (host: ${JSON.stringify(theirs)})`)
+}
+
+await check('patch editor: flow brackets must pair by type — mixed-bracket documents are refused (round 3 blocker)', () => {
+  // Before the fix the mixed depth counter let `{a: b]` / `[a, b}` resolve,
+  // parseFlow sliced without checking the outer pair, and the written file was
+  // one the host yaml refuses to load (BAD_INDENT) while migrate-go reported
+  // SUCCESS.
+  const setOp = { op: 'set', path: ['providers', 'x', 'api'], value: 'openai-completions' }
+  for (const [name, lines, pattern] of [
+    ['map opened, closed with sequence bracket', ['x:', '  models: {a: b]'], /mismatched flow bracket/],
+    ['sequence opened, closed with map bracket', ['x:', '  models: [a, b}'], /mismatched flow bracket/],
+    ['mismatch on the INNER bracket of a nested pair', ['x:', '  models: [{a: 1]]'], /mismatched flow bracket/],
+    // The close resolves here and the stray `]` is trailing content — still a
+    // refusal (the host rejects the trailing bracket too), just not a pairing
+    // one.
+    ['stray extra closing bracket', ['x:', '  models: [a, b]]'], /unexpected content after a flow collection/],
+  ]) {
+    const doc = patchWithProviders(lines)
+    const parsed = parsePatchDocument(doc)
+    assert.equal(parsed.ok, false, `${name} must not parse (the host yaml rejects the document)`)
+    assert.match(parsed.reason, pattern, name)
+    // The refusal is total: no op batch can run against the document either.
+    assert.equal(applyPatchOps(doc, [setOp]).ok, false, `${name}: ops refuse with zero writes`)
+  }
+})
+
+await check('patch editor: properly nested single-line flow collections decode like the host yaml (round 3)', () => {
+  const doc = patchWithProviders([
+    'x:',
+    '  nested: [{a: 1}]',
+    '  deep: [{a: 1}, {b: [2, 3]}]',
+    '  mapOfFlow: {a: [1, 2], b: {c: d}}',
+    '  quotedBrackets: {a: "[x]"}',
+    '  deepSeq: [[a]]',
+    '  spaced: [ [ a ] ]',
+    '  flowPairInNestedMap: [{a: b}]',
+  ])
+  const parsed = parsePatchDocument(doc)
+  assert.equal(parsed.ok, true, parsed.ok ? '' : parsed.reason)
+  const x = patchLlmPiAiProviders(parsed.root).providers.x
+  assert.deepEqual(x.nested, [{ a: 1 }])
+  assert.deepEqual(x.deep, [{ a: 1 }, { b: [2, 3] }])
+  assert.deepEqual(x.mapOfFlow, { a: [1, 2], b: { c: 'd' } })
+  assert.deepEqual(x.quotedBrackets, { a: '[x]' }, 'brackets inside a quoted flow scalar are content')
+  assert.deepEqual(x.deepSeq, [['a']])
+  assert.deepEqual(x.spaced, [['a']])
+  assert.deepEqual(x.flowPairInNestedMap, [{ a: 'b' }], 'a key: value pair INSIDE a nested map is a normal entry')
+  // Every value must equal the host yaml's decode of the same text.
+  assertHostAgrees('[{a: 1}]', x.nested, 'nested')
+  assertHostAgrees('[{a: 1}, {b: [2, 3]}]', x.deep, 'deep')
+  assertHostAgrees('{a: [1, 2], b: {c: d}}', x.mapOfFlow, 'mapOfFlow')
+  assertHostAgrees('{a: "[x]"}', x.quotedBrackets, 'quotedBrackets')
+  assertHostAgrees('[[a]]', x.deepSeq, 'deepSeq')
+  assertHostAgrees('[{a: b}]', x.flowPairInNestedMap, 'flowPairInNestedMap')
+  // Write path: an op against a tree with nested flow lines splices cleanly
+  // and the untouched nested line survives verbatim.
+  const applied = applyPatchOps(doc, [{ op: 'set', path: ['providers', 'x', 'api'], value: 'openai-completions' }])
+  assert.equal(applied.ok, true, applied.ok ? '' : applied.reason)
+  assert.ok(applied.next.includes('  nested: [{a: 1}]'), 'the untouched nested flow line survives byte-for-byte')
+  const reparsed = patchLlmPiAiProviders(parsePatchDocument(applied.next).root)
+  assert.equal(reparsed.providers.x.api, 'openai-completions')
+  assert.deepEqual(reparsed.providers.x.nested, [{ a: 1 }])
+})
+
+await check('patch editor: double-quoted escapes decode like the host yaml; unsupported escapes refuse (round 3)', () => {
+  // Supported domain: \n \t \r \" \\ \0 \b \f \xXX \uXXXX \UXXXXXXXX — each
+  // value-equal to the host yaml's decode (cross-checked when reachable).
+  const doc = patchWithProviders([
+    'x:',
+    '  lf: ["e\\nf"]',
+    '  tab: ["a\\tb"]',
+    '  cr: ["a\\rb"]',
+    '  dq: ["a\\"b"]',
+    '  bs: ["a\\\\b"]',
+    '  escPair: ["\\\\n"]',
+    '  nul: ["\\0"]',
+    '  bsF: ["\\b\\f"]',
+    '  hex: ["\\x41"]',
+    '  uni: ["\\u00e9"]',
+    '  uni8: ["\\U0001F600"]',
+  ])
+  const parsed = parsePatchDocument(doc)
+  assert.equal(parsed.ok, true, parsed.ok ? '' : parsed.reason)
+  const x = patchLlmPiAiProviders(parsed.root).providers.x
+  const cases = [
+    // [field, flow text in the doc, expected decode (a one-element array)]
+    ['lf', '["e\\nf"]', ['e\nf']],
+    ['tab', '["a\\tb"]', ['a\tb']],
+    ['cr', '["a\\rb"]', ['a\rb']],
+    ['dq', '["a\\"b"]', ['a"b']],
+    ['bs', '["a\\\\b"]', ['a\\b']],
+    ['escPair', '["\\\\n"]', ['\\n']],
+    ['nul', '["\\0"]', ['\0']],
+    ['bsF', '["\\b\\f"]', ['\b\f']],
+    ['hex', '["\\x41"]', ['A']],
+    ['uni', '["\\u00e9"]', ['é']],
+    ['uni8', '["\\U0001F600"]', ['\u{1F600}']],
+  ]
+  for (const [field, flowText, value] of cases) {
+    assert.deepEqual(x[field], value, `field ${field}`)
+    assertHostAgrees(flowText, x[field], field)
+  }
+  // The same escape domain applies at BLOCK position.
+  const block = parsePatchDocument(patchWithProviders(['x:', '  note: "e\\nf"']))
+  assert.equal(block.ok, true)
+  assert.deepEqual(patchLlmPiAiProviders(block.root).providers.x.note, 'e\nf')
+  // Single-quote semantics unchanged: only '' collapses; backslashes are literal.
+  const sq = parsePatchDocument(patchWithProviders(['x:', "  note: ['it''s']", "  lit: ['a\\b']"]))
+  assert.equal(sq.ok, true)
+  const sqx = patchLlmPiAiProviders(sq.root).providers.x
+  assert.deepEqual(sqx.note, ["it's"])
+  assert.deepEqual(sqx.lit, ['a\\b'])
+  assertHostAgrees("['it''s']", sqx.note, 'sq note')
+  // Unsupported escapes REFUSE (conservative): the host either decodes them
+  // differently (\a \/\N …) or rejects the document outright (\q, truncated
+  // hex, \U beyond U+10FFFF).
+  const setOp = { op: 'set', path: ['providers', 'x', 'api'], value: 'openai-completions' }
+  for (const [name, value] of [
+    ['unknown escape', '[a, "\\q"]'],
+    ['host-supported bell but outside the carried domain', '["\\a"]'],
+    ['truncated hex escape', '["\\x4"]'],
+    ['truncated unicode escape', '["\\u00"]'],
+    ['code point beyond U+10FFFF', '["\\U0011FFFF"]'],
+  ]) {
+    const refused = parsePatchDocument(patchWithProviders(['x:', `  m: ${value}`]))
+    assert.equal(refused.ok, false, `${name} must not parse`)
+    assert.match(refused.reason, /escape/, name)
+    const docText = patchWithProviders(['x:', `  m: ${value}`])
+    assert.equal(applyPatchOps(docText, [setOp]).ok, false, `${name}: ops refuse with zero writes`)
+  }
+})
+
+await check('patch editor: numeric-form keys are refused and numeric-form strings render quoted (round 3)', () => {
+  // Keys the host yaml resolves to numbers fold like 1/007 — refused.
+  for (const key of ['1e3', '0x1F', '1.', '.5', '.inf', '.NaN', '0o17', '+1e3', '-.inf']) {
+    const doc = parsePatchDocument(patchWithProviders([`${key}:`, '  apiKeyEnv: K']))
+    assert.equal(doc.ok, false, `numeric-form key ${key} must not parse`)
+    assert.match(doc.reason, /numeric-form/, key)
+  }
+  // The host really does fold these keys (differential sanity when reachable).
+  if (hostYaml !== undefined) {
+    assert.equal(hostYaml.parse('1e3: v')['1000'], 'v')
+    assert.equal(hostYaml.parse('0x1F: v')['31'], 'v')
+  }
+  // Write-back: numeric-form strings are QUOTED so the host reads the string
+  // back, not a number. Plain decimal strings stay quoted too; numbers and
+  // ordinary identifiers render plain.
+  for (const [text, rendered] of [
+    ['1e3', '"1e3"'], ['0x1F', '"0x1F"'], ['1.', '"1."'], ['.5', '".5"'],
+    ['.inf', '".inf"'], ['-.inf', '"-.inf"'], ['.NaN', '".NaN"'], ['0o17', '"0o17"'],
+    ['+007', '"+007"'], ['42', '"42"'],
+    ['plain-value', 'plain-value'], ['1:30', '1:30'],
+  ]) {
+    assert.equal(renderYamlScalar(text), rendered, `renderYamlScalar(${JSON.stringify(text)})`)
+  }
+  assert.equal(renderYamlScalar(1000), '1000', 'an actual NUMBER renders plain (host reads it as a number)')
+})
+
 await check('patch editor: colon-space in a value position is refused (review M2)', () => {
   for (const [name, lines] of [
     ['nested compact mapping', ['y: a: b']],
@@ -816,6 +1010,42 @@ await check('e2e: a target with an uneditable patch is skipped at discovery; oth
     assert.ok(store[`other#opencode-go#${fingerprint}`], 'the healthy sibling target still migrated')
     assert.ok(store[`curr#opencode-go#${fingerprint}`], 'the current profile still migrated')
     assert.equal(store[`bad#opencode-go#${fingerprint}`], undefined, 'the refused target wrote nothing')
+  } finally {
+    h.dispose()
+  }
+})
+
+await check('e2e: a patch with mismatched flow brackets is refused at discovery — skipped, zero writes, never confirmed (round 3 blocker)', async () => {
+  // Pre-fix e2e proof: `models: [alpha, beta}` PARSED (mixed depth counter +
+  // unchecked slice), the target migrated, and migrate-go reported SUCCESS
+  // for a file the host yaml then refused to load (BAD_INDENT).
+  const badFlowPatch = [
+    '# mismatched-bracket patch: the host yaml rejects it; the editor must too',
+    '- id: llm-pi-ai',
+    '  config:',
+    '    providers:',
+    '      opencode-go:',
+    '        apiKeyEnv: OPENCODE_GO_API_KEY',
+    '        models: [alpha, beta}',
+  ].join('\n')
+  const h = createHarness({ extraProfiles: { bad: badFlowPatch, other: OTHER_PATCH } })
+  try {
+    const badBefore = readFileSync(join(h.profilesDir, 'bad', 'cordis.patch.yml'), 'utf8')
+    const result = await h.invoke('migrate-go --all-profiles')
+    assert.equal(result.kind, 'success', result.text)
+    assert.match(result.text, /skipped: bad: line 7: flow collection opened with "\[" but closed with "\}"/, 'the refusal names the mismatched brackets')
+    // File bytes unchanged, no backup, nothing in the store, and the ONE
+    // batch confirmation never covered the refused target.
+    assert.equal(readFileSync(join(h.profilesDir, 'bad', 'cordis.patch.yml'), 'utf8'), badBefore, 'bad patch untouched (byte-for-byte)')
+    assert.equal(readdirSync(join(h.profilesDir, 'bad')).filter((name) => name.includes('.bak.')).length, 0, 'no backup taken for the refused target')
+    const fingerprint = fingerprintKey(KEY)
+    const store = JSON.parse(readFileSync(h.storePath, 'utf8'))
+    assert.equal(store[`bad#opencode-go#${fingerprint}`], undefined, 'the refused target wrote nothing')
+    assert.ok(store[`other#opencode-go#${fingerprint}`], 'the healthy sibling target still migrated')
+    assert.ok(store[`curr#opencode-go#${fingerprint}`], 'the current profile still migrated')
+    assert.equal(h.ask.calls, 1, 'still exactly one batch confirmation')
+    assert.ok(!h.ask.questions[0].questions[0].question.includes('[bad]'), 'the refused target is absent from the confirmation')
+    assert.ok(!/\[bad\]/.test(result.text.split('\n').filter((line) => !line.includes('skipped:')).join('\n')), 'the refused target appears only as a skip line, never as success')
   } finally {
     h.dispose()
   }
@@ -1564,6 +1794,51 @@ await check('restore: models-store is byte-exact (key order + formatting) via th
     writeFileSync(backup, '{not json')
     await assert.rejects(() => restoreModelsStoreIfUnchanged(deps, backup, sha256Of(JSON.stringify(afterRun))), /not valid JSON/)
     assert.equal(readFileSync(storePath, 'utf8'), JSON.stringify(afterRun), 'store untouched when the backup is unreadable')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+await check('restore: models-store restore re-verifies its baseline INSIDE the store lock (round 3)', async () => {
+  // The pre-lock sha check cannot cover the check→restore window. Simulate a
+  // writer that lands in that window: deps.fs.readFile (the pre-lock check's
+  // view) reports the expected post-write bytes, while the REAL file — what
+  // the lock accessor re-reads in-lock — carries a foreign edit. Without the
+  // in-lock re-verify the restore would clobber the foreign bytes.
+  const root = mkdtempSync(join(tmpdir(), 'model-sync-store-lock-'))
+  try {
+    const storePath = join(root, 'models-store.json')
+    const backup = join(root, 'models-store.json.bak.20261124-070809')
+    const backupText = '{"seed":{"models":[]}}'
+    writeFileSync(backup, backupText)
+    const afterRun = { seed: { models: [] }, 'curr#opencode-go#fp': { managed: {} } }
+    const expectedText = JSON.stringify(afterRun)
+    writeFileSync(storePath, expectedText)
+    const deps = makeRestoreDeps(root, {
+      fs: {
+        readFile: async (path) => (path === storePath ? expectedText : readFileSync(path, 'utf8')),
+        writeFile: async (path, data) => { writeFileSync(path, data) },
+        rename: async (from, to) => { renameSync(from, to) },
+        unlink: async (path) => { rmSync(path) },
+        mkdir: async () => {},
+        stat: async (path) => (existsSync(path) ? { mode: 0o644 } : undefined),
+        readdir: async (path) => readdirSync(path),
+        writeFileExclusive: async (path, data) => {
+          try { writeFileSync(path, data, { flag: 'wx' }); return true } catch (err) {
+            if (err.code === 'EEXIST') return false
+            throw err
+          }
+        },
+      },
+    })
+    // The real file now drifts from what the pre-lock check will see.
+    const foreign = { seed: { models: [] }, foreign: { models: [1] } }
+    writeFileSync(storePath, JSON.stringify(foreign))
+    const outcome = await restoreModelsStoreIfUnchanged(deps, backup, sha256Of(expectedText))
+    assert.equal(outcome.restored, false, 'the in-lock re-verify refuses the drifted store')
+    assert.ok(outcome.line.includes('concurrent modification detected, not restored'), 'reported as concurrent modification, not a restore failure')
+    assert.deepEqual(JSON.parse(readFileSync(storePath, 'utf8')), foreign, 'the foreign edit is never clobbered')
+    assert.ok(readdirSync(root).filter((name) => name.includes('restore-tmp')).length === 0, 'no restore-tmp residue')
   } finally {
     rmSync(root, { recursive: true, force: true })
   }

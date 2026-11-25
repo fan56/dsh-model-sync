@@ -34,6 +34,18 @@
 // inside the brackets) are refused, never guessed. All of these fail at
 // PARSE time, so every consumer fails closed before a single byte is written.
 //
+// Round 3: flow brackets pair BY TYPE — `{a: b]` / `[a, b}` are refused (the
+// host yaml rejects mismatched flow brackets; the old mixed depth counter
+// accepted them and wrote an unloadable file). Properly nested single-line
+// flow collections (`[{a: 1}]`, `{a: [b, c]}`) decode exactly like the host.
+// Double-quoted scalars decode the host's common escape set
+// (`\n \t \r \" \\ \0 \b \f \xXX \uXXXX \UXXXXXXXX`); any other escape
+// REFUSES (conservative — the host either decodes it to a different
+// character or rejects the document). Numeric-form KEYS outside the plain
+// integer/decimal domain (`1e3`, `0x1F`, `1.`, `.5`, `.inf`, …) are refused,
+// and numeric-form strings are QUOTED on write-back, so a rewritten value is
+// never re-read by the host as a number.
+//
 // Editing strategy: never re-serialize the document. Each settings op becomes
 // one original-line-range replacement computed from a fresh parse, so every
 // untouched line (comments, formatting, other providers) survives
@@ -130,6 +142,13 @@ function keyRefusal(key: string, lineNo: number): string | undefined {
   if (decoded === null || typeof decoded === 'boolean' || typeof decoded === 'number') {
     return `line ${lineNo}: key ${JSON.stringify(key)} resolves to a non-string (${String(decoded)}) in the host yaml; null/~/true/1 spellings collide into one key`
   }
+  // Round 3: also refuse the host's wider numeric domain (1e3/0x1F/1./.5/
+  // .inf/.NaN/0o17/…) — decodePlainScalar sees a string there while the host
+  // yaml folds the KEY into a number, so same-level spellings collide and the
+  // parser's string view diverges from the host's.
+  if (hostNumberForm(key)) {
+    return `line ${lineNo}: key ${JSON.stringify(key)} is numeric-form (the host yaml resolves it to a number, folding same-level spellings into one key); refusing`
+  }
   return undefined
 }
 
@@ -173,6 +192,31 @@ function decodePlainScalar(raw: string): unknown {
   return s
 }
 
+/**
+ * The scalar forms the host yaml@2 resolves to a NUMBER beyond the plain
+ * integer/decimal pair already handled by `decodePlainScalar` (differential-
+ * probed against the host closure's yaml@2.9.1): scientific notation
+ * (incl. `1.e3` / `.5e2`), trailing/leading-dot decimals, LOWERCASE-prefix
+ * hex/octal integers (the host keeps `0X1F`/`0O17` strings), and `.inf`/
+ * `.nan` spellings. Used to refuse numeric-form KEYS (the host folds them
+ * like `1`/`007`) and to QUOTE numeric-form strings on write-back (a plain
+ * `1e3` would be re-read by the host as the number 1000).
+ */
+function hostNumberForm(text: string): boolean {
+  return /^[-+]?\d+$/.test(text)
+    || /^[-+]?\d+\.\d+$/.test(text)
+    || /^[-+]?\d+\.$/.test(text)
+    || /^[-+]?\.\d+$/.test(text)
+    || /^[-+]?\d+(\.\d+)?[eE][-+]?\d+$/.test(text)
+    || /^[-+]?\d+\.[eE][-+]?\d+$/.test(text)
+    || /^[-+]?\.\d+[eE][-+]?\d+$/.test(text)
+    || /^0x[0-9a-fA-F]+$/.test(text)
+    || /^0o[0-7]+$/.test(text)
+    || /^\.(inf|Inf|INF)$/.test(text)
+    || /^[-+]?\.(inf|Inf|INF)$/.test(text)
+    || /^\.(nan|NaN|NAN)$/.test(text)
+}
+
 /** Strip one trailing ` #comment` from a plain scalar (values keep their own `#`). */
 function stripTrailingComment(raw: string): string {
   const index = raw.indexOf(' #')
@@ -192,12 +236,20 @@ function findClosingQuote(text: string, from: number, quote: string): number {
   return -1
 }
 
-/** Index of the closing bracket for a single-line flow collection, -1 when absent. */
-function matchingFlowClose(text: string, from: number): number {
-  const open = text[from]!
-  let depth = 0
+/**
+ * Index of the closing bracket for a single-line flow collection, -1 when
+ * absent. Round-3 blocker: brackets pair BY TYPE (a stack of open chars), so
+ * `{a: b]` / `[a, b}` / `[{a: 1]]` no longer "resolve" — the host yaml
+ * rejects mismatched flow brackets outright and the old mixed depth counter
+ * accepted exactly those unloadable documents (migrate-go reported SUCCESS
+ * while the host refused to load the written file). A type mismatch THROWS
+ * with the line number so the parse fails with the precise reason; the
+ * caller only ever splices with a correctly matched close index.
+ */
+function matchingFlowClose(text: string, from: number, lineNo: number): number {
+  const stack: string[] = [text[from]!]
   let quote: string | undefined
-  for (let i = from; i < text.length; i++) {
+  for (let i = from + 1; i < text.length; i++) {
     const ch = text[i]!
     if (quote !== undefined) {
       if (quote === '"' && ch === '\\') { i += 1; continue }
@@ -205,20 +257,71 @@ function matchingFlowClose(text: string, from: number): number {
       continue
     }
     if (ch === '"' || ch === "'") { quote = ch; continue }
-    if (ch === '[' || ch === '{') depth += 1
+    if (ch === '[' || ch === '{') { stack.push(ch); continue }
     if (ch === ']' || ch === '}') {
-      depth -= 1
-      if (depth === 0) return i
+      const opened = stack.pop()
+      const wanted = ch === ']' ? '[' : '{'
+      if (opened !== wanted) {
+        throw new Error(`line ${lineNo}: flow collection opened with "${opened}" but closed with "${ch}" — the host yaml rejects mismatched flow brackets; refusing`)
+      }
+      if (stack.length === 0) return i
     }
   }
   return -1
 }
 
-function unquoteYaml(text: string): string {
+/**
+ * Decode ONE single-line quoted scalar the way the host yaml@2 would
+ * (round 3): single quotes only collapse `''`; double quotes decode
+ * left-to-right over the host's common escape set
+ * (`\n \t \r \" \\ \0 \b \f \xXX \uXXXX \UXXXXXXXX`). ANY other escape
+ * REFUSES: the host either decodes it to a different character (`\a`, `\v`,
+ * `\/`, `\N`, …) or rejects the document (`\q`, truncated hex, `\U` beyond
+ * U+10FFFF) — writing the escape through as literal text would silently flip
+ * the host's reading of the rewritten value. Multi-line quoted scalars never
+ * reach here (they are opaque leaves upstream), so no line-fold/continuation
+ * handling applies: refusing to decode what cannot be seen IS the
+ * host-consistent continuation behavior of this subset.
+ */
+function unquoteYaml(text: string, lineNo: number): string {
   const quote = text[0]!
   const inner = text.slice(1, -1)
-  if (quote === '"') return inner.replaceAll('\\"', '"').replaceAll('\\\\', '\\')
-  return inner.replaceAll("''", "'")
+  if (quote !== '"') return inner.replaceAll("''", "'")
+  let out = ''
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i]!
+    if (ch !== '\\') { out += ch; continue }
+    const code = inner[i + 1]
+    switch (code) {
+      case '0': out += '\0'; i += 1; break
+      case 'b': out += '\b'; i += 1; break
+      case 'f': out += '\f'; i += 1; break
+      case 'n': out += '\n'; i += 1; break
+      case 'r': out += '\r'; i += 1; break
+      case 't': out += '\t'; i += 1; break
+      case '"': out += '"'; i += 1; break
+      case '\\': out += '\\'; i += 1; break
+      case 'x':
+      case 'u':
+      case 'U': {
+        const width = code === 'x' ? 2 : code === 'u' ? 4 : 8
+        const digits = inner.slice(i + 2, i + 2 + width)
+        if (digits.length !== width || !/^[0-9a-fA-F]+$/.test(digits)) {
+          throw new Error(`line ${lineNo}: invalid "\\${code}" escape in a double-quoted scalar (exactly ${width} hex digits required); refusing`)
+        }
+        const value = Number.parseInt(digits, 16)
+        if (value > 0x10ffff) {
+          throw new Error(`line ${lineNo}: "\\U" escape beyond U+10FFFF is rejected by the host yaml; refusing`)
+        }
+        out += String.fromCodePoint(value)
+        i += 1 + width
+        break
+      }
+      default:
+        throw new Error(`line ${lineNo}: unsupported escape sequence "\\${code ?? ''}" in a double-quoted scalar — the host yaml decodes it differently (or rejects the document); refusing instead of writing a value the host would read differently`)
+    }
+  }
+  return out
 }
 
 /**
@@ -238,19 +341,25 @@ function hasMappingIndicator(text: string): boolean {
 
 /**
  * Split a single-line flow-collection body into its top-level parts,
- * quote- and escape-aware (the old splitter mis-tracked `\"` escapes and
- * silently dropped empty entries). Refuses what the host cannot load or
- * would read differently (review M1/M2):
- * - an empty entry between commas (`[a, , b]` — the host rejects the file)
- * - a `#` outside a quoted span (a comment inside the brackets swallows the
- *   closing bracket for the host — again an unloadable document; a `#`
- *   GLUED into a plain part like `a#b` is not a comment and stays legal)
+ * quote-, escape- and bracket-depth-aware (the old splitter mis-tracked
+ * `\"` escapes and silently dropped empty entries). Commas and the
+ * empty-entry check only act at depth 0, so nested `[`/`{` spans survive as
+ * one part and recursion decodes them (round 3: nested single-line flow
+ * collections decode like the host instead of being refused). Refuses what
+ * the host cannot load or would read differently (review M1/M2):
+ * - an empty entry between depth-0 commas (`[a, , b]` — the host rejects the
+ *   file)
+ * - a `#` outside a quoted span at any depth (a comment inside the brackets
+ *   swallows the closing bracket for the host — again an unloadable
+ *   document; a `#` GLUED into a plain part like `a#b` is not a comment and
+ *   stays legal)
  */
 function scanFlowParts(inner: string, lineNo: number): string[] {
   const parts: string[] = []
   let current = ''
   let quote: string | undefined
   let prev = ''
+  let depth = 0
   for (let i = 0; i < inner.length; i++) {
     const ch = inner[i]!
     if (quote !== undefined) {
@@ -267,10 +376,12 @@ function scanFlowParts(inner: string, lineNo: number): string[] {
       continue
     }
     if (ch === '"' || ch === "'") { quote = ch; current += ch; prev = ch; continue }
+    if (ch === '[' || ch === '{') { depth += 1; prev = ch; current += ch; continue }
+    if (ch === ']' || ch === '}') { depth -= 1; prev = ch; current += ch; continue }
     if (ch === '#' && (prev === '' || /\s/.test(prev) || ',{}[]:'.includes(prev))) {
       throw new Error(`line ${lineNo}: a comment inside a flow collection swallows the closing bracket for the host yaml; refusing`)
     }
-    if (ch === ',' ) {
+    if (ch === ',' && depth === 0) {
       if (current.trim() === '') throw new Error(`line ${lineNo}: empty flow entry (the host yaml rejects "[a, , b]")`)
       parts.push(current)
       current = ''
@@ -287,10 +398,13 @@ function scanFlowParts(inner: string, lineNo: number): string[] {
 /**
  * Decode ONE flow scalar exactly the way the host yaml would (review M1):
  * quoted scalars go through the SAME `unquoteYaml` path as the block
- * position (single/double quotes, `''`/`\"`/`\\` escapes), so the subset
- * tree and the host yaml agree on the same text. Tags, single-pair entries
- * and anchors/aliases are REFUSED — decoding them as text is what used to
- * turn `input: ["text"]` into `["\"text\""]` on write-back.
+ * position (single/double quotes, `''` and the round-3 double-quote escape
+ * domain), and a bracket-led item is a nested flow collection decoded by
+ * recursion (round 3) — the host parses `[{a: 1}]` as `[{a: 1}]`, not as
+ * text, so refusing it would diverge from the tree the host sees. Tags,
+ * single-pair entries and anchors/aliases are REFUSED — decoding them as
+ * text is what used to turn `input: ["text"]` into `["\"text\""]` on
+ * write-back.
  */
 function decodeFlowScalar(item: string, lineNo: number, where: string, colonMeaning: string): unknown {
   if (item.startsWith('!')) {
@@ -306,7 +420,14 @@ function decodeFlowScalar(item: string, lineNo: number, where: string, colonMean
     if (item.slice(close + 1).trim() !== '') {
       throw new Error(`line ${lineNo}: unexpected content after a quoted scalar in a ${where}`)
     }
-    return unquoteYaml(item)
+    return unquoteYaml(item, lineNo)
+  }
+  if (item.startsWith('[') || item.startsWith('{')) {
+    const close = matchingFlowClose(item, 0, lineNo)
+    if (item.slice(close + 1).trim() !== '') {
+      throw new Error(`line ${lineNo}: unexpected content after a flow collection in a ${where}`)
+    }
+    return parseFlow(item, lineNo)
   }
   if (hasMappingIndicator(item)) {
     throw new Error(`line ${lineNo}: ${colonMeaning}; refusing instead of guessing`)
@@ -314,15 +435,25 @@ function decodeFlowScalar(item: string, lineNo: number, where: string, colonMean
   return decodePlainScalar(item)
 }
 
-/** Scalars-only single-line flow parser (`[]`, `{}`, `[a, b]`, `{k: v}`). */
+/**
+ * Single-line flow parser (`[]`, `{}`, `[a, b]`, `{k: v}` and properly
+ * nested combinations since round 3). The outer bracket TYPE pair is
+ * validated first (round-3 blocker: the old `slice(1, -1)` never checked,
+ * so `{a: b]` decoded as the map `{a: b}` while the host yaml rejected the
+ * whole document).
+ */
 function parseFlow(text: string, lineNo: number): unknown {
   const trimmed = text.trim()
   if (trimmed === '[]') return []
   if (trimmed === '{}') return {}
-  if (trimmed.startsWith('[')) {
-    const inner = trimmed.slice(1, -1)
+  const open = trimmed[0]!
+  const close = trimmed[trimmed.length - 1]!
+  if (!((open === '[' && close === ']') || (open === '{' && close === '}'))) {
+    throw new Error(`line ${lineNo}: flow collection opened with "${open}" but closed with "${close}" — the host yaml rejects mismatched flow brackets; refusing`)
+  }
+  const inner = trimmed.slice(1, -1)
+  if (open === '[') {
     if (inner.trim() === '') return []
-    if (/[\[{]/.test(inner)) throw new Error(`line ${lineNo}: nested flow collections are not supported`)
     return scanFlowParts(inner, lineNo).map((part) =>
       decodeFlowScalar(
         part.trim(),
@@ -331,8 +462,6 @@ function parseFlow(text: string, lineNo: number): unknown {
         'a single-pair flow entry like "[a: b]" (the host yaml parses it as a mapping, not a string)',
       ))
   }
-  const inner = trimmed.slice(1, -1)
-  if (/[\[{]/.test(inner)) throw new Error(`line ${lineNo}: nested flow collections are not supported`)
   const out: Record<string, unknown> = {}
   for (const part of scanFlowParts(inner, lineNo)) {
     const match = KEY_ENTRY.exec(part.trim())
@@ -418,7 +547,7 @@ class PatchParser {
         const after = line.slice(closeCol + 1).trim()
         if (after !== '' && !after.startsWith('#')) throw new Error(`line ${lineIdx + 1}: unexpected content after a quoted scalar`)
         return {
-          node: { kind: 'scalar', value: unquoteYaml(line.slice(openCol, closeCol + 1)), startLine: lineIdx, endLine: lineIdx },
+          node: { kind: 'scalar', value: unquoteYaml(line.slice(openCol, closeCol + 1), lineIdx + 1), startLine: lineIdx, endLine: lineIdx },
           endLine: lineIdx,
         }
       }
@@ -443,7 +572,7 @@ class PatchParser {
     }
     if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
       const openCol = line.indexOf(trimmed[0]!)
-      const closeCol = matchingFlowClose(line, openCol)
+      const closeCol = matchingFlowClose(line, openCol, lineIdx + 1)
       if (closeCol < 0) throw new Error(`line ${lineIdx + 1}: multi-line flow collections are not supported`)
       const after = line.slice(closeCol + 1).trim()
       if (after !== '' && !after.startsWith('#')) throw new Error(`line ${lineIdx + 1}: unexpected content after a flow collection`)
@@ -724,7 +853,14 @@ export function patchLlmPiAiProviders(root: PatchNode): { ok: true; providers: u
 
 const PLAIN_SAFE = /^[A-Za-z0-9_][A-Za-z0-9_\-./: ]*$/
 
-/** Render one scalar in plain-or-quoted form (double quotes, JSON escaping). */
+/**
+ * Render one scalar in plain-or-quoted form (double quotes, JSON escaping).
+ * Round 3: any numeric-form STRING (`1e3`, `0x1F`, `1.`, `.5`, `.inf`, … as
+ * well as the plain integer/decimal pair) is QUOTED — the host yaml resolves
+ * those plain forms to numbers, so an unquoted write-back would silently
+ * flip the value's type in the host's reading (the plain decimal exclusion
+ * used to cover `42` only and let `1e3` through as a number).
+ */
 export function renderYamlScalar(value: unknown): string {
   if (value === null || value === undefined) return 'null'
   if (typeof value === 'boolean') return value ? 'true' : 'false'
@@ -732,7 +868,7 @@ export function renderYamlScalar(value: unknown): string {
   const text = String(value)
   if (text !== '' && text === text.trim() && PLAIN_SAFE.test(text)
     && !/^(true|false|null|~|True|False|Null|TRUE|FALSE|NULL)$/i.test(text)
-    && !/^[-+]?\d+(\.\d+)?$/.test(text)
+    && !hostNumberForm(text)
     && !text.includes(': ') && !text.endsWith(':') && !text.includes(' #')) {
     return text
   }

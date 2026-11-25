@@ -63,7 +63,7 @@ import {
   type ReferenceRewrite,
   type RewriteRefMode,
 } from './opencode-go-migrate.ts'
-import { loadModelsStore } from './remote-catalog.ts'
+import { loadModelsStore, STORE_RESTORE_SHA_MISMATCH } from './remote-catalog.ts'
 import type { MigrationStateStore } from './opencode-go-migration.ts'
 import {
   createFilePatchSettingsService,
@@ -884,7 +884,11 @@ export async function removeStoreIfUnchanged(deps: OneShotDeps, postWriteSha: st
  * lock), not a per-key rebuild — the backup's key order survives verbatim and
  * the restore is transactional. The same post-write-baseline check as the
  * patch restore applies first, and a backup that is not valid JSON refuses
- * loudly before anything is touched.
+ * loudly before anything is touched. Round 3: the baseline is ALSO
+ * re-verified INSIDE the store's queue + cross-process lock (the accessor's
+ * `expectedCurrentSha`), so a writer that landed between the pre-lock check
+ * and the restore is refused at the write site and reported as concurrent
+ * modification instead of clobbering the foreign bytes.
  */
 export async function restoreModelsStoreIfUnchanged(
   deps: OneShotDeps,
@@ -910,7 +914,19 @@ export async function restoreModelsStoreIfUnchanged(
     throw new Error(`backup is not valid JSON (${err instanceof Error ? err.message : String(err)})`)
   }
   const accessor = loadModelsStore(deps.modelsStorePath)
-  await accessor.restoreRawDocument(backupText)
+  try {
+    // The pre-lock check above is advisory (it can only narrow the window);
+    // the authoritative re-verify runs inside the lock via expectedCurrentSha.
+    await accessor.restoreRawDocument(backupText, postWriteSha)
+  } catch (err) {
+    if ((err as { code?: unknown }).code === STORE_RESTORE_SHA_MISMATCH) {
+      return {
+        restored: false,
+        line: `concurrent modification detected, not restored: ${deps.modelsStorePath} (backup: ${backupPath}) — 人工核对后处理`,
+      }
+    }
+    throw err
+  }
   return { restored: true, line: `restored ${deps.modelsStorePath} ← ${backupPath} (byte-exact via models-store lock accessor)` }
 }
 
