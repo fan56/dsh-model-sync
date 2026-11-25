@@ -30,7 +30,7 @@ https://github.com/user-attachments/assets/c3f9c8b1-ea5e-470c-b8a8-60a81fc5c20a
 - **定时刷新。** `intervalMinutes` 周期轮（默认 240，即 4 小时）加 `startupDelaySeconds` 启动延迟（默认 5 秒）；每轮自动刷新输出的报告与手动刷新完全相同。`0` 表示关闭周期（仅启动时刷一次）。配置变更时周期会实时重新挂载（`src/index.ts`）。
 - **变更报告 / diff。** 每轮报告新增/移除的模型 id（`diffModelIds`）；`settings` 模式下还会对照当前原始 settings 报告新增/移除/变更的条目（`diffEntries`，`diff.ts`）。被丢弃（dropped）与降级（degraded）的条目连同原因一并报告。
 - **`modelSync` 服务。** 对外暴露 `modelSync` 服务（`syncNow()`），UI 调用它即可强制跑一轮刷新并读取报告。
-- **`/model-sync` 命令。** 插件自行通过共享的 dsh 命令注册表（`@deepseek-ai/dsh-commands`）注册 `/model-sync` 斜杠命令，所有交互式 UI 自动发现并列出——UI 侧零配合。执行它当场强制跑一轮刷新，输出的报告与定时轮完全相同；同步范围由 `managedRoutes` 决定（裸命令后附带的额外参数会被忽略）。命令注册表是可选 peer：没有命令注册服务的宿主照常降级，定时刷新与 `modelSync` 服务不受影响。其子命令为 `go`/`status`（跑一整轮 opencode-go 同步）、`adopt go`（带采纳跑同一轮）、`migrate plan|apply|rollback|status`（唯一的显式同意配置写入路径；`plan` 只读，`apply` 需要 plan hash、6 位确认码与 `--ack-managed`）以及 `migrate-go`（一键完成整段迁移：plan + 文件备份 + 一次确认 + apply，见下文）。`eject` 已下线——回退只用 `migrate rollback`。
+- **`/model-sync` 命令。** 插件自行通过共享的 dsh 命令注册表（`@deepseek-ai/dsh-commands`）注册 `/model-sync` 斜杠命令，所有交互式 UI 自动发现并列出——UI 侧零配合。执行它当场强制跑一轮刷新，输出的报告与定时轮完全相同；同步范围由 `managedRoutes` 决定（裸命令后附带的额外参数会被忽略）。命令注册表是可选 peer：没有命令注册服务的宿主照常降级，定时刷新与 `modelSync` 服务不受影响。其子命令为 `go`/`status`（跑一整轮 opencode-go 同步）、`adopt go`（带采纳跑同一轮）、`migrate plan|apply|rollback|status`（唯一经显式令牌三重门把守的写入路径；`plan` 只读，`apply` 需要 plan hash、6 位确认码与 `--ack-managed`）以及 `migrate-go`（一键完成整段迁移：plan + 文件备份 + 一次命令内确认 + apply，见下文）。`eject` 已下线——回退只用 `migrate rollback`。
 - **opencode-go 同步（需显式开启）。** 设 `opencode.go.enabled: true` 后，三条路由——`opencode-go`（chat-completions）、`opencode-go-msg`（messages）、`opencode-go-resp`（responses）——改为从官方公开 `/v1/models` 清单同步，而非 pi.dev。默认关闭，因此现存手写的 opencode-go 列表在开启前保持冻结。这三条 go 路由与上文的默认 pi.dev `managedRoutes` 相互独立。
 - **`/opencode-status` 只读诊断。** 对照官方 opencode-go `/v1/models` 清单与当前 profile 的路由（零写入、不改 settings）。
 - **翻译规则。** pi.dev 条目被翻译成 settings 可写的模型 profile（`translate.ts`）：base-matching 与 base-less 分类、`reasoningEfforts` 推导（S2 gate）、`compat` 门控到 `openai-completions`（S5 gate）、`maxTokens` 处理，以及混合协议路由的丢弃逻辑。容量值另有卫生门：非正整数的 `contextWindow`，或不是「严格小于 contextWindow 的正整数」的 `maxTokens`（有的列表会把 context window 回声填进 maxTokens），一律跳过不写，并在报告中以降级警告说明。
@@ -121,7 +121,7 @@ providers:
 
 在任意交互式 UI 里输入 `/model-sync` 即可当场强制跑一轮同步。命令由插件自己注册进共享命令注册表（`@deepseek-ai/dsh-commands`），UI 自动发现。它返回与定时轮相同的报告；同步范围由 `managedRoutes` 决定，裸命令后附带的额外参数会被忽略。没有命令注册服务的宿主会平滑降级——定时刷新与 `modelSync` 服务照常工作。
 
-opencode-go 增加了子命令：`/model-sync go`（或 `status`）跑一整轮 go 同步，`/model-sync adopt go` 带采纳跑同一轮，`/model-sync migrate plan|apply|rollback|status` 是唯一的显式同意配置写入路径——`plan` 只读，`apply` 需要 plan hash、6 位确认码与 `--ack-managed`。`eject` 已下线，回退请用 `migrate rollback`。`/opencode-status` 是另一条只读诊断命令，对照官方清单与当前 profile 路由，从不写入 settings 或凭据。
+opencode-go 增加了子命令：`/model-sync go`（或 `status`）跑一整轮 go 同步，`/model-sync adopt go` 带采纳跑同一轮，`/model-sync migrate plan|apply|rollback|status` 是唯一经显式令牌三重门把守的写入路径——`plan` 只读，`apply` 需要 plan hash、6 位确认码与 `--ack-managed`。`eject` 已下线，回退请用 `migrate rollback`。`/opencode-status` 是另一条只读诊断命令，对照官方清单与当前 profile 路由，从不写入 settings 或凭据。
 
 ### 一键迁移：`/model-sync migrate-go`
 
@@ -131,7 +131,9 @@ opencode-go 增加了子命令：`/model-sync go`（或 `status`）跑一整轮 
 /model-sync migrate-go [--all-profiles] [--adopt] [--prune-user-extra] [--rewrite-refs=default-model|config]
 ```
 
-固定流水线：生成计划（与 `migrate plan` 打印的同一只读构建）→ 写入前先做文件备份（每个目标 profile 一份 `cordis.patch.yml.bak.<YYYYMMDD-HHMMSS>`，全局一份 `models-store.json.bak.<同一时间戳>`；每类最多保留 3 份）→ 仅弹一次交互确认（走宿主 ask-user 通道；题干包含将删除的旧条目、将新建的槽位、每个 profile 的摘要与备份路径）→ 经原封不动的 `migrate apply` 同意门执行（hash/确认码由调用侧算出；不存在 `--yes`/`--auto`）。缺凭证或确认通道 → fail-closed 零写入。任一 apply 失败则中止整批并用本轮备份字节级恢复所有改动文件，报告失败步骤与恢复结果。成功后当前 profile 的 `opencode.go.enabled` 置为 `true`，明细日志落在 `~/.dsh/storages/dsh-model-sync/migrate-go-<时间戳>.log`。逐 profile 回退：`/model-sync migrate rollback --plan <planHash>`。
+固定流水线：生成计划（与 `migrate plan` 打印的同一只读构建）→ 写入前先做文件备份（每个目标 profile 一份 `cordis.patch.yml.bak.<YYYYMMDD-HHMMSS>`，全局一份 `models-store.json.bak.<同一时间戳>`；每类最多保留 3 份）→ 仅弹一次交互确认（走宿主 ask-user 通道；题干包含将删除的旧条目、将新建的槽位、每个 profile 的摘要与备份路径）→ 经原封不动的 `migrate apply` 同意门执行（hash/确认码由调用侧算出；不存在 `--yes`/`--auto`）。缺凭证 → 在任何外呼、写入、备份之前 fail-closed。确认通道缺失或未应答 → fail-closed，改走手动 `migrate plan`/`apply` 流程并给出已算出的 hash（配置零写入；已生成的备份保留）。任一 apply 失败则中止整批并用本轮备份字节级恢复所有改动文件，报告失败步骤与恢复结果。成功后当前 profile 的 `opencode.go.enabled` 置为 `true`，明细日志落在 `~/.dsh/storages/dsh-model-sync/migrate-go-<时间戳>.log`。逐 profile 回退：`/model-sync migrate rollback --plan <planHash>`。
+
+槽位来自顶层 `opencode.go.routes` 配置的解析结果——除非配置（或现存段）要求，不会创建 google 槽，也从不触碰其他 provider。设计取舍与撤销路径见 [ADR 0001：migrate-go 的命令内单次确认](docs/adr/0001-in-command-single-confirmation-for-migrate-go.md)。
 
 ## 开发
 
