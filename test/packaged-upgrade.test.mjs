@@ -23,7 +23,9 @@ const pkgName = '@aiwayds/dsh-model-sync'
 const registry = 'https://registry.npmjs.org'
 const installHooks = ['preinstall', 'install', 'postinstall']
 const baselineVersion = '0.9.0'
-const repoVersion = '0.10.0'
+// The packed tarball must always carry the repo manifest's version, so read it
+// instead of pinning it: a release bump no longer needs a hand edit here.
+const repoVersion = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')).version
 const bundlePatch = './cordis.patch.yml'
 
 if (!existsSync(join(repoRoot, 'lib', 'index.js'))) {
