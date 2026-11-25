@@ -6,7 +6,8 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -1075,6 +1076,62 @@ await checkAsync('N2: fetchRemoteCatalog keeps a lock timeout actionable instead
     assert.ok(!result.error.includes('Fetch failed'), 'not degraded to a generic fetch failure')
   } finally {
     globalThis.fetch = origFetch
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Round 3 — restoreRawDocument: in-lock baseline re-verify + tmp cleanup
+// ---------------------------------------------------------------------------
+await checkAsync('restoreRawDocument re-verifies the expected sha INSIDE the lock (round 3)', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-restore-sha-'))
+  const storePath = join(dir, 'models-store.json')
+  try {
+    resetModelsStoreCache()
+    const store = loadModelsStore(storePath)
+    await writeFile(storePath, '{"a":1}')
+    const sha = createHash('sha256').update('{"a":1}').digest('hex')
+    // Matching baseline: the restore proceeds byte-exact.
+    await store.restoreRawDocument('{"orig":true}', sha)
+    assert.equal(await readFile(storePath, 'utf8'), '{"orig":true}')
+    // Stale baseline (another writer changed the store between the caller's
+    // pre-lock check and this restore): refused with the recognizable code,
+    // the foreign bytes survive.
+    await assert.rejects(
+      () => store.restoreRawDocument('{"evil":1}', sha),
+      (err) => err.code === 'STORE_RESTORE_SHA_MISMATCH',
+      'a drifted store refuses the restore',
+    )
+    assert.equal(await readFile(storePath, 'utf8'), '{"orig":true}', 'the refused restore writes nothing')
+    // A vanished store is a mismatch too (nothing sane to restore onto).
+    await rm(storePath)
+    await assert.rejects(
+      () => store.restoreRawDocument('{"x":1}', sha),
+      (err) => err.code === 'STORE_RESTORE_SHA_MISMATCH',
+    )
+    // No expected baseline: the restore runs unconditionally (legacy shape).
+    await store.restoreRawDocument('{"legacy":1}')
+    assert.equal(await readFile(storePath, 'utf8'), '{"legacy":1}')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+    resetModelsStoreCache()
+  }
+})
+
+await checkAsync('restoreRawDocument cleans its restore-tmp staging file when the write/rename fails (round 3)', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-restore-tmp-'))
+  const storePath = join(dir, 'models-store.json')
+  try {
+    resetModelsStoreCache()
+    const store = loadModelsStore(storePath)
+    // rename(2) onto an existing DIRECTORY fails (EISDIR) — the staging file
+    // must be cleaned by the failing restore call itself.
+    await mkdir(storePath, { recursive: true })
+    await assert.rejects(() => store.restoreRawDocument('{"y":2}'))
+    const residue = (await readdir(dir)).filter((name) => name.includes('restore-tmp'))
+    assert.deepEqual(residue, [], 'no <pid>.restore-tmp residue after a failed restore')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+    resetModelsStoreCache()
   }
 })
 

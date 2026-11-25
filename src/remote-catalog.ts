@@ -14,7 +14,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, open, readFile, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
 
 // ---------------------------------------------------------------------------
 // Constants (ported from docs-dsh-llm-pi-ai.patch:35-36)
@@ -28,6 +28,16 @@ export const REMOTE_CATALOG_REFRESH_INTERVAL_MS = 4 * 60 * 60 * 1000
 
 /** Path to the persistent per-provider cache. */
 export const MODELS_STORE_PATH = join(homedir(), '.dsh', 'models-store.json')
+
+/**
+ * `code` of the error `restoreRawDocument` throws when the in-lock re-verify
+ * (round 3) finds the current document's sha256 different from the caller's
+ * expected baseline — another writer changed the store between the caller's
+ * pre-lock check and this restore. Callers match on `code` (not instanceof)
+ * so the failure can degrade to a "concurrent modification, not restored"
+ * outcome instead of a generic restore failure.
+ */
+export const STORE_RESTORE_SHA_MISMATCH = 'STORE_RESTORE_SHA_MISMATCH'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -430,6 +440,21 @@ export interface ModelsStoreAccessor {
   /** Queue-serialized removal of one opaque slot. */
   deleteRaw(key: string): Promise<void>
   /**
+   * Whole-document BYTE restore (migrate-go rollback): under the SAME promise
+   * queue + cross-process lock as every other mutation, atomically replace the
+   * document with the EXACT bytes given (sibling temp file + rename). Unlike a
+   * per-key rebuild this preserves the backup's key order verbatim and is
+   * transactional — a failure mid-restore leaves the previous document intact.
+   * The text is written as-is, no re-serialization. When `expectedCurrentSha`
+   * is given, the CURRENT document is re-hashed INSIDE the queue + lock and
+   * the restore refuses (throws, `code: STORE_RESTORE_SHA_MISMATCH`) when it
+   * differs — a caller's pre-lock check cannot cover the check→write window,
+   * so the baseline is re-verified at the write site itself (round 3). A
+   * failed stage/rename cleans the `<pid>.restore-tmp` staging file it
+   * created.
+   */
+  restoreRawDocument(text: string, expectedCurrentSha?: string): Promise<void>
+  /**
    * All top-level keys currently in the document, for legacy-key detection and
    * journal enumeration. An unreadable store THROWS (never an empty list): a
    * caller that would silently treat [] as "no journals / no legacy keys" must
@@ -641,6 +666,47 @@ export function loadModelsStore(storePath?: string): ModelsStoreAccessor {
         }
         delete (doc as unknown as Record<string, unknown>)[key]
         await writeDoc(doc)
+      }),
+    restoreRawDocument: (text: string, expectedCurrentSha?: string): Promise<void> =>
+      enqueue(async () => {
+        // In-lock re-verify (round 3): the caller's pre-lock sha check cannot
+        // cover the window between the check and this write, so the baseline
+        // is re-hashed here under the SAME queue + cross-process lock as the
+        // write itself. A missing file is a mismatch too (the store vanished
+        // mid-run — nothing sane to restore onto).
+        if (expectedCurrentSha !== undefined) {
+          let current: string | undefined
+          try {
+            current = await readFile(effectivePath, 'utf8')
+          } catch {
+            current = undefined
+          }
+          const currentSha = current === undefined ? undefined : createHash('sha256').update(current).digest('hex')
+          if (currentSha !== expectedCurrentSha) {
+            throw Object.assign(
+              new Error(
+                `models-store changed since the post-write baseline was taken ` +
+                `(expected sha ${expectedCurrentSha}, current ${currentSha ?? 'absent'}); restore refused`,
+              ),
+              { code: STORE_RESTORE_SHA_MISMATCH },
+            )
+          }
+        }
+        // Byte-exact whole-document replacement under the same lock every
+        // other writer uses (migrate-go rollback). Same atomic tmp+rename
+        // contract as writeDoc — a crash leaves either the pre-restore doc or
+        // the restored backup, never a torn hybrid. A failed stage/rename
+        // cleans the staging file this call created (round 3: no
+        // `<pid>.restore-tmp` residue).
+        await mkdir(dirname(effectivePath), { recursive: true })
+        const tmpPath = `${effectivePath}.${process.pid}.restore-tmp`
+        try {
+          await writeFile(tmpPath, text)
+          await rename(tmpPath, effectivePath)
+        } catch (err) {
+          await unlink(tmpPath).catch(() => {})
+          throw err
+        }
       }),
     listRawKeys: async (): Promise<string[]> => Object.keys(await readDoc()),
   }
