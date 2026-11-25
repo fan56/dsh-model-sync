@@ -17,7 +17,10 @@
 //      sequence suffix inside one second; 3 newest kept per category.
 //   e. ONE user-questions confirmation for the whole run; no channel or any
 //      ask error → fail closed with the manual migrate plan/apply path.
-//      Cancel → zero writes.
+//      Cancel → zero writes. After the ask returns, invocation.signal.aborted
+//      is re-checked (abort ⇒ cancel) and an answer carrying BOTH option
+//      labels is an ambiguous cancel + rerun — proceed never wins a contested
+//      answer.
 //   f. apply via applyMigration with the computed consent triple and
 //      ackManaged: true. --yes/--auto do not exist on this command.
 //   g. slots come from the resolved opencode.go.routes config (the top-level
@@ -29,11 +32,19 @@
 //      report says so with the manual step instead of failing the migration.
 //
 // Atomicity: any apply failure stops the loop and byte-restores every file
-// this run changed (per-profile patches + models-store.json) from the backups
-// created in step d, then reports the failed step, the original error and the
-// restore outcome. All external effects (fs, settings, userQuestions, fetch,
-// clock, homedir) arrive through OneShotDeps.
+// this run changed (per-profile patches + models-store.json) — patches through
+// the same atomic tmp+rename io the apply writes with, the models-store
+// through the remote-catalog lock accessor (never a raw overwrite). Every
+// restore first re-hashes the on-disk content and refuses to touch a file a
+// concurrent process has modified since this run's last write. Backups are
+// created under an O_EXCL exclusive claim (same-second collisions retry the
+// next sequence suffix; no readdir snapshot can hand out one name twice), and
+// each target's staleness is re-verified (sha256) right before apply, so a
+// file edited between backup and apply aborts that target with zero writes.
+// All external effects (fs, settings, userQuestions, fetch, clock, homedir)
+// arrive through OneShotDeps.
 
+import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { fingerprintKey, type GoModelRecord } from './opencode-go-source.ts'
 import { GO_SLOT_ROUTES, type GoRouteSlot } from './opencode-go-grouping.ts'
@@ -44,10 +55,12 @@ import {
   applyMigration,
   buildMigrationPlanFromDeps,
   type MigrateDeps,
+  type MigrationIdPlan,
   type MigrationPlan,
   type ReferenceRewrite,
   type RewriteRefMode,
 } from './opencode-go-migrate.ts'
+import { loadModelsStore } from './remote-catalog.ts'
 import type { MigrationStateStore } from './opencode-go-migration.ts'
 import {
   createFilePatchSettingsService,
@@ -93,6 +106,15 @@ export interface AskServiceShape {
 
 export interface OneShotFs extends PatchFs {
   readdir(path: string): Promise<string[]>
+  /**
+   * Exclusive-claim + atomic write in one step: creates `path` with O_EXCL
+   * semantics (returns `false` when the name is already taken — the caller
+   * retries the next sequence suffix), then replaces its content through a
+   * sibling temp file + rename so a crash never leaves a torn backup. This is
+   * how backups are born: the FILESYSTEM decides "name taken", never a
+   * readdir snapshot two racers can read identically.
+   */
+  writeFileExclusive(path: string, data: string, mode?: number): Promise<boolean>
 }
 
 // ---------------------------------------------------------------------------
@@ -239,12 +261,23 @@ export function formatStamp(date: Date): string {
 const PATCH_BACKUP_PATTERN = /^cordis\.patch\.yml\.bak\.(\d{8}-\d{6})(?:\.(\d+))?$/
 const STORE_BACKUP_PATTERN = /^models-store\.json\.bak\.(\d{8}-\d{6})(?:\.(\d+))?$/
 
-/** First free `<base>` / `<base>.<seq>` path inside one second (no overwrite). */
-export function nextBackupPath(exists: (path: string) => boolean, base: string): string {
-  if (!exists(base)) return base
+/** sha256 hex digest of a text — the staleness / concurrent-modification detector. */
+export function sha256Of(text: string): string {
+  return createHash('sha256').update(text).digest('hex')
+}
+
+/**
+ * Create `<base>` / `<base>.<seq>` exclusively: `writeFileExclusive` returns
+ * false when the name is taken (O_EXCL), and only then does the loop advance
+ * the sequence suffix. No readdir snapshot is consulted, so two processes
+ * racing inside the same second can never both "win" the same backup name —
+ * the loser retries onto `.<seq+1>` and both files survive.
+ */
+export async function writeExclusiveBackup(fs: OneShotFs, base: string, text: string, mode?: number): Promise<string> {
+  let candidate = base
   for (let seq = 2; ; seq += 1) {
-    const candidate = `${base}.${seq}`
-    if (!exists(candidate)) return candidate
+    if (await fs.writeFileExclusive(candidate, text, mode)) return candidate
+    candidate = `${base}.${seq}`
   }
 }
 
@@ -416,6 +449,14 @@ async function discoverTargets(deps: OneShotDeps, flags: MigrateGoFlags): Promis
 interface ChangeTracker {
   patchChanged: boolean
   storeChanged: boolean
+  /**
+   * sha256 of the patch file's content recorded IMMEDIATELY after this
+   * target's last settings write (the post-write baseline). Restore only
+   * replaces the file while its current content still hashes to this value;
+   * `undefined` (file unreadable after the write) makes restore refuse —
+   * fail closed instead of clobbering an unbaselined file.
+   */
+  patchPostWriteSha?: string | undefined
 }
 
 function wrapOwnershipStore(
@@ -458,12 +499,19 @@ function wrapMigrationStore(store: MigrationStateStore, tracker: ChangeTracker):
   }
 }
 
-function wrapSettings(settings: SettingsService, tracker: ChangeTracker): SettingsService {
+function wrapSettings(
+  settings: SettingsService,
+  tracker: ChangeTracker,
+  recordPostWrite: () => Promise<void>,
+): SettingsService {
   return {
     describe: () => settings.describe(),
     mutate: async (ns, ops, expectedRevision) => {
       await settings.mutate(ns, ops, expectedRevision)
       tracker.patchChanged = true
+      // Baseline the post-write bytes while nothing else has had a chance to
+      // touch the file — this hash is what the restore path verifies against.
+      await recordPostWrite()
     },
   }
 }
@@ -484,13 +532,23 @@ function buildTargetDeps(
   shared: SharedPlanInputs,
   flags: MigrateGoFlags,
 ): { migrateDeps: MigrateDeps; tracker: ChangeTracker } {
-  const tracker: ChangeTracker = { patchChanged: false, storeChanged: false }
+  const tracker: ChangeTracker = { patchChanged: false, storeChanged: false, patchPostWriteSha: undefined }
+  // Baseline the patch file's bytes right after every settings write so the
+  // restore path can prove the file was not touched by anyone else in between
+  // (review Major 2: restore only ever replaces content this run wrote).
+  const recordPatchPostWrite = async (): Promise<void> => {
+    try {
+      tracker.patchPostWriteSha = sha256Of(await deps.fs.readFile(target.patchPath))
+    } catch {
+      tracker.patchPostWriteSha = undefined // unreadable ⇒ restore must refuse
+    }
+  }
   const rawSettings = target.isCurrent && deps.currentSettings !== undefined
     ? deps.currentSettings
     : createFilePatchSettingsService(deps.patchIoFor(target.patchPath))
   const stores = deps.storesFor(target.key)
   const migrateDeps: MigrateDeps = {
-    settings: wrapSettings(rawSettings, tracker),
+    settings: wrapSettings(rawSettings, tracker, recordPatchPostWrite),
     ownershipStore: wrapOwnershipStore(stores.ownership, tracker, deps.faultOwnershipWriteOnKeyPrefix, target.key),
     migrationStore: wrapMigrationStore(stores.migration, tracker),
     logger: deps.logger,
@@ -522,8 +580,18 @@ function buildTargetDeps(
 interface BackupRecord {
   source: string
   backup: string
+  /** sha256 of the source content captured at backup time — the pre-apply
+   *  staleness check re-verifies the source against this before any write. */
+  sourceSha: string
 }
 
+/**
+ * Snapshot `source` into `<source>.bak.<stamp>[.<seq>]`. The write is an
+ * exclusive O_EXCL claim followed by an atomic tmp+rename (mode preserved from
+ * the source), so a crash leaves either no backup or a complete one, and two
+ * same-second racers get distinct sequence suffixes instead of one clobbering
+ * the other. Returns the record with the source hash for the staleness check.
+ */
 async function backupFile(
   deps: OneShotDeps,
   source: string,
@@ -532,17 +600,17 @@ async function backupFile(
   pattern: RegExp,
 ): Promise<BackupRecord> {
   let text: string
+  let mode: number | undefined
   try {
     text = await deps.fs.readFile(source)
+    mode = (await deps.fs.stat(source))?.mode
   } catch (err) {
     throw new Error(`backup failed for ${source}: ${err instanceof Error ? err.message : String(err)}`)
   }
   const base = `${source}.bak.${stamp}`
-  const names = await deps.fs.readdir(dirPath).catch(() => [] as string[])
-  const backupPath = nextBackupPath((candidate) => names.includes(candidate.slice(dirPath.length + 1)), base)
-  await deps.fs.writeFile(backupPath, text)
+  const backupPath = await writeExclusiveBackup(deps.fs, base, text, mode)
   await pruneBackups(deps.fs, dirPath, pattern)
-  return { source, backup: backupPath }
+  return { source, backup: backupPath, sourceSha: sha256Of(text) }
 }
 
 // ---------------------------------------------------------------------------
@@ -561,24 +629,71 @@ function slotSummary(plan: MigrationPlan): string {
   return slots.length > 0 ? slots.join('、') : '(no route changes)'
 }
 
+/**
+ * The per-id action rows for the confirmation question (review Major 3: the
+ * dialog must not stop at +n/-n counts — every add/move/delete id is listed,
+ * and ids deleted as user-written or unknown/retired carry their kind so the
+ * user sees exactly which handwritten models `--adopt`/`--prune-user-extra`
+ * will remove). Compact: adds and deletes group onto one line per route;
+ * moves are one line each (source → target differs per row).
+ */
+function perIdActionLines(plan: MigrationPlan): string[] {
+  const groupByRoute = (op: MigrationIdPlan['op']): Map<string, string[]> => {
+    const grouped = new Map<string, string[]>()
+    for (const action of plan.idActions) {
+      if (action.op !== op) continue
+      const label = op === 'delete' && (action.kind === 'user-extra' || action.kind === 'unknown-retired')
+        ? `${action.id}（${action.kind === 'user-extra' ? '用户手写' : '未知/已下架'}）`
+        : action.id
+      const bucket = grouped.get(action.route) ?? []
+      bucket.push(label)
+      grouped.set(action.route, bucket)
+    }
+    return grouped
+  }
+  const lines: string[] = []
+  for (const [route, ids] of groupByRoute('add')) lines.push(`    + 新增 → ${route}: ${ids.join(', ')}`)
+  for (const action of plan.idActions) {
+    if (action.op === 'move') lines.push(`    ~ 移动 ${action.id}: ${action.route} → ${action.to ?? action.route}`)
+  }
+  for (const [route, ids] of groupByRoute('delete')) lines.push(`    - 删除 → ${route}: ${ids.join(', ')}`)
+  return lines
+}
+
 function buildConfirmQuestion(stamp: string, prepared: PreparedTarget[], modelsStoreBackup: string | undefined): AskItemShape {
   const lines: string[] = []
   lines.push('即将执行 opencode-go 一键迁移（写入前最后确认）。')
-  lines.push('将要删除/重写的旧条目（legacy 残桩 → 托管槽位）:')
+  lines.push('')
+  lines.push('【旧条目删除/重写（legacy 残桩 → 托管槽位）】')
   for (const item of prepared) {
     for (const stub of item.stubs) {
       lines.push(`  - [${item.target.key}] ${stub.route}（手写模型 ${stub.ids.length} 个: ${stub.ids.join(', ') || '无'}）`)
     }
   }
-  lines.push(`将新建/写入的槽位: ${slotSummary(prepared[0]!.plan)}（按 opencode.go.routes 配置；未配置的槽不创建，google 缺省不建）`)
-  lines.push('每个 profile 一行摘要:')
+  lines.push('')
+  lines.push('【逐 id 动作（保留项从略）】')
   for (const item of prepared) {
     const add = item.plan.idActions.filter((action) => action.op === 'add' || action.op === 'move').length
     const del = item.plan.idActions.filter((action) => action.op === 'delete').length
     const keep = item.plan.idActions.filter((action) => action.op === 'keep').length
-    lines.push(`  - [${item.target.key}] +${add} 新增 / ${del} 删除 / ${keep} 保留；planHash ${item.plan.planHash.slice(0, 12)}…`)
+    lines.push(`  [${item.target.key}] +${add} 新增/移动、${del} 删除、${keep} 保留；planHash ${item.plan.planHash.slice(0, 12)}…`)
+    const rows = perIdActionLines(item.plan)
+    lines.push(...(rows.length > 0 ? rows : ['    （无新增/移动/删除）']))
   }
-  lines.push('备份文件（失败即字节恢复）:')
+  lines.push('')
+  // The B6 managed-after notice, VERBATIM from the plan it belongs to (it is
+  // hashed into planHash, so this text and the applied plan cannot drift
+  // apart): `ackManaged: true` is the user's own informed answer to exactly
+  // this text, never a code-signed claim.
+  lines.push('【托管后告知（逐 profile，取自该 profile 的迁移计划）】')
+  for (const item of prepared) {
+    lines.push(`  [${item.target.key}]`)
+    for (const line of item.plan.managedAfterMigration.split('\n')) lines.push(`    ${line}`)
+  }
+  lines.push('')
+  lines.push(`【槽位】${slotSummary(prepared[0]!.plan)}（按 opencode.go.routes 配置；未配置的槽不创建，google 缺省不建）`)
+  lines.push('')
+  lines.push('【备份文件（失败即字节恢复）】')
   for (const item of prepared) lines.push(`  - ${item.patchBackup.backup}`)
   if (modelsStoreBackup !== undefined) lines.push(`  - ${modelsStoreBackup}`)
   lines.push(`迁移成功后: 当前 profile 的 opencode.go.enabled → true（时间戳 ${stamp}）。`)
@@ -606,6 +721,181 @@ function failClosedConfirmMessage(reason: string, prepared: PreparedTarget[]): s
     lines.push(`  [${item.target.key}] confirmCode: ${item.plan.confirmCode}`)
   }
   return lines.join('\n')
+}
+
+// ---------------------------------------------------------------------------
+// Restore helpers — guarded: never clobber a concurrent modification
+// ---------------------------------------------------------------------------
+
+interface RestoreOutcome {
+  line: string
+  /** True only when the file was actually replaced/removed. */
+  restored: boolean
+}
+
+/**
+ * Restore one changed patch file from its backup, but ONLY while the on-disk
+ * content still hashes to the post-write baseline this run recorded right
+ * after its last write. Anything else means another process touched the file
+ * after us: never overwrite it — report "concurrent modification detected,
+ * not restored" with the backup path so a human can decide. The write itself
+ * goes through the SAME atomic io (tmp + rename, mode preserved) the apply
+ * used — never a raw writeFile.
+ */
+export async function restorePatchIfUnchanged(
+  deps: OneShotDeps,
+  record: BackupRecord,
+  postWriteSha: string | undefined,
+): Promise<RestoreOutcome> {
+  let currentSha: string | undefined
+  try {
+    currentSha = sha256Of(await deps.fs.readFile(record.source))
+  } catch {
+    currentSha = undefined
+  }
+  if (postWriteSha === undefined || currentSha === undefined || currentSha !== postWriteSha) {
+    return {
+      restored: false,
+      line: `concurrent modification detected, not restored: ${record.source} (backup: ${record.backup}) — 人工核对后处理`,
+    }
+  }
+  const backupText = await deps.fs.readFile(record.backup)
+  await deps.patchIoFor(record.source).writeAtomic(backupText)
+  return { restored: true, line: `restored ${record.source} ← ${record.backup}` }
+}
+
+/**
+ * Remove a models-store this run CREATED, but only while its content still
+ * matches this run's post-write baseline; a store another process has touched
+ * since is left in place and reported for manual handling.
+ */
+export async function removeStoreIfUnchanged(deps: OneShotDeps, postWriteSha: string | undefined): Promise<RestoreOutcome> {
+  let currentSha: string | undefined
+  try {
+    currentSha = sha256Of(await deps.fs.readFile(deps.modelsStorePath))
+  } catch {
+    currentSha = undefined
+  }
+  if (postWriteSha === undefined || currentSha === undefined || currentSha !== postWriteSha) {
+    return {
+      restored: false,
+      line: `concurrent modification detected, not restored: ${deps.modelsStorePath} (created by this run, changed since) — 人工核对后处理`,
+    }
+  }
+  await deps.fs.unlink(deps.modelsStorePath)
+  return { restored: true, line: `removed ${deps.modelsStorePath} (created by this run)` }
+}
+
+/**
+ * Restore the models-store from its backup through the remote-catalog store
+ * accessor — the SAME promise queue + cross-process lock every other
+ * models-store writer uses — instead of overwriting the file behind its back.
+ * Keys a concurrent writer added are dropped explicitly, key by key, and the
+ * same post-write-baseline check as the patch restore applies first.
+ */
+export async function restoreModelsStoreIfUnchanged(
+  deps: OneShotDeps,
+  backupPath: string,
+  postWriteSha: string | undefined,
+): Promise<RestoreOutcome> {
+  let currentSha: string | undefined
+  try {
+    currentSha = sha256Of(await deps.fs.readFile(deps.modelsStorePath))
+  } catch {
+    currentSha = undefined
+  }
+  if (postWriteSha === undefined || currentSha === undefined || currentSha !== postWriteSha) {
+    return {
+      restored: false,
+      line: `concurrent modification detected, not restored: ${deps.modelsStorePath} (backup: ${backupPath}) — 人工核对后处理`,
+    }
+  }
+  const backupText = await deps.fs.readFile(backupPath)
+  let backupDoc: Record<string, unknown>
+  try {
+    backupDoc = JSON.parse(backupText) as Record<string, unknown>
+  } catch (err) {
+    throw new Error(`backup is not valid JSON (${err instanceof Error ? err.message : String(err)})`)
+  }
+  const accessor = loadModelsStore(deps.modelsStorePath)
+  for (const key of await accessor.listRawKeys()) {
+    if (!(key in backupDoc)) await accessor.deleteRaw(key)
+  }
+  for (const [key, value] of Object.entries(backupDoc)) {
+    await accessor.writeRaw(key, value as Record<string, unknown>)
+  }
+  return { restored: true, line: `restored ${deps.modelsStorePath} ← ${backupPath} (via models-store lock accessor)` }
+}
+
+/**
+ * Re-hash every target's patch file and drop the ones whose content changed
+ * after their backup was taken (the backup → apply window, review Major 2
+ * item 3): a plan computed from stale bytes is never applied, and a dropped
+ * target writes nothing.
+ */
+export async function dropStaleTargets(
+  deps: OneShotDeps,
+  prepared: readonly PreparedTarget[],
+): Promise<{ ready: PreparedTarget[]; stale: { key: string; patchPath: string }[] }> {
+  const ready: PreparedTarget[] = []
+  const stale: { key: string; patchPath: string }[] = []
+  for (const item of prepared) {
+    let currentSha: string | undefined
+    try {
+      currentSha = sha256Of(await deps.fs.readFile(item.target.patchPath))
+    } catch {
+      currentSha = undefined
+    }
+    if (currentSha !== item.patchBackup.sourceSha) stale.push({ key: item.target.key, patchPath: item.target.patchPath })
+    else ready.push(item)
+  }
+  return { ready, stale }
+}
+
+export type StoreFreshness = { ok: true } | { ok: false; reason: string }
+
+/**
+ * Verify the shared models-store has not drifted inside the backup → apply
+ * window: with a backup, its content must still hash to the backup-time
+ * value; without one (the file did not exist at backup time), it must still
+ * not exist — a store another process created meanwhile must never end up
+ * deleted by this run's rollback path.
+ */
+export async function verifyStoreFreshness(
+  deps: OneShotDeps,
+  modelsStoreBackup: string | undefined,
+  storeSourceSha: string | undefined,
+  storeExistedBefore: boolean,
+): Promise<StoreFreshness> {
+  const rerunHint = '请重跑 /model-sync migrate-go 以基于最新内容重新规划。'
+  if (modelsStoreBackup !== undefined) {
+    let shaNow: string | undefined
+    try {
+      shaNow = sha256Of(await deps.fs.readFile(deps.modelsStorePath))
+    } catch {
+      shaNow = undefined
+    }
+    if (shaNow !== storeSourceSha) {
+      return {
+        ok: false,
+        reason: `${deps.modelsStorePath} changed after its backup was taken; aborted with zero writes.\n备份仍在（人工核对可用）: ${modelsStoreBackup}\n${rerunHint}`,
+      }
+    }
+    return { ok: true }
+  }
+  if (!storeExistedBefore) {
+    let existsNow = false
+    try {
+      await deps.fs.readFile(deps.modelsStorePath)
+      existsNow = true
+    } catch {
+      existsNow = false
+    }
+    if (existsNow) {
+      return { ok: false, reason: `${deps.modelsStorePath} was created by another process after this run started; aborted with zero writes.\n${rerunHint}` }
+    }
+  }
+  return { ok: true }
 }
 
 // ---------------------------------------------------------------------------
@@ -678,7 +968,7 @@ export async function runMigrateGoOneShot(
         notMigratable.push(`${target.key}: state=${plan.state} (nothing to migrate)`)
         continue
       }
-      prepared.push({ target, plan, migrateDeps, tracker, stubs: target.stubs, patchBackup: { source: '', backup: '' } })
+      prepared.push({ target, plan, migrateDeps, tracker, stubs: target.stubs, patchBackup: { source: '', backup: '', sourceSha: '' } })
     }
     for (const line of notMigratable) note(`not migratable: ${line}`)
     if (prepared.length === 0) {
@@ -693,6 +983,8 @@ export async function runMigrateGoOneShot(
     // ---- d. backups BEFORE any write --------------------------------------
     const patchBackups: BackupRecord[] = []
     let modelsStoreBackup: string | undefined
+    let storeSourceSha: string | undefined
+    let storeExistedBefore = false
     try {
       for (const item of prepared) {
         const record = await backupFile(deps, item.target.patchPath, stamp, item.target.dir, PATCH_BACKUP_PATTERN)
@@ -706,13 +998,14 @@ export async function runMigrateGoOneShot(
       } catch (err) {
         if (!isEnoent(err)) throw err
       }
+      storeExistedBefore = storeText !== undefined
       if (storeText !== undefined) {
         const base = `${deps.modelsStorePath}.bak.${stamp}`
         const homeDir = deps.home
-        const names = await deps.fs.readdir(homeDir).catch(() => [] as string[])
-        const backupPath = nextBackupPath((candidate) => names.includes(candidate.slice(homeDir.length + 1)), base)
-        await deps.fs.writeFile(backupPath, storeText)
+        const storeMode = (await deps.fs.stat(deps.modelsStorePath))?.mode
+        const backupPath = await writeExclusiveBackup(deps.fs, base, storeText, storeMode)
         modelsStoreBackup = backupPath
+        storeSourceSha = sha256Of(storeText)
         note(`backup: ${deps.modelsStorePath} → ${backupPath}`)
         await pruneBackups(deps.fs, homeDir, STORE_BACKUP_PATTERN)
       }
@@ -720,15 +1013,36 @@ export async function runMigrateGoOneShot(
       return { kind: 'error', text: `migrate-go: ${err instanceof Error ? err.message : String(err)}; zero writes` }
     }
 
+    // ---- d2. staleness re-verify (the backup → apply window) --------------
+    const { ready, stale } = await dropStaleTargets(deps, prepared)
+    for (const item of stale) {
+      note(`stale: [${item.key}] ${item.patchPath} changed after its backup was taken; target aborted (zero writes)`)
+    }
+    if (ready.length === 0) {
+      return {
+        kind: 'success',
+        text: [
+          'migrate-go: nothing to apply — every target changed after its backup was taken; zero writes.',
+          '请重跑 /model-sync migrate-go 以基于最新内容重新规划。',
+          ...patchBackups.map((record) => `  backup kept: ${record.backup}`),
+        ].join('\n'),
+      }
+    }
+    const storeFresh = await verifyStoreFreshness(deps, modelsStoreBackup, storeSourceSha, storeExistedBefore)
+    if (!storeFresh.ok) {
+      note(`stale: ${storeFresh.reason.split('\n')[0]}`)
+      return { kind: 'error', text: `migrate-go: ${storeFresh.reason}` }
+    }
+
     // ---- e. ONE confirmation (fail closed without the channel) ------------
     const ask = deps.resolveAsk()
     if (ask === undefined || typeof ask.ask !== 'function') {
-      return { kind: 'error', text: failClosedConfirmMessage('userQuestions 服务缺失（NO_PROVIDER / 未注册）', prepared) }
+      return { kind: 'error', text: failClosedConfirmMessage('userQuestions 服务缺失（NO_PROVIDER / 未注册）', ready) }
     }
     let answers: { answers?: AskAnswerItemShape[] }
     try {
       answers = await ask.ask({
-        questions: [buildConfirmQuestion(stamp, prepared, modelsStoreBackup)],
+        questions: [buildConfirmQuestion(stamp, ready, modelsStoreBackup)],
         ...(invocation.agent === undefined ? {} : { agent: invocation.agent }),
         ...(invocation.signal === undefined ? {} : { signal: invocation.signal }),
       })
@@ -736,18 +1050,38 @@ export async function runMigrateGoOneShot(
       const code = typeof (err as { code?: unknown }).code === 'string' ? (err as { code?: unknown }).code as string : undefined
       const reason = err instanceof Error ? `${err.message}${code !== undefined ? ` [${code}]` : ''}` : String(err)
       note(`confirm failed: ${reason}`)
-      return { kind: 'error', text: failClosedConfirmMessage(reason, prepared) }
+      return { kind: 'error', text: failClosedConfirmMessage(reason, ready) }
     }
+    const backupListLines = (): string[] =>
+      [...patchBackups.map((record) => record.backup), ...(modelsStoreBackup !== undefined ? [modelsStoreBackup] : [])]
+        .map((path) => `  ${path}`)
     const answer = (answers.answers ?? []).find((item) => item.id === CONFIRM_QUESTION_ID)
     const selected = answer?.selected ?? []
-    if (!selected.includes(CONFIRM_PROCEED)) {
-      note('confirm: cancelled / blank')
+    // Abort defense in depth (review Minor 5): the ask seam can return after
+    // the invocation was already aborted — re-check here and treat it as a
+    // cancel, zero writes.
+    if (invocation.signal?.aborted === true) {
+      note('confirm: aborted (signal aborted when ask returned)')
+      return {
+        kind: 'success',
+        text: ['migrate-go: 确认请求已中止（signal aborted）——按取消处理，零写入。', '本轮备份已生成（保留，可手动删除）:', ...backupListLines()].join('\n'),
+      }
+    }
+    const choseProceed = selected.includes(CONFIRM_PROCEED)
+    const choseCancel = selected.includes(CONFIRM_CANCEL)
+    if (!choseProceed || choseCancel) {
+      // Blank/skip and an answer carrying BOTH labels are ambiguous: cancel
+      // and ask the user to rerun — proceed never wins a contested answer.
+      const ambiguous = choseProceed && choseCancel
+      note(ambiguous ? 'confirm: ambiguous (both labels selected)' : 'confirm: cancelled / blank')
       return {
         kind: 'success',
         text: [
-          'migrate-go: 已取消——零写入。',
+          ambiguous
+            ? 'migrate-go: 两个选项同时被选中，答案有歧义——按取消处理，零写入。请重跑后再确认。'
+            : 'migrate-go: 已取消——零写入。',
           '本轮备份已生成（保留，可手动删除）:',
-          ...[...patchBackups.map((item) => item.backup), ...(modelsStoreBackup !== undefined ? [modelsStoreBackup] : [])].map((path) => `  ${path}`),
+          ...backupListLines(),
         ].join('\n'),
       }
     }
@@ -755,11 +1089,12 @@ export async function runMigrateGoOneShot(
 
     // ---- f. apply (existing engine; consent triple computed HERE) ---------
     const applied: PreparedTarget[] = []
-    const changedPatches: { backup: BackupRecord; isCurrent: boolean }[] = []
+    const changedPatches: { backup: BackupRecord; isCurrent: boolean; tracker: ChangeTracker }[] = []
     let modelsStoreChanged = false
     let modelsStoreCreated = false
+    let storePostWriteSha: string | undefined
     let failure: { target: Target; detail: string } | undefined
-    for (const item of prepared) {
+    for (const item of ready) {
       let resultText: string | undefined
       let resultOk = false
       try {
@@ -775,12 +1110,21 @@ export async function runMigrateGoOneShot(
       // Track changes BEFORE judging the outcome: applyMigration may have
       // mutated settings/stores and then failed (its internal logical restore
       // mutates too) — those files must be byte-restored regardless.
-      if (item.tracker.patchChanged === true) changedPatches.push({ backup: item.patchBackup, isCurrent: item.target.isCurrent })
+      if (item.tracker.patchChanged === true) {
+        changedPatches.push({ backup: item.patchBackup, isCurrent: item.target.isCurrent, tracker: item.tracker })
+      }
       if (item.tracker.storeChanged === true) {
         modelsStoreChanged = true
         // The store backup only exists when the file pre-dated the run; a
         // store created by this run is restored by removing it again.
         modelsStoreCreated ||= modelsStoreBackup === undefined
+        // Baseline the store's post-write bytes (read right after the write
+        // through the lock accessor) for the restore path's content check.
+        try {
+          storePostWriteSha = sha256Of(await deps.fs.readFile(deps.modelsStorePath))
+        } catch {
+          storePostWriteSha = undefined
+        }
       }
       for (const line of (resultText ?? '').split('\n')) note(`[${item.target.key}] apply: ${line}`)
       if (!resultOk) {
@@ -790,38 +1134,36 @@ export async function runMigrateGoOneShot(
       applied.push(item)
     }
 
-    // ---- atomicity: byte-restore everything this run changed --------------
+    // ---- atomicity: restore everything this run changed -------------------
     if (failure !== undefined) {
       const restore: string[] = []
       let restoredHostSeamProfile = false
       for (const changed of [...changedPatches].reverse()) {
         try {
-          const text = await deps.fs.readFile(changed.backup.backup)
-          await deps.fs.writeFile(changed.backup.source, text)
-          restore.push(`restored ${changed.backup.source} ← ${changed.backup.backup}`)
-          restoredHostSeamProfile ||= changed.isCurrent
+          const outcome = await restorePatchIfUnchanged(deps, changed.backup, changed.tracker.patchPostWriteSha)
+          restore.push(outcome.line)
+          restoredHostSeamProfile ||= outcome.restored && changed.isCurrent
         } catch (err) {
           restore.push(`RESTORE FAILED for ${changed.backup.source}: ${err instanceof Error ? err.message : String(err)} (backup: ${changed.backup.backup})`)
         }
       }
       if (modelsStoreCreated) {
         try {
-          await deps.fs.unlink(deps.modelsStorePath)
-          restore.push(`removed ${deps.modelsStorePath} (created by this run)`)
+          const outcome = await removeStoreIfUnchanged(deps, storePostWriteSha)
+          restore.push(outcome.line)
         } catch (err) {
           restore.push(`RESTORE FAILED for ${deps.modelsStorePath}: ${err instanceof Error ? err.message : String(err)}`)
         }
       } else if (modelsStoreChanged && modelsStoreBackup !== undefined) {
         try {
-          const text = await deps.fs.readFile(modelsStoreBackup)
-          await deps.fs.writeFile(deps.modelsStorePath, text)
-          restore.push(`restored ${deps.modelsStorePath} ← ${modelsStoreBackup}`)
+          const outcome = await restoreModelsStoreIfUnchanged(deps, modelsStoreBackup, storePostWriteSha)
+          restore.push(outcome.line)
         } catch (err) {
           restore.push(`RESTORE FAILED for ${deps.modelsStorePath}: ${err instanceof Error ? err.message : String(err)} (backup: ${modelsStoreBackup})`)
         }
       }
       const text = [
-        `migrate-go: FAILED at apply for [${failure.target.key}] — 已回滚本轮全部改动文件。`,
+        `migrate-go: FAILED at apply for [${failure.target.key}] — 已停止，改动文件按本轮备份恢复（逐文件核对结果见下）。`,
         `失败步骤: apply；原始错误: ${failure.detail}`,
         '恢复结果:',
         ...(restore.length > 0 ? restore.map((line) => `  ${line}`) : ['  (no file had been written)']),

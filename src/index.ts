@@ -135,7 +135,7 @@ import {
 } from './opencode-go-one-shot.ts'
 import type { PatchFileIo } from './opencode-go-patch-file.ts'
 import { MODELS_STORE_PATH } from './remote-catalog.ts'
-import { mkdir, readFile, readdir, rename, stat as statFd, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, open, readFile, readdir, rename, stat as statFd, unlink, writeFile } from 'node:fs/promises'
 import { readFileSync, statSync, writeFileSync } from 'node:fs'
 
 export const name = 'dsh-model-sync'
@@ -1286,7 +1286,31 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
       return info === undefined ? undefined : { mode: info.mode }
     },
     readdir: async (path) => readdir(path),
+    // Backup creation: claim the final name exclusively (O_EXCL `wx` — false
+    // when taken, so the caller retries the next sequence suffix), then
+    // replace the claimed placeholder atomically via tmp + rename. A crash
+    // between claim and rename leaves at most an empty placeholder; the
+    // tmp+rename guarantees the backup content itself is never torn.
+    writeFileExclusive: async (path, data, mode) => {
+      try {
+        const handle = await open(path, 'wx', mode)
+        await handle.close()
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'EEXIST') return false
+        throw err
+      }
+      const tmp = `${path}.tmp-${process.pid}-${exclusiveWriteSeq++}`
+      try {
+        await writeFile(tmp, data, mode === undefined ? undefined : { mode })
+        await rename(tmp, path)
+        return true
+      } catch (err) {
+        await unlink(path).catch(() => {}) // release the claim; nothing was replaced
+        throw err
+      }
+    },
   }
+  let exclusiveWriteSeq = 0
   /** Sync-read + atomic-write io for one patch file (describe() is sync). */
   const patchIoFor = (path: string): PatchFileIo => {
     let writeSeq = 0

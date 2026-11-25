@@ -4,7 +4,7 @@
 // test touches the real ~/.dsh.
 
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -16,12 +16,18 @@ import {
 import { GO_MIGRATION_STORE_SERVICE } from '../lib/opencode-go-migration.js'
 import { GO_OWNERSHIP_STORE_SERVICE } from '../lib/opencode-go-sync.js'
 import {
+  dropStaleTargets,
   formatStamp,
   legacyStubsOf,
   MIGRATE_GO_USAGE,
-  nextBackupPath,
   parseMigrateGoFlags,
   pruneBackups,
+  removeStoreIfUnchanged,
+  restoreModelsStoreIfUnchanged,
+  restorePatchIfUnchanged,
+  sha256Of,
+  verifyStoreFreshness,
+  writeExclusiveBackup,
 } from '../lib/opencode-go-one-shot.js'
 import {
   applyPatchOps,
@@ -142,8 +148,14 @@ function makeAsk(script = { mode: 'approve' }) {
       recorder.calls += 1
       recorder.questions.push(request)
       if (recorder.mode === 'throw') throw Object.assign(new Error('no user-questions answerer accepted the request'), { code: 'NO_PROVIDER' })
-      const label = recorder.mode === 'cancel' ? '取消' : '执行迁移'
-      return { answers: [{ id: request.questions[0].id, selected: recorder.mode === 'blank' ? [] : [label] }] }
+      const selected = recorder.mode === 'cancel'
+        ? ['取消']
+        : recorder.mode === 'blank'
+          ? []
+          : recorder.mode === 'both'
+            ? ['执行迁移', '取消']
+            : ['执行迁移']
+      return { answers: [{ id: request.questions[0].id, selected }] }
     },
   }
   return recorder
@@ -284,9 +296,9 @@ function createHarness({
     commands: { register(definition) { state.definitions.push(definition); return () => {} } },
   }
   apply(ctx, config)
-  const invoke = (text) => {
+  const invoke = (text, signal) => {
     const command = state.definitions.find((d) => d.name === 'model-sync')
-    return command.handler({ rawInput: text, agent: { id: 'agent-1' }, signal: new AbortController().signal })
+    return command.handler({ rawInput: text, agent: { id: 'agent-1' }, signal: signal ?? new AbortController().signal })
   }
   return {
     root, home, profilesDir, currDir, storePath, settings, logs, state, invoke,
@@ -347,13 +359,24 @@ await check('formatStamp yields YYYYMMDD-HHMMSS', () => {
   assert.match(formatStamp(new Date(2026, 10, 24, 7, 8, 9)), /^20261124-070809$/)
 })
 
-await check('nextBackupPath adds a sequence suffix inside one second', () => {
-  const taken = new Set(['/x/f.bak.20261124-070809'])
-  const exists = (p) => taken.has(p)
-  assert.equal(nextBackupPath(exists, '/x/f.bak.20261124-070809'), '/x/f.bak.20261124-070809.2')
-  taken.add('/x/f.bak.20261124-070809.2')
-  assert.equal(nextBackupPath(exists, '/x/f.bak.20261124-070809'), '/x/f.bak.20261124-070809.3')
-  assert.equal(nextBackupPath(() => false, '/x/f.bak.20261124-070809'), '/x/f.bak.20261124-070809')
+await check('writeExclusiveBackup retries the sequence suffix when the exclusive claim misses', async () => {
+  // A fake fs whose O_EXCL semantics say the same-second base name is taken.
+  const claimed = new Set(['/h/models-store.json.bak.20261124-070809'])
+  const written = []
+  const fs = {
+    writeFileExclusive: async (path) => {
+      if (claimed.has(path)) return false
+      claimed.add(path)
+      written.push(path)
+      return true
+    },
+  }
+  const first = await writeExclusiveBackup(fs, '/h/models-store.json.bak.20261124-070809', '{}')
+  assert.equal(first, '/h/models-store.json.bak.20261124-070809.2', 'taken base name → .2, never an overwrite')
+  const second = await writeExclusiveBackup(fs, '/h/models-store.json.bak.20261124-070809', '{}')
+  assert.equal(second, '/h/models-store.json.bak.20261124-070809.3')
+  const free = await writeExclusiveBackup(fs, '/h/models-store.json.bak.20261124-070810', 'x')
+  assert.equal(free, '/h/models-store.json.bak.20261124-070810', 'free name claims the base directly')
 })
 
 await check('pruneBackups keeps the 3 newest matching files and only those', async () => {
@@ -495,6 +518,191 @@ await check('patch editor: refuses unsupported shapes instead of guessing', () =
   assert.equal(applyPatchOps(CURR_PATCH, [{ op: 'set', path: ['providers', 'opencode-go'], value: {} }]).ok, false, 'whole-section set')
 })
 
+// ---------------------------------------------------------------------------
+// Patch editor: host-incompatible YAML is refused at parse time (Blocker A).
+// Every shape below used to parse + self-validate + get written while the
+// host yaml@2.8 rejected or re-interpreted the result — now the PARSE fails,
+// so every consumer (discovery, describe, mutate) fails closed pre-write.
+// ---------------------------------------------------------------------------
+
+/** Build a patch whose llm-pi-ai providers tree contains the given raw lines. */
+const patchWithProviders = (providerLines) => [
+  '- id: llm-pi-ai',
+  '  config:',
+  '    providers:',
+  ...providerLines.map((line) => `      ${line}`),
+].join('\n')
+
+await check('patch editor: quoted keys are refused (bare plain keys only)', () => {
+  const quoted = patchWithProviders(['"opencode-go":', '  apiKeyEnv: K'])
+  const parsed = parsePatchDocument(quoted)
+  assert.equal(parsed.ok, false, 'quoted key must not parse')
+  assert.match(parsed.reason, /quoted key/)
+  assert.equal(applyPatchOps(quoted, [{ op: 'set', path: ['providers', 'opencode-go', 'api'], value: 'x' }]).ok, false)
+})
+
+await check('patch editor: whitespace in a key (or before the colon) is refused', () => {
+  for (const [name, lines] of [
+    ['trailing space before colon', ['opencode-go :', '  apiKeyEnv: K']],
+    ['inner space', ['open code-go:', '  apiKeyEnv: K']],
+  ]) {
+    const parsed = parsePatchDocument(patchWithProviders(lines))
+    assert.equal(parsed.ok, false, `${name} must not parse`)
+    assert.match(parsed.reason, /whitespace/)
+  }
+})
+
+await check('patch editor: YAML indicator characters in a key are refused', () => {
+  for (const key of ['a#b', 'a*b', 'a&b', 'a{b', 'a[b']) {
+    const parsed = parsePatchDocument(patchWithProviders([`${key}: 1`]))
+    assert.equal(parsed.ok, false, `key ${key} must not parse`)
+    assert.match(parsed.reason, /indicator character/)
+  }
+})
+
+await check('patch editor: duplicate keys in the same mapping are refused', () => {
+  const duplicated = patchWithProviders([
+    'opencode-go:',
+    '  apiKeyEnv: K',
+    'opencode-go:',
+    '  api: openai-completions',
+  ])
+  const parsed = parsePatchDocument(duplicated)
+  assert.equal(parsed.ok, false, 'same-level duplicate key must not parse (host yaml rejects it; no last-wins folding)')
+  assert.match(parsed.reason, /duplicate key/)
+  // Also at other mapping levels (config level here).
+  const configDup = ['- id: llm-pi-ai', '  config:', '    a: 1', '    a: 2'].join('\n')
+  assert.equal(parsePatchDocument(configDup).ok, false)
+})
+
+await check('patch editor: aliases, anchors and merge keys are refused', () => {
+  const alias = parsePatchDocument(patchWithProviders(['opencode-go:', '  models: *m']))
+  assert.equal(alias.ok, false, 'alias must not parse')
+  assert.match(alias.reason, /anchors\/aliases/)
+  const anchored = parsePatchDocument(patchWithProviders(['opencode-go:', '  api: &a openai-completions']))
+  assert.equal(anchored.ok, false, 'inline anchor must not parse')
+  assert.match(anchored.reason, /anchors\/aliases/)
+  const mergeKey = parsePatchDocument(patchWithProviders(['<<: *base', 'opencode-go:', '  apiKeyEnv: K']))
+  assert.equal(mergeKey.ok, false, 'merge key must not parse')
+  assert.match(mergeKey.reason, /merge key/)
+  const flowAlias = parsePatchDocument('- id: llm-pi-ai\n  config:\n    x: [a, *m]\n')
+  assert.equal(flowAlias.ok, false, 'alias inside a flow collection must not parse')
+})
+
+await check('patch editor: !!js opaque leaves outside the edited providers tree stay passthrough', () => {
+  const outside = [
+    '- id: ui-chat',
+    '  config:',
+    '    flag: !!js true',
+    '- id: llm-pi-ai',
+    '  config:',
+    '    providers:',
+    '      opencode-go:',
+    '        apiKeyEnv: OPENCODE_GO_API_KEY',
+    '        models:',
+    '          - id: custom-test-model',
+    '            name: Custom',
+  ].join('\n')
+  const parsed = parsePatchDocument(outside)
+  assert.equal(parsed.ok, true, 'opaque leaf OUTSIDE the edit scope still parses (existing behavior)')
+  const applied = applyPatchOps(outside, [{ op: 'set', path: ['providers', 'opencode-go', 'api'], value: 'openai-completions' }])
+  assert.equal(applied.ok, true, 'ops apply while the opaque leaf stays outside the edited tree')
+  assert.ok(applied.next.includes('flag: !!js true'), 'the opaque leaf survives verbatim')
+})
+
+await check('patch editor: a mid-batch refusal means the whole target refuses with zero writes', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'model-sync-no-partial-'))
+  const path = join(root, 'cordis.patch.yml')
+  try {
+    writeFileSync(path, CURR_PATCH)
+    const before = readFileSync(path, 'utf8')
+    const io = {
+      readText: () => readFileSync(path, 'utf8'),
+      writeAtomic: async (text) => {
+        const tmp = `${path}.tmp`
+        writeFileSync(tmp, text)
+        renameSync(tmp, path)
+      },
+    }
+    const service = createFilePatchSettingsService(io)
+    const desc = service.describe().find((d) => d.ns === 'llm-pi-ai')
+    // Op 1 would succeed; op 2 hits a refused mutation path. The adapter must
+    // throw BEFORE any write — the file stays byte-identical.
+    await assert.rejects(
+      () => service.mutate('llm-pi-ai', [
+        { op: 'set', path: ['providers', 'opencode-go', 'api'], value: 'openai-completions' },
+        { op: 'set', path: ['providers', 'opencode-go', 'api', 'extra'], value: 'x' },
+      ], desc.revision),
+      /unsupported mutation path/,
+    )
+    assert.equal(readFileSync(path, 'utf8'), before, 'a refusing batch never partially writes')
+    assert.equal(existsSync(`${path}.tmp`), false, 'no temp file left behind')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+await check('patch editor: regression — the old accept-broken behavior no longer exists', async () => {
+  // Old behavior: a quoted key parsed into a distinct literal key, passed
+  // op-by-op self-validation, and was written back — the host yaml then
+  // failed to load the profile settings while the batch reported SUCCESS.
+  const brokenKey = patchWithProviders(['"opencode-go":', '  apiKeyEnv: OPENCODE_GO_API_KEY'])
+  const parsed = parsePatchDocument(brokenKey)
+  assert.equal(parsed.ok, false, 'the broken document is now refused at parse')
+  assert.equal(applyPatchOps(brokenKey, [{ op: 'set', path: ['providers', 'opencode-go', 'api'], value: 'x' }]).ok, false)
+  // The adapter fails closed: an unparseable file yields NO descriptor and
+  // mutate refuses, so nothing can be written through it.
+  const root = mkdtempSync(join(tmpdir(), 'model-sync-regression-'))
+  const path = join(root, 'cordis.patch.yml')
+  try {
+    writeFileSync(path, brokenKey)
+    const service = createFilePatchSettingsService({
+      readText: () => readFileSync(path, 'utf8'),
+      writeAtomic: async () => { throw new Error('must never be reached') },
+    })
+    assert.deepEqual(service.describe(), [], 'unparseable patch ⇒ no descriptor (fail closed)')
+    await assert.rejects(
+      () => service.mutate('llm-pi-ai', [{ op: 'set', path: ['providers', 'opencode-go', 'api'], value: 'x' }]),
+      /parse failed/,
+    )
+    assert.equal(readFileSync(path, 'utf8'), brokenKey, 'the broken file is never rewritten')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+await check('e2e: a target with an uneditable patch is skipped at discovery; other targets migrate', async () => {
+  const quotedKeyPatch = [
+    '# quoted-key patch: the host yaml would load it, the subset editor refuses it',
+    '- id: llm-pi-ai',
+    '  config:',
+    '    providers:',
+    '      "opencode-go":',
+    '        apiKeyEnv: OPENCODE_GO_API_KEY',
+    '        models:',
+    '          - id: custom-bad-model',
+    '            name: Custom Bad',
+  ].join('\n')
+  const h = createHarness({ extraProfiles: { bad: quotedKeyPatch, other: OTHER_PATCH } })
+  try {
+    const badBefore = readFileSync(join(h.profilesDir, 'bad', 'cordis.patch.yml'), 'utf8')
+    const result = await h.invoke('migrate-go --all-profiles')
+    assert.equal(result.kind, 'success', result.text)
+    // Strategy: an uneditable target is SKIPPED at discovery (fail closed,
+    // zero writes for it), the rest of the batch proceeds normally.
+    assert.match(result.text, /skipped: bad: .*quoted key/)
+    assert.equal(readFileSync(join(h.profilesDir, 'bad', 'cordis.patch.yml'), 'utf8'), badBefore, 'bad patch untouched')
+    assert.equal(readdirSync(join(h.profilesDir, 'bad')).filter((name) => name.includes('.bak.')).length, 0, 'no backup taken for a skipped target')
+    const fingerprint = fingerprintKey(KEY)
+    const store = JSON.parse(readFileSync(h.storePath, 'utf8'))
+    assert.ok(store[`other#opencode-go#${fingerprint}`], 'the healthy sibling target still migrated')
+    assert.ok(store[`curr#opencode-go#${fingerprint}`], 'the current profile still migrated')
+    assert.equal(store[`bad#opencode-go#${fingerprint}`], undefined, 'the refused target wrote nothing')
+  } finally {
+    h.dispose()
+  }
+})
+
 await check('patch file adapter: describe is sync, mutate writes atomically, revision conflicts detected', async () => {
   const root = mkdtempSync(join(tmpdir(), 'model-sync-adapter-'))
   const path = join(root, 'cordis.patch.yml')
@@ -554,10 +762,19 @@ await check('e2e: approve migrates the current profile end to end', async () => 
     assert.equal(h.ask.calls, 1, 'exactly one confirmation')
     const question = h.ask.questions[0].questions[0]
     assert.equal(question.options[0].label, '执行迁移')
-    assert.ok(question.options[0].label === question.options[0].label && question.options[1].label === '取消')
+    assert.equal(question.options[1].label, '取消')
     for (const needle of ['custom-test-model', 'opencode-go-msg', 'opencode-go-resp', '[curr]', h.patchPath, 'planHash']) {
       assert.ok(question.question.includes(needle), `question mentions ${needle}`)
     }
+    // Managed-after notice is quoted VERBATIM in the question (informed
+    // consent: ackManaged must reflect text the user actually saw).
+    assert.ok(question.question.includes('[managed-after-migration] 以下模型将交由插件管理：'), 'managed-after header present')
+    assert.ok(question.question.includes('官方下架时，这些模型会在满足「归属账本 + 现值哈希 + 无 override/pin」三闸门且连续 2 轮确认后自动从列表移除。'),
+      'managed-after auto-removal notice present verbatim')
+    // Per-id action rows (not just +n/-n counts).
+    assert.ok(question.question.includes('+ 新增 → opencode-go-msg: qwen4-max'), 'per-id add row for msg')
+    assert.ok(question.question.includes('+ 新增 → opencode-go-resp: grok-4.7'), 'per-id add row for resp')
+    assert.ok(question.question.includes('+ 新增 → opencode-go: deepseek-v4.1-flash'), 'per-id add row for chat')
     // Settings: stub upgraded in place, msg/resp created, others untouched.
     const chat = h.settings.state.get('opencode-go')
     assert.equal(chat.api, 'openai-completions')
@@ -749,7 +966,12 @@ await check('e2e: --all-profiles migrates every stub profile with ONE confirmati
     assert.match(result.text, /\[other\]/)
     // models-store backed up exactly once for the whole run.
     assert.equal(backupsIn(h.home, /^models-store\.json\.bak\./).length, 1)
-    void otherBefore
+    // The second profile's backup is byte-accurate (true byte comparison of
+    // the pre-run file against the backup the run wrote for it).
+    const otherBackups = readdirSync(join(h.profilesDir, 'other')).filter((name) => /^cordis\.patch\.yml\.bak\./.test(name))
+    assert.equal(otherBackups.length, 1, 'one backup for the other profile')
+    assert.equal(readFileSync(join(h.profilesDir, 'other', otherBackups[0]), 'utf8'), otherBefore,
+      'other profile backup is byte-identical to its pre-run content')
   } finally {
     h.dispose()
   }
@@ -787,5 +1009,353 @@ await check('e2e: first-profile failure restores all changed files byte-for-byte
     assert.equal(h.settings.state.get('opencode-go-msg'), undefined, 'no slot was created')
   } finally {
     h.dispose()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Confirmation content (review Major 3): per-id rows incl. deleted user ids
+// ---------------------------------------------------------------------------
+
+await check('e2e: --adopt --prune-user-extra lists deleted user-written ids one by one', async () => {
+  const h = createHarness({ storeSeed: { seed: { models: [] } } })
+  try {
+    const result = await h.invoke('migrate-go --adopt --prune-user-extra')
+    assert.equal(result.kind, 'success', result.text)
+    assert.equal(h.ask.calls, 1, 'still exactly one confirmation')
+    const question = h.ask.questions[0].questions[0]
+    assert.equal(question.options.length, 2, 'still exactly two options')
+    // The B6 managed-after notice is present verbatim (informed consent).
+    assert.ok(question.question.includes('[managed-after-migration] 以下模型将交由插件管理：'))
+    assert.ok(question.question.includes('官方下架时，这些模型会在满足「归属账本 + 现值哈希 + 无 override/pin」三闸门且连续 2 轮确认后自动从列表移除。'))
+    // Per-id rows: every add and the deleted user-written id, individually.
+    assert.ok(question.question.includes('+ 新增 → opencode-go: deepseek-v4.1-flash'))
+    assert.ok(question.question.includes('+ 新增 → opencode-go-msg: qwen4-max'))
+    assert.ok(question.question.includes('+ 新增 → opencode-go-resp: grok-4.7'))
+    assert.ok(question.question.includes('删除 → opencode-go: custom-test-model（用户手写）'),
+      'the pruned user-written id is listed individually with its kind')
+    // And the migration really did delete it (the dialog matched the outcome).
+    const chat = h.settings.state.get('opencode-go')
+    assert.equal(chat.models.some((m) => m.id === 'custom-test-model'), false, 'custom-test-model deleted as promised')
+  } finally {
+    h.dispose()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Abort / ambiguous answers (review Minor 5)
+// ---------------------------------------------------------------------------
+
+await check('e2e: signal already aborted when ask returns → cancel, zero writes', async () => {
+  const h = createHarness({ ask: makeAsk({ mode: 'approve' }) })
+  try {
+    const patchBefore = readFileSync(h.patchPath, 'utf8')
+    const controller = new AbortController()
+    controller.abort()
+    const result = await h.invoke('migrate-go', controller.signal)
+    assert.equal(result.kind, 'success', result.text)
+    assert.match(result.text, /已中止.*零写入/s)
+    assert.equal(h.ask.calls, 1, 'the ask itself still ran (abort is re-checked AFTER it returns)')
+    assert.deepEqual(h.settings.mutations, [], 'zero settings writes')
+    assert.equal(readFileSync(h.patchPath, 'utf8'), patchBefore, 'patch untouched')
+    assert.ok(!existsSync(h.storePath), 'models-store never created')
+  } finally {
+    h.dispose()
+  }
+})
+
+await check('e2e: both labels selected is an ambiguous answer → cancel + rerun hint, zero writes', async () => {
+  const h = createHarness({ ask: makeAsk({ mode: 'both' }) })
+  try {
+    const patchBefore = readFileSync(h.patchPath, 'utf8')
+    const result = await h.invoke('migrate-go')
+    assert.equal(result.kind, 'success', result.text)
+    assert.match(result.text, /歧义.*取消.*零写入/s)
+    assert.match(result.text, /重跑/)
+    assert.deepEqual(h.settings.mutations, [], 'zero settings writes — proceed never wins a contested answer')
+    assert.equal(readFileSync(h.patchPath, 'utf8'), patchBefore)
+  } finally {
+    h.dispose()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Blank answers, idempotency, restore guards (review Major 2 + Minor 9)
+// ---------------------------------------------------------------------------
+
+await check('e2e: blank answer (skip) is a cancel with zero writes', async () => {
+  const h = createHarness({ ask: makeAsk({ mode: 'blank' }) })
+  try {
+    const patchBefore = readFileSync(h.patchPath, 'utf8')
+    const result = await h.invoke('migrate-go')
+    assert.equal(result.kind, 'success', result.text)
+    assert.match(result.text, /已取消.*零写入/s)
+    assert.deepEqual(h.settings.mutations, [], 'zero settings writes')
+    assert.equal(readFileSync(h.patchPath, 'utf8'), patchBefore, 'patch untouched')
+    assert.ok(!existsSync(h.storePath), 'models-store never created')
+  } finally {
+    h.dispose()
+  }
+})
+
+await check('e2e: second run is idempotent — nothing to apply, no new backups, no new confirmation', async () => {
+  const h = createHarness({ storeSeed: { seed: { models: [] } } })
+  try {
+    const first = await h.invoke('migrate-go')
+    assert.equal(first.kind, 'success', first.text)
+    const patchBackupsAfterFirst = backupsIn(h.currDir, /^cordis\.patch\.yml\.bak\./).length
+    const storeBackupsAfterFirst = backupsIn(h.home, /^models-store\.json\.bak\./).length
+    assert.equal(patchBackupsAfterFirst, 1)
+    assert.equal(storeBackupsAfterFirst, 1)
+    const second = await h.invoke('migrate-go')
+    assert.equal(second.kind, 'success', second.text)
+    assert.match(second.text, /nothing to apply/)
+    assert.equal(backupsIn(h.currDir, /^cordis\.patch\.yml\.bak\./).length, patchBackupsAfterFirst, 'no new patch backup')
+    assert.equal(backupsIn(h.home, /^models-store\.json\.bak\./).length, storeBackupsAfterFirst, 'no new store backup')
+    assert.equal(h.ask.calls, 1, 'the second run never reaches the confirmation')
+    assert.equal(h.settings.updates.length, 1, 'enabled flip happens once')
+  } finally {
+    h.dispose()
+  }
+})
+
+await check('e2e: second-target failure restores the first target byte-for-byte', async () => {
+  const h = createHarness({
+    // 'zeta' sorts after 'curr', so curr applies FIRST and zeta fails after.
+    extraProfiles: { zeta: OTHER_PATCH },
+    storeSeed: { seed: { models: [] } },
+    ownershipFaultOnKeyPrefix: 'zeta#',
+  })
+  try {
+    const currBefore = readFileSync(h.patchPath, 'utf8')
+    const zetaBefore = readFileSync(join(h.profilesDir, 'zeta', 'cordis.patch.yml'), 'utf8')
+    const storeBefore = readFileSync(h.storePath, 'utf8')
+    const result = await h.invoke('migrate-go --all-profiles')
+    assert.equal(result.kind, 'error')
+    assert.match(result.text, /FAILED at apply for \[zeta\]/)
+    assert.match(result.text, /restored .*curr\/cordis\.patch\.yml/, 'the first target is restored too')
+    // First target: byte-for-byte back to its pre-run content.
+    assert.equal(readFileSync(h.patchPath, 'utf8'), currBefore, 'first target patch byte-restored')
+    assert.equal(readFileSync(join(h.profilesDir, 'zeta', 'cordis.patch.yml'), 'utf8'), zetaBefore, 'second target patch byte-restored')
+    assert.equal(readFileSync(h.storePath, 'utf8'), storeBefore, 'models-store byte-restored through the lock accessor')
+    const store = JSON.parse(readFileSync(h.storePath, 'utf8'))
+    assert.deepEqual(Object.keys(store), ['seed'], 'no ledger/record residue from the first target either')
+    // The first target's host-seam writes live in the host's memory, not in
+    // the restored files — the report must say so instead of claiming a full
+    // in-memory rollback.
+    assert.match(result.text, /宿主内存态可能与磁盘文件短暂不一致/)
+  } finally {
+    h.dispose()
+  }
+})
+
+await check('e2e: a models-store created by this run is removed again on failure', async () => {
+  const h = createHarness({
+    // No storeSeed: the store does not exist before the run; curr's ledger
+    // writes create it, then zeta fails — the created store must be removed.
+    extraProfiles: { zeta: OTHER_PATCH },
+    ownershipFaultOnKeyPrefix: 'zeta#',
+  })
+  try {
+    assert.ok(!existsSync(h.storePath), 'no store before the run')
+    assert.equal(backupsIn(h.home, /^models-store\.json\.bak\./).length, 0, 'no store backup when the store did not pre-date the run')
+    const result = await h.invoke('migrate-go --all-profiles')
+    assert.equal(result.kind, 'error')
+    assert.match(result.text, /FAILED at apply for \[zeta\]/)
+    assert.match(result.text, /removed .*models-store\.json.*created by this run/)
+    assert.ok(!existsSync(h.storePath), 'the run-created store is gone after the rollback')
+    // The first target's patch is still byte-restored by the same failure path.
+    assert.equal(readFileSync(h.patchPath, 'utf8'), CURR_PATCH, 'first target patch byte-restored')
+  } finally {
+    h.dispose()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Restore guards (review Major 2): concurrent modifications are never clobbered
+// ---------------------------------------------------------------------------
+
+/** Minimal real-fs OneShotDeps subset for the restore/staleness helpers. */
+function makeRestoreDeps(root, extra = {}) {
+  return {
+    home: root,
+    modelsStorePath: join(root, 'models-store.json'),
+    fs: {
+      readFile: async (path) => readFileSync(path, 'utf8'),
+      writeFile: async (path, data) => { writeFileSync(path, data) },
+      rename: async (from, to) => { renameSync(from, to) },
+      unlink: async (path) => { rmSync(path) },
+      mkdir: async () => {},
+      stat: async (path) => (existsSync(path) ? { mode: 0o644 } : undefined),
+      readdir: async (path) => readdirSync(path),
+      writeFileExclusive: async (path, data) => {
+        try {
+          writeFileSync(path, data, { flag: 'wx' })
+          return true
+        } catch (err) {
+          if (err.code === 'EEXIST') return false
+          throw err
+        }
+      },
+    },
+    patchIoFor: (path) => ({
+      readText: () => readFileSync(path, 'utf8'),
+      writeAtomic: async (text) => {
+        const tmp = `${path}.tmp`
+        writeFileSync(tmp, text)
+        renameSync(tmp, path)
+      },
+    }),
+    ...extra,
+  }
+}
+
+await check('restore: patch is restored atomically only while content matches the post-write hash', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'model-sync-restore-'))
+  try {
+    const source = join(root, 'cordis.patch.yml')
+    const backup = join(root, 'cordis.patch.yml.bak.20261124-070809')
+    writeFileSync(backup, 'PRE-RUN CONTENT')
+    writeFileSync(source, 'POST-WRITE CONTENT')
+    const deps = makeRestoreDeps(root)
+    const postWriteSha = sha256Of('POST-WRITE CONTENT')
+    const outcome = await restorePatchIfUnchanged(deps, { source, backup }, postWriteSha)
+    assert.equal(outcome.restored, true)
+    assert.match(outcome.line, /restored .*cordis\.patch\.yml/)
+    assert.equal(readFileSync(source, 'utf8'), 'PRE-RUN CONTENT', 'bytes back to the backup')
+    assert.equal(existsSync(`${source}.tmp`), false, 'atomic write cleaned its temp file')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+await check('restore: a concurrently modified patch is NOT restored (report + backup path)', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'model-sync-restore-'))
+  try {
+    const source = join(root, 'cordis.patch.yml')
+    const backup = join(root, 'cordis.patch.yml.bak.20261124-070809')
+    writeFileSync(backup, 'PRE-RUN CONTENT')
+    writeFileSync(source, 'CONCURRENT EDIT BY ANOTHER PROCESS')
+    const deps = makeRestoreDeps(root)
+    const outcome = await restorePatchIfUnchanged(deps, { source, backup }, sha256Of('POST-WRITE CONTENT'))
+    assert.equal(outcome.restored, false)
+    assert.ok(outcome.line.includes('concurrent modification detected, not restored'), 'the mandated report line')
+    assert.ok(outcome.line.includes(backup), 'the backup path is printed for manual handling')
+    assert.equal(readFileSync(source, 'utf8'), 'CONCURRENT EDIT BY ANOTHER PROCESS', 'the foreign edit is never clobbered')
+    // A missing post-write baseline (unreadable after our write) refuses too.
+    const noBaseline = await restorePatchIfUnchanged(deps, { source, backup }, undefined)
+    assert.equal(noBaseline.restored, false, 'no baseline ⇒ no restore (fail closed)')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+await check('restore: models-store goes through the lock accessor and drops run-added keys', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'model-sync-store-restore-'))
+  try {
+    const storePath = join(root, 'models-store.json')
+    const backup = join(root, 'models-store.json.bak.20261124-070809')
+    writeFileSync(backup, JSON.stringify({ seed: { models: [] } }))
+    // The run added a ledger slot next to the seeded one.
+    const afterRun = { seed: { models: [] }, 'curr#opencode-go#fp': { managed: {} } }
+    writeFileSync(storePath, JSON.stringify(afterRun))
+    const deps = makeRestoreDeps(root)
+    const outcome = await restoreModelsStoreIfUnchanged(deps, backup, sha256Of(JSON.stringify(afterRun)))
+    assert.equal(outcome.restored, true)
+    assert.match(outcome.line, /restored .*models-store\.json/)
+    assert.equal(readFileSync(storePath, 'utf8'), JSON.stringify({ seed: { models: [] } }), 'run-added slot removed, seeded slot kept')
+    // Concurrent modification: never restored.
+    const concurrent = { seed: { models: [] }, foreign: { models: [1] } }
+    writeFileSync(storePath, JSON.stringify(concurrent))
+    const blocked = await restoreModelsStoreIfUnchanged(deps, backup, sha256Of(JSON.stringify(afterRun)))
+    assert.equal(blocked.restored, false)
+    assert.ok(blocked.line.includes('concurrent modification detected, not restored'))
+    assert.deepEqual(JSON.parse(readFileSync(storePath, 'utf8')), concurrent, 'foreign slots survive untouched')
+    // A corrupt backup refuses loudly instead of wiping the store.
+    writeFileSync(storePath, JSON.stringify(afterRun))
+    writeFileSync(backup, '{not json')
+    await assert.rejects(() => restoreModelsStoreIfUnchanged(deps, backup, sha256Of(JSON.stringify(afterRun))), /not valid JSON/)
+    assert.equal(readFileSync(storePath, 'utf8'), JSON.stringify(afterRun), 'store untouched when the backup is unreadable')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+await check('restore: a run-created store is removed only while its content still matches', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'model-sync-store-created-'))
+  try {
+    const storePath = join(root, 'models-store.json')
+    const deps = makeRestoreDeps(root)
+    writeFileSync(storePath, '{"created":"by this run"}')
+    const outcome = await removeStoreIfUnchanged(deps, sha256Of('{"created":"by this run"}'))
+    assert.equal(outcome.restored, true)
+    assert.match(outcome.line, /removed .*models-store\.json/)
+    assert.ok(!existsSync(storePath))
+    // Concurrent touch after creation: leave it in place.
+    writeFileSync(storePath, '{"someone":"else touched"}')
+    const blocked = await removeStoreIfUnchanged(deps, sha256Of('{"created":"by this run"}'))
+    assert.equal(blocked.restored, false)
+    assert.ok(blocked.line.includes('concurrent modification detected, not restored'))
+    assert.ok(existsSync(storePath), 'the store is left for manual handling')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+await check('staleness: targets changed after their backup are dropped, fresh ones stay', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'model-sync-stale-'))
+  try {
+    const freshPath = join(root, 'fresh.patch.yml')
+    const stalePath = join(root, 'stale.patch.yml')
+    writeFileSync(freshPath, 'FRESH')
+    writeFileSync(stalePath, 'CHANGED SINCE BACKUP')
+    const deps = makeRestoreDeps(root)
+    const prepared = [
+      { target: { key: 'fresh', patchPath: freshPath }, patchBackup: { source: freshPath, backup: '', sourceSha: sha256Of('FRESH') } },
+      { target: { key: 'stale', patchPath: stalePath }, patchBackup: { source: stalePath, backup: '', sourceSha: sha256Of('AT BACKUP TIME') } },
+    ]
+    const { ready, stale } = await dropStaleTargets(deps, prepared)
+    assert.deepEqual(ready.map((item) => item.target.key), ['fresh'])
+    assert.deepEqual(stale.map((item) => item.key), ['stale'])
+    // A vanished file is stale too (its sha is undefined ≠ the recorded one).
+    rmSync(stalePath)
+    rmSync(freshPath)
+    const vanished = await dropStaleTargets(deps, prepared)
+    assert.deepEqual(vanished.ready.map((item) => item.target.key), [], 'a vanished file never counts as fresh')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+await check('staleness: a drifted or newly created models-store aborts with zero writes', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'model-sync-stale-store-'))
+  try {
+    const storePath = join(root, 'models-store.json')
+    const backup = join(root, 'models-store.json.bak.20261124-070809')
+    const deps = makeRestoreDeps(root)
+    // Backed up, then changed by another process before apply.
+    writeFileSync(backup, '{"at":"backup"}')
+    writeFileSync(storePath, '{"changed":"since backup"}')
+    const drifted = await verifyStoreFreshness(deps, backup, sha256Of('{"at":"backup"}'), true)
+    assert.equal(drifted.ok, false)
+    assert.match(drifted.reason, /changed after its backup was taken/)
+    assert.match(drifted.reason, /zero writes/)
+    // Still matching → fine.
+    writeFileSync(storePath, '{"at":"backup"}')
+    assert.deepEqual(await verifyStoreFreshness(deps, backup, sha256Of('{"at":"backup"}'), true), { ok: true })
+    // Store vanished before apply → abort.
+    rmSync(storePath)
+    const vanished = await verifyStoreFreshness(deps, backup, sha256Of('{"at":"backup"}'), true)
+    assert.equal(vanished.ok, false)
+    // No backup (store absent at backup time) but it exists NOW → abort, so
+    // the rollback path can never delete another process's file.
+    writeFileSync(storePath, '{"created":"by another process"}')
+    const appeared = await verifyStoreFreshness(deps, undefined, undefined, false)
+    assert.equal(appeared.ok, false)
+    assert.match(appeared.reason, /created by another process/)
+    // Still absent → fine.
+    rmSync(storePath)
+    assert.deepEqual(await verifyStoreFreshness(deps, undefined, undefined, false), { ok: true })
+  } finally {
+    rmSync(root, { recursive: true, force: true })
   }
 })

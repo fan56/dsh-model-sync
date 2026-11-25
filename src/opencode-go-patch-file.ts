@@ -11,6 +11,17 @@
 // (tabs, CRLF, unterminated constructs) with an actionable reason so a caller
 // can fail closed and point at the manual migrate plan/apply path.
 //
+// Parse-time refusals (the "cannot silently write a file the host cannot
+// load" rule, review Blocker A): every mapping key must be a BARE plain key —
+// quoted keys, whitespace inside a key, and YAML indicator characters
+// (#*&{[) in a key are refused; duplicate keys in the SAME mapping are
+// refused (the host yaml rejects them, last-wins folding is not a valid
+// edit basis); YAML anchors (`&name`), aliases (`*name`) and merge keys
+// (`<<`) are refused anywhere in a value position. Tags (`!!`/`!`) keep the
+// opaque-leaf behavior: verbatim outside the edited providers tree, a refusal
+// for any op whose target tree contains one. All of these fail at PARSE time,
+// so every consumer fails closed before a single byte is written.
+//
 // Editing strategy: never re-serialize the document. Each settings op becomes
 // one original-line-range replacement computed from a fresh parse, so every
 // untouched line (comments, formatting, other providers) survives
@@ -78,6 +89,32 @@ const LLM_PI_AI_ENTRY_ID = 'llm-pi-ai'
 
 /** The KEY regex every block-map row must match (keys are simple identifiers in practice). */
 const KEY_ENTRY = /^(\S[^:]*?):(?:[ \t]+(.*))?$/
+
+/**
+ * Refuse any mapping key this subset parser and the host yaml could disagree
+ * on. A key is accepted only as a BARE plain scalar: no quotes, no whitespace,
+ * no YAML indicator characters, and no merge key. The host (yaml@2) parses
+ * each of these shapes differently than this parser — or rejects the document
+ * outright (duplicate keys) — so an edit that survived here used to write a
+ * file the host could not load while the batch reported SUCCESS. Failing the
+ * PARSE makes every consumer fail closed: no descriptor, no ops, no write.
+ */
+function keyRefusal(key: string, lineNo: number): string | undefined {
+  if (key === '<<') return `line ${lineNo}: merge key "<<" is not supported`
+  if (key.startsWith('"') || key.startsWith("'")) {
+    return `line ${lineNo}: quoted key ${JSON.stringify(key)} is not supported (bare plain keys only)`
+  }
+  if (/\s/.test(key)) return `line ${lineNo}: key ${JSON.stringify(key)} contains whitespace (bare plain keys only)`
+  if (/[#*&{[]/.test(key)) {
+    return `line ${lineNo}: key ${JSON.stringify(key)} contains a YAML indicator character (#*&{[); refusing to guess`
+  }
+  return undefined
+}
+
+/** True when a plain scalar/flow part is a YAML anchor (`&name`) or alias (`*name`). */
+function isAnchorOrAlias(text: string): boolean {
+  return text.startsWith('&') || text.startsWith('*')
+}
 
 class TabIndentError extends Error {
   override name = 'TabIndentError'
@@ -192,7 +229,11 @@ function parseFlow(text: string, lineNo: number): unknown {
     const inner = trimmed.slice(1, -1)
     if (inner.trim() === '') return []
     if (/[\[{]/.test(inner)) throw new Error(`line ${lineNo}: nested flow collections are not supported`)
-    return splitTopLevel(inner).map((part) => decodePlainScalar(stripTrailingComment(part.trim())))
+    return splitTopLevel(inner).map((part) => {
+      const item = part.trim()
+      if (isAnchorOrAlias(item)) throw new Error(`line ${lineNo}: YAML anchors/aliases are not supported`)
+      return decodePlainScalar(stripTrailingComment(item))
+    })
   }
   const inner = trimmed.slice(1, -1)
   if (/[\[{]/.test(inner)) throw new Error(`line ${lineNo}: nested flow collections are not supported`)
@@ -200,7 +241,13 @@ function parseFlow(text: string, lineNo: number): unknown {
   for (const part of splitTopLevel(inner)) {
     const match = KEY_ENTRY.exec(part.trim())
     if (match === null) throw new Error(`line ${lineNo}: unsupported flow mapping entry`)
-    out[match[1]!.trim()] = decodePlainScalar(stripTrailingComment((match[2] ?? '').trim()))
+    const key = match[1]!.trim()
+    const keyLine = keyRefusal(key, lineNo)
+    if (keyLine !== undefined) throw new Error(keyLine)
+    if (key in out) throw new Error(`line ${lineNo}: duplicate key ${JSON.stringify(key)} in the same mapping`)
+    const value = (match[2] ?? '').trim()
+    if (isAnchorOrAlias(value)) throw new Error(`line ${lineNo}: YAML anchors/aliases are not supported`)
+    out[key] = decodePlainScalar(stripTrailingComment(value))
   }
   return out
 }
@@ -277,6 +324,14 @@ class PatchParser {
       }
       const end = this.consumeQuoted(lineIdx, entryIndent, quote, openCol + 1)
       return { node: { kind: 'opaque', startLine: lineIdx, endLine: end }, endLine: end }
+    }
+    // Anchors/aliases are refused anywhere in a value position: this parser
+    // would decode `models: *m` as the literal string "*m" while the host yaml
+    // resolves the alias — an edit validated against the wrong tree used to
+    // pass self-validation and write a semantically different document.
+    // (Quoted values starting with & or * were already handled above.)
+    if (isAnchorOrAlias(trimmed)) {
+      throw new Error(`line ${lineIdx + 1}: YAML anchors/aliases are not supported (value starts with '${trimmed[0]}')`)
     }
     if (trimmed.startsWith('!')) {
       const end = this.consumeDeeper(lineIdx, entryIndent)
@@ -371,6 +426,11 @@ class PatchParser {
     first: { key: string; valueText: string | undefined },
   ): { node: PatchNode; next: number } {
     const entries: PatchMapEntry[] = []
+    // Same-level duplicate keys: this parser used to fold them last-wins in
+    // its plain view while the host yaml rejects the document outright — an
+    // edit validated against the folded view wrote a file the host could not
+    // load. Detect at parse time, per mapping level.
+    const seenKeys = new Set<string>()
     let i = start
     let pending: { key: string; valueText: string | undefined; line: number } | undefined =
       { key: first.key, valueText: first.valueText, line: start }
@@ -396,6 +456,12 @@ class PatchParser {
         rawValue = match[2]
         i = at
       }
+      const keyProblem = keyRefusal(key, keyLine + 1)
+      if (keyProblem !== undefined) throw new Error(keyProblem)
+      if (seenKeys.has(key)) {
+        throw new Error(`line ${keyLine + 1}: duplicate key ${JSON.stringify(key)} in the same mapping (the host yaml rejects duplicate keys)`)
+      }
+      seenKeys.add(key)
       if (rawValue === undefined || rawValue.trim() === '' || rawValue.trimStart().startsWith('#')) {
         const nested = this.nextStructural(keyLine + 1)
         if (nested !== undefined && indentOf(this.lines[nested]!) > mapIndent) {
