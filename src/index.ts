@@ -125,6 +125,18 @@ import {
   type ReferenceRewrite,
   type RewriteRefMode,
 } from './opencode-go-migrate.ts'
+import {
+  runMigrateGoOneShot,
+  parseMigrateGoFlags,
+  type AskServiceShape,
+  type MigrateGoFlags,
+  type OneShotFs,
+  type OneShotDeps,
+} from './opencode-go-one-shot.ts'
+import type { PatchFileIo } from './opencode-go-patch-file.ts'
+import { MODELS_STORE_PATH } from './remote-catalog.ts'
+import { mkdir, readFile, readdir, rename, stat as statFd, unlink, writeFile } from 'node:fs/promises'
+import { readFileSync, statSync, writeFileSync } from 'node:fs'
 
 export const name = 'dsh-model-sync'
 
@@ -143,6 +155,19 @@ export const GO_MIGRATION_ADOPT_DISABLED_SERVICE = 'goMigrationAdoptDisabled'
 export const GO_MIGRATION_MUTEX_SERVICE = 'goMigrationMutex'
 /** O1/C2 seam: injected write-ahead journal store (tests use a temp-dir store). */
 export const GO_JOURNAL_STORE_SERVICE = 'goJournalStore'
+/**
+ * One-shot migrate-go path overrides (tests point everything at a temp dir;
+ * a host may pin non-default locations). Plain `undefined` fields fall back
+ * to resolveDshHome() / MODELS_STORE_PATH / `<home>/profiles`.
+ */
+export const GO_ONESHOT_PATHS_SERVICE = 'goOneShotPaths'
+export interface GoOneShotPaths {
+  home?: string
+  modelsStorePath?: string
+  profilesDir?: string
+  /** TEST FAULT INJECTION ONLY: see OneShotDeps.faultOwnershipWriteOnKeyPrefix. */
+  testOnlyOwnershipWriteFaultPrefix?: string
+}
 
 // dsh-settings 0.1.7 rewrote the seam: the runtime register(ns, schema) call
 // is gone, and a plugin's settings form is projected from its exported
@@ -1244,6 +1269,107 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
     }
   }
 
+  // -----------------------------------------------------------------------
+  // One-shot migrate-go deps (design: one command = plan + backup + confirm
+  // + apply). Assembled from the same seams migrateDeps reads; the fs subset
+  // and the clock are the only new external surfaces, both plain adapters
+  // over node:fs/promises and Date here so tests inject their own.
+  // -----------------------------------------------------------------------
+  const oneShotFs: OneShotFs = {
+    readFile: (path) => readFile(path, 'utf8'),
+    writeFile: (path, data, mode) => (mode === undefined ? writeFile(path, data) : writeFile(path, data, { mode })),
+    rename: (from, to) => rename(from, to),
+    unlink: async (path) => { await unlink(path) },
+    mkdir: async (path, options) => { await mkdir(path, options) },
+    stat: async (path) => {
+      const info = await statFd(path).catch(() => undefined)
+      return info === undefined ? undefined : { mode: info.mode }
+    },
+    readdir: async (path) => readdir(path),
+  }
+  /** Sync-read + atomic-write io for one patch file (describe() is sync). */
+  const patchIoFor = (path: string): PatchFileIo => {
+    let writeSeq = 0
+    return {
+      readText: () => readFileSync(path, 'utf8'),
+      writeAtomic: async (text) => {
+        writeSeq += 1
+        const tmp = `${path}.tmp-${process.pid}-${writeSeq}`
+        const mode = statSync(path).mode
+        writeFileSync(tmp, text, mode !== undefined ? { mode } : undefined)
+        await rename(tmp, path)
+      },
+    }
+  }
+  const buildOneShotDeps = (target: Context): OneShotDeps => {
+    const { value } = readGoRuntimeConfig(config)
+    const settings = settingsForWriteFrom(target)
+    const desc = settings?.describe().find((item) => item.ns === 'llm-pi-ai')
+    const ref = value.ref
+    const profile = target.get('profileContext') as { name?: string; dir?: string } | undefined
+    const launchEnv = target.get('launchEnvironment') as { get(key: string): { value: string } | undefined } | undefined
+    const injectedMutex = target.get(GO_MIGRATION_MUTEX_SERVICE) as (() => boolean) | undefined
+    const injectedRefWriter = target.get(GO_MIGRATION_REF_WRITER_SERVICE) as
+      | ((rewrite: ReferenceRewrite) => Promise<void>) | undefined
+    const pathOverrides = target.get(GO_ONESHOT_PATHS_SERVICE) as GoOneShotPaths | undefined
+    return {
+      home: pathOverrides?.home ?? resolveDshHome(),
+      modelsStorePath: pathOverrides?.modelsStorePath ?? MODELS_STORE_PATH,
+      profilesDir: pathOverrides?.profilesDir,
+      fs: oneShotFs,
+      patchIoFor,
+      currentProfile: {
+        key: resolveProfileKey(target),
+        dir: profile?.dir ?? launchEnv?.get('DSH_PROFILE_DIR')?.value,
+      },
+      currentSettings: settings,
+      hostSettings: rawSettings() as (SettingsService & { update?(ns: string, patch: object): Promise<void> }) | undefined,
+      goConfig: {
+        routes: value.routes,
+        ref,
+        pinnedModels: value.pinnedModels,
+        adoptDisabled: target.get(GO_MIGRATION_ADOPT_DISABLED_SERVICE) === true
+          || settings === undefined || typeof settings.mutate !== 'function',
+      },
+      resolveCredential: async () => ({
+        value: await resolveRouteCredentialValue(
+          target as unknown as NativeCredentialContext,
+          desc,
+          'opencode-go',
+          ref,
+        ),
+        ref,
+      }),
+      resolveEntries: (apiKey) => resolveMigrateEntries(value, apiKey),
+      resolvePublicCatalogIds: (_apiKey, entries) => resolvePublicCatalogIds(value, entries),
+      resolveAsk: () => {
+        try {
+          return target.get('userQuestions') as AskServiceShape | undefined
+        } catch {
+          return undefined
+        }
+      },
+      // File-backed stores scoped per profile in the SAME models-store.json
+      // the backup step snapshots. The GO_MIGRATION_STORE_SERVICE /
+      // GO_OWNERSHIP_STORE_SERVICE seams are deliberately NOT consulted
+      // here: the one-shot needs per-profile scoping, which the injected
+      // single-store seams cannot express — the path override below is the
+      // test seam instead (tests point it at a temp dir).
+      storesFor: (profileKey) => ({
+        ownership: createModelsStoreOwnershipStore(pathOverrides?.modelsStorePath, profileKey),
+        migration: createModelsStoreMigrationStateStore(pathOverrides?.modelsStorePath, profileKey),
+      }),
+      journalStore: profileKey === undefined ? undefined : createModelsStoreJournalStore(pathOverrides?.modelsStorePath),
+      isSyncInFlight: injectedMutex ?? (() => goScheduler.isInFlight),
+      applyReferenceRewrite: injectedRefWriter,
+      ...(pathOverrides?.testOnlyOwnershipWriteFaultPrefix !== undefined
+        ? { faultOwnershipWriteOnKeyPrefix: pathOverrides.testOnlyOwnershipWriteFaultPrefix }
+        : {}),
+      logger: target.logger as unknown as Logger,
+      now: Date.now,
+    }
+  }
+
   /** Auto rounds log the same report the /model-sync command shows. */
   const runAuto = (): void => {
     // A rejected round (service lookups mid-dispose, a refused mutate) must
@@ -1341,7 +1467,7 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
     cmdCtx.effect(() => {
       const definition: CommandDefinition = {
         name: 'model-sync',
-        description: 'Force one model-list sync round from the pi.dev gateway into settings; go subcommands: go|status (one full opencode-go round), adopt go; migrate plan|apply|rollback|status (explicit consent only)',
+        description: 'Force one model-list sync round from the pi.dev gateway into settings; go subcommands: go|status (one full opencode-go round), adopt go; migrate plan|apply|rollback|status (explicit consent only); migrate-go (one-shot full migration with file backups + one confirmation)',
         handler: async (invocation) => {
           const args = invocation.rawInput.trim().split(/\s+/).filter((part) => part.length > 0)
           const [sub, scope] = args
@@ -1349,6 +1475,27 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
           // never auto-triggered and never folded into the pi.dev sync path.
           if (sub === 'migrate') {
             return runMigrate(args.slice(1), cmdCtx)
+          }
+          // One-shot migrate-go: the full plan → backup → confirm → apply
+          // pipeline for the current profile (or --all-profiles). Its consent
+          // is the interactive confirmation; apply still passes through the
+          // unchanged verifyConsent gate with the computed hash/code.
+          if (sub === 'migrate-go') {
+            const parsed = parseMigrateGoFlags(args.slice(1))
+            if (!parsed.ok) {
+              return { kind: 'error', text: parsed.error } satisfies CommandResult
+            }
+            const flags: MigrateGoFlags = parsed.flags
+            try {
+              return await runMigrateGoOneShot(
+                buildOneShotDeps(cmdCtx),
+                flags,
+                { agent: invocation.agent, signal: invocation.signal },
+              )
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error)
+              return { kind: 'error', text: `migrate-go failed: ${message}` } satisfies CommandResult
+            }
           }
           // B3 (31 R-4): `eject` is retired — `migrate rollback` is the only
           // rollback entry. Reject the old invocation explicitly so it never
