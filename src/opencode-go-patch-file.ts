@@ -16,11 +16,23 @@
 // quoted keys, whitespace inside a key, and YAML indicator characters
 // (#*&{[) in a key are refused; duplicate keys in the SAME mapping are
 // refused (the host yaml rejects them, last-wins folding is not a valid
-// edit basis); YAML anchors (`&name`), aliases (`*name`) and merge keys
-// (`<<`) are refused anywhere in a value position. Tags (`!!`/`!`) keep the
-// opaque-leaf behavior: verbatim outside the edited providers tree, a refusal
-// for any op whose target tree contains one. All of these fail at PARSE time,
-// so every consumer fails closed before a single byte is written.
+// edit basis); keys that the host yaml resolves to null/boolean/number
+// (`~`, `true`, `1`, …) are refused because same-level spellings collapse
+// into one key (`true` = `True`, `null` = `~`, `1` = `+1`) and the host
+// rejects the document as duplicate-keyed (review M3); YAML anchors
+// (`&name`), aliases (`*name`) and merge keys (`<<`) are refused anywhere in
+// a value position. A colon-space (or trailing colon) in a plain VALUE
+// position is refused: the parser used to accept `key: a: b` while the host
+// yaml rejects the whole document (review M2). Tags (`!!`/`!`) keep the
+// opaque-leaf behavior at block position: verbatim outside the edited
+// providers tree, a refusal for any op whose target tree contains one — but
+// INSIDE a flow collection a tag is refused outright, because flow values
+// are decoded into the subset tree and a tagged leaf would silently become
+// text (review M1). Flow scalars decode through the SAME unquoteYaml path as
+// block-position quoted scalars, and flow entries that the host would parse
+// differently (single-pair items like `[a: b]`, empty entries, comments
+// inside the brackets) are refused, never guessed. All of these fail at
+// PARSE time, so every consumer fails closed before a single byte is written.
 //
 // Editing strategy: never re-serialize the document. Each settings op becomes
 // one original-line-range replacement computed from a fresh parse, so every
@@ -107,6 +119,16 @@ function keyRefusal(key: string, lineNo: number): string | undefined {
   if (/\s/.test(key)) return `line ${lineNo}: key ${JSON.stringify(key)} contains whitespace (bare plain keys only)`
   if (/[#*&{[]/.test(key)) {
     return `line ${lineNo}: key ${JSON.stringify(key)} contains a YAML indicator character (#*&{[); refusing to guess`
+  }
+  // Review M3: the host yaml resolves keys to scalars before folding them into
+  // a mapping — `true`/`True`/`TRUE`, `null`/`Null`/`~` and `1`/`+1`/`007` are
+  // each THE SAME key, so two same-level spellings make the host reject the
+  // whole document ("Map keys must be unique") while this parser sees distinct
+  // strings. A single non-string key would still disagree with the string view
+  // here. Refused outright instead of guessed.
+  const decoded = decodePlainScalar(key)
+  if (decoded === null || typeof decoded === 'boolean' || typeof decoded === 'number') {
+    return `line ${lineNo}: key ${JSON.stringify(key)} resolves to a non-string (${String(decoded)}) in the host yaml; null/~/true/1 spellings collide into one key`
   }
   return undefined
 }
@@ -199,25 +221,97 @@ function unquoteYaml(text: string): string {
   return inner.replaceAll("''", "'")
 }
 
-function splitTopLevel(text: string): string[] {
+/**
+ * True when a plain (non-quoted) text carries a mapping indicator the host
+ * yaml would act on: a colon followed by space/tab, or a colon at the end.
+ * Both parse as a nested / single-pair mapping — never as part of a plain
+ * scalar (review M1 flow single-pair items, review M2 value position).
+ */
+function hasMappingIndicator(text: string): boolean {
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== ':') continue
+    const next = text[i + 1]
+    if (next === undefined || next === ' ' || next === '\t') return true
+  }
+  return false
+}
+
+/**
+ * Split a single-line flow-collection body into its top-level parts,
+ * quote- and escape-aware (the old splitter mis-tracked `\"` escapes and
+ * silently dropped empty entries). Refuses what the host cannot load or
+ * would read differently (review M1/M2):
+ * - an empty entry between commas (`[a, , b]` — the host rejects the file)
+ * - a `#` outside a quoted span (a comment inside the brackets swallows the
+ *   closing bracket for the host — again an unloadable document; a `#`
+ *   GLUED into a plain part like `a#b` is not a comment and stays legal)
+ */
+function scanFlowParts(inner: string, lineNo: number): string[] {
   const parts: string[] = []
-  let depth = 0
-  let quote: string | undefined
   let current = ''
-  for (const ch of text) {
+  let quote: string | undefined
+  let prev = ''
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i]!
     if (quote !== undefined) {
       current += ch
+      if (quote === '"' && ch === '\\') {
+        i += 1
+        const escaped = inner[i] ?? ''
+        current += escaped
+        prev = escaped
+        continue
+      }
       if (ch === quote) quote = undefined
+      prev = ch
       continue
     }
-    if (ch === '"' || ch === "'") { quote = ch; current += ch; continue }
-    if (ch === '[' || ch === '{') depth += 1
-    if (ch === ']' || ch === '}') depth -= 1
-    if (ch === ',' && depth === 0) { parts.push(current); current = ''; continue }
+    if (ch === '"' || ch === "'") { quote = ch; current += ch; prev = ch; continue }
+    if (ch === '#' && (prev === '' || /\s/.test(prev) || ',{}[]:'.includes(prev))) {
+      throw new Error(`line ${lineNo}: a comment inside a flow collection swallows the closing bracket for the host yaml; refusing`)
+    }
+    if (ch === ',' ) {
+      if (current.trim() === '') throw new Error(`line ${lineNo}: empty flow entry (the host yaml rejects "[a, , b]")`)
+      parts.push(current)
+      current = ''
+      prev = ','
+      continue
+    }
+    prev = ch
     current += ch
   }
   if (current.trim() !== '') parts.push(current)
   return parts
+}
+
+/**
+ * Decode ONE flow scalar exactly the way the host yaml would (review M1):
+ * quoted scalars go through the SAME `unquoteYaml` path as the block
+ * position (single/double quotes, `''`/`\"`/`\\` escapes), so the subset
+ * tree and the host yaml agree on the same text. Tags, single-pair entries
+ * and anchors/aliases are REFUSED — decoding them as text is what used to
+ * turn `input: ["text"]` into `["\"text\""]` on write-back.
+ */
+function decodeFlowScalar(item: string, lineNo: number, where: string, colonMeaning: string): unknown {
+  if (item.startsWith('!')) {
+    throw new Error(`line ${lineNo}: YAML tags inside a ${where} are not supported (a tagged leaf cannot be carried in the subset tree; refusing instead of guessing)`)
+  }
+  if (isAnchorOrAlias(item)) {
+    throw new Error(`line ${lineNo}: YAML anchors/aliases are not supported (in a ${where})`)
+  }
+  if (item.startsWith('"') || item.startsWith("'")) {
+    const quote = item[0]!
+    const close = findClosingQuote(item, 1, quote)
+    if (close < 0) throw new Error(`line ${lineNo}: unterminated quoted scalar in a ${where}`)
+    if (item.slice(close + 1).trim() !== '') {
+      throw new Error(`line ${lineNo}: unexpected content after a quoted scalar in a ${where}`)
+    }
+    return unquoteYaml(item)
+  }
+  if (hasMappingIndicator(item)) {
+    throw new Error(`line ${lineNo}: ${colonMeaning}; refusing instead of guessing`)
+  }
+  return decodePlainScalar(item)
 }
 
 /** Scalars-only single-line flow parser (`[]`, `{}`, `[a, b]`, `{k: v}`). */
@@ -229,16 +323,18 @@ function parseFlow(text: string, lineNo: number): unknown {
     const inner = trimmed.slice(1, -1)
     if (inner.trim() === '') return []
     if (/[\[{]/.test(inner)) throw new Error(`line ${lineNo}: nested flow collections are not supported`)
-    return splitTopLevel(inner).map((part) => {
-      const item = part.trim()
-      if (isAnchorOrAlias(item)) throw new Error(`line ${lineNo}: YAML anchors/aliases are not supported`)
-      return decodePlainScalar(stripTrailingComment(item))
-    })
+    return scanFlowParts(inner, lineNo).map((part) =>
+      decodeFlowScalar(
+        part.trim(),
+        lineNo,
+        'flow sequence item',
+        'a single-pair flow entry like "[a: b]" (the host yaml parses it as a mapping, not a string)',
+      ))
   }
   const inner = trimmed.slice(1, -1)
   if (/[\[{]/.test(inner)) throw new Error(`line ${lineNo}: nested flow collections are not supported`)
   const out: Record<string, unknown> = {}
-  for (const part of splitTopLevel(inner)) {
+  for (const part of scanFlowParts(inner, lineNo)) {
     const match = KEY_ENTRY.exec(part.trim())
     if (match === null) throw new Error(`line ${lineNo}: unsupported flow mapping entry`)
     const key = match[1]!.trim()
@@ -246,8 +342,12 @@ function parseFlow(text: string, lineNo: number): unknown {
     if (keyLine !== undefined) throw new Error(keyLine)
     if (key in out) throw new Error(`line ${lineNo}: duplicate key ${JSON.stringify(key)} in the same mapping`)
     const value = (match[2] ?? '').trim()
-    if (isAnchorOrAlias(value)) throw new Error(`line ${lineNo}: YAML anchors/aliases are not supported`)
-    out[key] = decodePlainScalar(stripTrailingComment(value))
+    out[key] = decodeFlowScalar(
+      value,
+      lineNo,
+      'flow mapping value',
+      'a nested mapping inside a flow collection ("{a: b: c}" — the host yaml rejects the whole document)',
+    )
   }
   return out
 }
@@ -352,10 +452,30 @@ class PatchParser {
         endLine: lineIdx,
       }
     }
+    // Review M2: a colon-space (or trailing colon) in a plain VALUE position
+    // parses here but the host yaml rejects the WHOLE document ("Nested
+    // mappings are not allowed"). Strip the trailing comment first — only the
+    // value's own colons count (`a # x: y` is a comment for the host too).
+    const plain = stripTrailingComment(trimmed)
+    if (hasMappingIndicator(plain)) {
+      throw new Error(`line ${lineIdx + 1}: a "b: c" nested mapping in a value position is rejected by the host yaml; refusing`)
+    }
     const end = this.consumeDeeper(lineIdx, entryIndent)
-    if (end !== lineIdx) return { node: { kind: 'opaque', startLine: lineIdx, endLine: end }, endLine: end }
+    if (end !== lineIdx) {
+      // Multi-line PLAIN blob: the raw lines stay opaque, but a mapping
+      // indicator on any continuation line still makes the file unloadable
+      // for the host — refuse instead of accepting a broken document.
+      for (let i = lineIdx + 1; i <= end; i++) {
+        const raw = stripTrailingComment(this.lines[i]!.trim())
+        if (raw === '' || raw.startsWith('#')) continue
+        if (hasMappingIndicator(raw)) {
+          throw new Error(`line ${i + 1}: a "b: c" nested mapping inside a plain multi-line scalar is rejected by the host yaml; refusing`)
+        }
+      }
+      return { node: { kind: 'opaque', startLine: lineIdx, endLine: end }, endLine: end }
+    }
     return {
-      node: { kind: 'scalar', value: decodePlainScalar(stripTrailingComment(trimmed)), startLine: lineIdx, endLine: lineIdx },
+      node: { kind: 'scalar', value: decodePlainScalar(plain), startLine: lineIdx, endLine: lineIdx },
       endLine: lineIdx,
     }
   }

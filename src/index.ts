@@ -1287,17 +1287,27 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
     },
     readdir: async (path) => readdir(path),
     // Backup creation: claim the final name exclusively (O_EXCL `wx` — false
-    // when taken, so the caller retries the next sequence suffix), then
-    // replace the claimed placeholder atomically via tmp + rename. A crash
-    // between claim and rename leaves at most an empty placeholder; the
-    // tmp+rename guarantees the backup content itself is never torn.
+    // when taken, so the caller retries the next sequence suffix), stamp the
+    // claim with a recognizable placeholder line, then replace the claimed
+    // file atomically via tmp + rename. A crash between claim and rename
+    // leaves a self-describing placeholder (review M7) instead of a silent
+    // 0-byte file that looks like a real backup; the tmp+rename guarantees the
+    // backup content itself is never torn. A failure of the tmp write or the
+    // rename releases the claim AND removes the tmp residue.
     writeFileExclusive: async (path, data, mode) => {
+      let handle
       try {
-        const handle = await open(path, 'wx', mode)
-        await handle.close()
+        handle = await open(path, 'wx', mode)
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code === 'EEXIST') return false
         throw err
+      }
+      try {
+        // The file was created with `mode` by open(wx); the placeholder write
+        // keeps that mode — no explicit mode needed here.
+        await handle.writeFile('dsh-model-sync: backup claim in progress — crash residue, NOT a backup (safe to delete)\n')
+      } finally {
+        await handle.close().catch(() => {})
       }
       const tmp = `${path}.tmp-${process.pid}-${exclusiveWriteSeq++}`
       try {
@@ -1305,6 +1315,7 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
         await rename(tmp, path)
         return true
       } catch (err) {
+        await unlink(tmp).catch(() => {}) // remove the tmp residue (review M7)
         await unlink(path).catch(() => {}) // release the claim; nothing was replaced
         throw err
       }
@@ -1320,8 +1331,13 @@ export async function apply(ctx: Context, config: ModelSyncConfigValue): Promise
         writeSeq += 1
         const tmp = `${path}.tmp-${process.pid}-${writeSeq}`
         const mode = statSync(path).mode
-        writeFileSync(tmp, text, mode !== undefined ? { mode } : undefined)
-        await rename(tmp, path)
+        try {
+          writeFileSync(tmp, text, mode !== undefined ? { mode } : undefined)
+          await rename(tmp, path)
+        } catch (err) {
+          await unlink(tmp).catch(() => {}) // no tmp residue on a failed write (review M7)
+          throw err
+        }
       },
     }
   }

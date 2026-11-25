@@ -11,6 +11,7 @@ import {
   apply,
   GO_MIGRATION_ENTRIES_SERVICE,
   GO_MIGRATION_MUTEX_SERVICE,
+  GO_MIGRATION_REF_WRITER_SERVICE,
   GO_ONESHOT_PATHS_SERVICE,
 } from '../lib/index.js'
 import { GO_MIGRATION_STORE_SERVICE } from '../lib/opencode-go-migration.js'
@@ -105,6 +106,28 @@ const OTHER_PATCH = CURR_PATCH
   .replace('test profile patch', 'other profile patch')
   .replace('custom-test-model', 'custom-other-model')
 
+/**
+ * A handwritten model whose `input` is the common single-line FLOW idiom.
+ * Before the review-M1 fix the subset parser decoded `["text"]` as the literal
+ * string '"text"', the conservative keep wrote that corrupted value back, and
+ * the host yaml then read `['"text"']` — silent data corruption with a
+ * SUCCESS report.
+ */
+const FLOW_PATCH = [
+  '# flow-input patch: handwritten model with input: ["text"] (flow idiom).',
+  '- id: llm-pi-ai',
+  '  name: "@deepseek-ai/dsh-llm-pi-ai"',
+  '  config:',
+  '    providers:',
+  '      opencode-go:',
+  '        apiKeyEnv: OPENCODE_GO_API_KEY',
+  '        models:',
+  '          - id: custom-flow-model',
+  '            name: Custom Flow Model',
+  '            contextWindow: 64000',
+  '            input: ["text"]',
+].join('\n')
+
 function mockSettings(initialRoutes = {}) {
   const state = new Map(Object.entries(initialRoutes).map(([r, d]) => [r, structuredClone(d)]))
   const mutations = []
@@ -174,6 +197,13 @@ function createHarness({
   storeSeed,
   ownershipFaultOnKeyPrefix,
   credentialFault = false,
+  /**
+   * Injected GO_MIGRATION_REF_WRITER_SERVICE (the host ctx seam the one-shot
+   * calls for `--rewrite-refs`). Receives `(rewrite, patchPath)` — patchPath
+   * is the current profile's patch file, so a test can simulate the host
+   * rewriting that document.
+   */
+  refWriter,
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'model-sync-migrate-go-'))
   const home = join(root, 'dsh')
@@ -231,6 +261,7 @@ function createHarness({
   }
 
   const askHarness = ask ?? makeAsk()
+  const currPatchPath = join(currDir, 'cordis.patch.yml')
   const services = {
     settings,
     profileContext: { name: 'curr', dir: currDir },
@@ -250,6 +281,7 @@ function createHarness({
     },
     userQuestions: askHarness.service,
     [GO_MIGRATION_MUTEX_SERVICE]: () => false,
+    ...(refWriter === undefined ? {} : { [GO_MIGRATION_REF_WRITER_SERVICE]: (rewrite) => refWriter(rewrite, currPatchPath) }),
   }
 
   const config = (() => {
@@ -589,6 +621,92 @@ await check('patch editor: aliases, anchors and merge keys are refused', () => {
   assert.equal(flowAlias.ok, false, 'alias inside a flow collection must not parse')
 })
 
+// ---------------------------------------------------------------------------
+// Patch editor: flow collections decode like the host yaml or refuse (M1)
+// ---------------------------------------------------------------------------
+
+await check('patch editor: flow scalars decode through the same unquote path as block position (review M1)', () => {
+  const doc = patchWithProviders([
+    'x:',
+    '  fields: {a: "b"}',
+    '  input: ["text"]',
+    "  sq: ['it''s']",
+    '  dq: ["a\\"b\\\\c"]',
+    '  note: ["a # b"]',
+    '  mixed: [true, null, 1, 2.5]',
+    '  trail: [a, ]',
+  ])
+  const parsed = parsePatchDocument(doc)
+  assert.equal(parsed.ok, true, parsed.ok ? '' : parsed.reason)
+  const x = patchLlmPiAiProviders(parsed.root).providers.x
+  // Before the fix each quoted flow scalar kept its quotes as literal text
+  // ({a:'"b"'} / ['"text"']) and diverged from the host yaml.
+  assert.deepEqual(x.fields, { a: 'b' })
+  assert.deepEqual(x.input, ['text'])
+  assert.deepEqual(x.sq, ["it's"])
+  assert.deepEqual(x.dq, ['a"b\\c'])
+  assert.deepEqual(x.note, ['a # b'], 'a quoted # is content, not a comment (never stripped inside quotes)')
+  assert.deepEqual(x.mixed, [true, null, 1, 2.5])
+  assert.deepEqual(x.trail, ['a'], 'a trailing comma is not an empty entry')
+})
+
+await check('patch editor: flow tags / single-pair items / merge keys / anchors are refused (review M1)', () => {
+  const setOp = { op: 'set', path: ['providers', 'x', 'api'], value: 'openai-completions' }
+  for (const [name, lines, pattern] of [
+    ['flow tag value', ['x:', '  a: {b: !!js x}'], /YAML tags/],
+    ['flow tag item', ['x:', '  a: [!!str x]'], /YAML tags/],
+    ['flow single-pair item', ['x:', '  models: [a: b]'], /single-pair/],
+    ['flow trailing-colon item', ['x:', '  models: [a:, b]'], /single-pair/],
+    ['flow merge key', ['x:', '  m: {<<: *base}'], /merge key/],
+    ['flow anchor', ['x:', '  m: [&a x]'], /anchors\/aliases/],
+    ['flow alias', ['x:', '  m: [*a]'], /anchors\/aliases/],
+    ['flow empty entry', ['x:', '  m: [a, , b]'], /empty flow entry/],
+    ['flow comment inside brackets', ['x:', '  m: [a # c, b]'], /comment inside a flow/],
+  ]) {
+    const doc = patchWithProviders(lines)
+    const parsed = parsePatchDocument(doc)
+    assert.equal(parsed.ok, false, `${name} must not parse`)
+    assert.match(parsed.reason, pattern, name)
+    // The refusal is total: no op batch can run against the document either.
+    assert.equal(applyPatchOps(doc, [setOp]).ok, false, `${name}: ops refuse with zero writes`)
+  }
+})
+
+await check('patch editor: colon-space in a value position is refused (review M2)', () => {
+  for (const [name, lines] of [
+    ['nested compact mapping', ['y: a: b']],
+    ['trailing colon', ['y: a:']],
+    ['mapping indicator on a continuation line', ['y: a', '    b: c']],
+  ]) {
+    const parsed = parsePatchDocument(patchWithProviders(lines))
+    assert.equal(parsed.ok, false, `${name} must not parse (the host yaml rejects the whole file)`)
+    assert.match(parsed.reason, /nested mapping/, name)
+  }
+  // A colon NOT followed by space is plain content: URLs keep parsing.
+  const url = parsePatchDocument(patchWithProviders(['y: http://h:8080/p']))
+  assert.equal(url.ok, true, url.ok ? '' : url.reason)
+  assert.equal(patchLlmPiAiProviders(url.root).providers.y, 'http://h:8080/p')
+})
+
+await check('patch editor: keys resolving to null/boolean/number are refused (review M3)', () => {
+  for (const [name, lines] of [
+    ['true/True collide in the host', ['true: 1', 'True: 2']],
+    ['null/~ collide in the host', ['null: 1', '~: 2']],
+    ['1/+1 collide in the host', ['1: a', '+1: b']],
+    ['single boolean key', ['true: 1']],
+    ['single null key', ['~: 1']],
+    ['single numeric key', ['007: 1']],
+  ]) {
+    const parsed = parsePatchDocument(patchWithProviders(lines))
+    assert.equal(parsed.ok, false, `${name} must not parse`)
+    assert.match(parsed.reason, /resolves to a non-string/, name)
+  }
+  // Flow mapping keys go through the same rule.
+  const flow = parsePatchDocument(patchWithProviders(['m: {true: a, True: b}']))
+  assert.equal(flow.ok, false, 'flow boolean keys must not parse')
+  assert.match(flow.reason, /resolves to a non-string/)
+})
+
 await check('patch editor: !!js opaque leaves outside the edited providers tree stay passthrough', () => {
   const outside = [
     '- id: ui-chat',
@@ -803,10 +921,17 @@ await check('e2e: approve migrates the current profile end to end', async () => 
     // Backups: patch + models-store, both byte-accurate.
     const stampBackups = backupsIn(h.currDir, /^cordis\.patch\.yml\.bak\.(\d{8}-\d{6})(?:\.(\d+))?$/)
     assert.equal(stampBackups.length, 1, 'one patch backup')
-    assert.equal(readFileSync(join(h.currDir, stampBackups[0]), 'utf8'), patchBefore, 'patch backup is byte-accurate')
+    const patchBackupText = readFileSync(join(h.currDir, stampBackups[0]), 'utf8')
+    assert.equal(patchBackupText, patchBefore, 'patch backup is byte-accurate')
+    assert.ok(!patchBackupText.includes('crash residue, NOT a backup'),
+      'the completed backup carries no claim placeholder (rename replaced it — review M7)')
     const storeBackups = backupsIn(h.home, /^models-store\.json\.bak\.(\d{8}-\d{6})(?:\.(\d+))?$/)
     assert.equal(storeBackups.length, 1, 'one models-store backup')
     assert.deepEqual(JSON.parse(readFileSync(join(h.home, storeBackups[0]), 'utf8')), { 'existing-route': { models: [] } })
+    // M7: a clean run leaves no tmp residue next to the written files.
+    for (const dir of [h.currDir, h.home]) {
+      assert.equal(readdirSync(dir).filter((name) => name.includes('.tmp-')).length, 0, `no .tmp- residue in ${dir}`)
+    }
     // Ledger + migration record landed in the shared store (profile-scoped).
     const store = JSON.parse(readFileSync(h.storePath, 'utf8'))
     const fingerprint = fingerprintKey(KEY)
@@ -1013,7 +1138,116 @@ await check('e2e: first-profile failure restores all changed files byte-for-byte
 })
 
 // ---------------------------------------------------------------------------
-// Confirmation content (review Major 3): per-id rows incl. deleted user ids
+// E2E: M1 regression — a conservatively kept handwritten model with the flow
+// `input: ["text"]` idiom must still decode/rewrite as ["text"], never the
+// corrupted ['"text"'].
+// ---------------------------------------------------------------------------
+
+await check('e2e: flow input ["text"] survives a conservative keep of a handwritten model (review M1)', async () => {
+  const h = createHarness({
+    extraProfiles: { flow: FLOW_PATCH },
+    storeSeed: { seed: { models: [] } },
+  })
+  try {
+    const result = await h.invoke('migrate-go --all-profiles')
+    assert.equal(result.kind, 'success', result.text)
+    assert.ok(result.text.includes('[flow]'), 'the flow profile migrated')
+    // Read the file back through the SAME parser the engine uses: the kept
+    // model's input must be the decoded array, not ['"text"'].
+    const after = readFileSync(join(h.profilesDir, 'flow', 'cordis.patch.yml'), 'utf8')
+    const parsed = parsePatchDocument(after)
+    assert.equal(parsed.ok, true, parsed.ok ? '' : parsed.reason)
+    const models = patchLlmPiAiProviders(parsed.root).providers['opencode-go'].models
+    const kept = models.find((model) => model.id === 'custom-flow-model')
+    assert.ok(kept, 'the handwritten model was kept (conservative)')
+    assert.deepEqual(kept.input, ['text'], 'input decodes as ["text"] — the M1 corruption shape would be [\'"text"\']')
+    // The rewritten section is host-loadable YAML: input is a plain scalar
+    // item (block form), never a quoted-twice literal.
+    const dataLines = after.split('\n').filter((line) => !line.trim().startsWith('#'))
+    assert.ok(!dataLines.some((line) => line.includes('"text"')),
+      'no doubled quoting leaked into the written data lines')
+    // And a follow-up describe() (what the next sync round compares against)
+    // sees the same value.
+    const service = createFilePatchSettingsService({
+      readText: () => readFileSync(join(h.profilesDir, 'flow', 'cordis.patch.yml'), 'utf8'),
+      writeAtomic: async () => { throw new Error('not expected') },
+    })
+    const desc = service.describe().find((d) => d.ns === 'llm-pi-ai')
+    assert.deepEqual(
+      desc.user.providers['opencode-go'].models.find((model) => model.id === 'custom-flow-model').input,
+      ['text'],
+    )
+  } finally {
+    h.dispose()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// E2E: M4 — --rewrite-refs writes ride the change tracker
+// ---------------------------------------------------------------------------
+
+await check('e2e: ref rewrite is tracked and restored on a later failure (no false concurrent-modification, review M4)', async () => {
+  const rewrites = []
+  const h = createHarness({
+    // 'zeta' sorts after 'curr': curr applies (and its ref rewrite lands),
+    // then zeta fails — everything curr changed must still restore.
+    extraProfiles: { zeta: OTHER_PATCH },
+    storeSeed: { seed: { models: [] } },
+    ownershipFaultOnKeyPrefix: 'zeta#',
+    refWriter: async (rewrite, patchPath) => {
+      rewrites.push({ ...rewrite })
+      // Simulate the host seam rewriting the current profile's patch document
+      // AFTER the settings writes (this is the write that used to bypass the
+      // tracker and drift the post-write sha).
+      const text = readFileSync(patchPath, 'utf8')
+      writeFileSync(patchPath, text.replace(
+        '# trailing comment must survive any rewrite.',
+        `# ref rewrite: ${rewrite.before} → ${rewrite.after}\n# trailing comment must survive any rewrite.`,
+      ))
+    },
+  })
+  try {
+    const currBefore = readFileSync(h.patchPath, 'utf8')
+    const zetaBefore = readFileSync(join(h.profilesDir, 'zeta', 'cordis.patch.yml'), 'utf8')
+    const storeBefore = readFileSync(h.storePath, 'utf8')
+    const result = await h.invoke('migrate-go --all-profiles --rewrite-refs=default-model')
+    assert.equal(result.kind, 'error', 'zeta still fails the run')
+    assert.equal(rewrites.length, 1, 'the ref writer ran exactly once (current profile, verified+rewritable candidate)')
+    assert.match(result.text, /restored .*curr\/cordis\.patch\.yml/,
+      'the ref-rewritten patch is restored (tracked as a change)')
+    assert.ok(!result.text.includes('concurrent modification detected'),
+      'no false concurrent-modification report for the file this run wrote last')
+    assert.equal(readFileSync(h.patchPath, 'utf8'), currBefore, 'the ref rewrite is rolled back byte-for-byte too')
+    assert.equal(readFileSync(join(h.profilesDir, 'zeta', 'cordis.patch.yml'), 'utf8'), zetaBefore)
+    assert.equal(readFileSync(h.storePath, 'utf8'), storeBefore, 'models-store byte-restored')
+  } finally {
+    h.dispose()
+  }
+})
+
+await check('e2e: ref rewrite without a later failure lands and the report succeeds', async () => {
+  const rewrites = []
+  const h = createHarness({
+    storeSeed: { seed: { models: [] } },
+    refWriter: async (rewrite, patchPath) => {
+      rewrites.push({ ...rewrite })
+      const text = readFileSync(patchPath, 'utf8')
+      writeFileSync(patchPath, `${text}# ref rewritten\n`)
+    },
+  })
+  try {
+    const result = await h.invoke('migrate-go --rewrite-refs=config')
+    assert.equal(result.kind, 'success', result.text)
+    assert.equal(rewrites.length, 2, 'config mode rewrites both verified config-surface candidates')
+  } finally {
+    h.dispose()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Confirmation content (review Major 3 + M8): per-id rows incl. deleted user
+// ids, update rows with before→after, per-row reasons, route fields and the
+// rewrite-refs before→after preview.
 // ---------------------------------------------------------------------------
 
 await check('e2e: --adopt --prune-user-extra lists deleted user-written ids one by one', async () => {
@@ -1036,6 +1270,57 @@ await check('e2e: --adopt --prune-user-extra lists deleted user-written ids one 
     // And the migration really did delete it (the dialog matched the outcome).
     const chat = h.settings.state.get('opencode-go')
     assert.equal(chat.models.some((m) => m.id === 'custom-test-model'), false, 'custom-test-model deleted as promised')
+  } finally {
+    h.dispose()
+  }
+})
+
+await check('e2e: confirmation shows update rows (before→after), per-row reasons, route fields (review M8)', async () => {
+  const h = createHarness({ storeSeed: { seed: { models: [] } } })
+  try {
+    // A user-modified OFFICIAL model on its official route → an `update` row
+    // (report-only drift; apply never overwrites it).
+    const chat = h.settings.state.get('opencode-go')
+    chat.models.push({ id: 'deepseek-v4.1-flash', name: 'My Custom Flash', contextWindow: 123456, input: ['text'] })
+    const result = await h.invoke('migrate-go')
+    assert.equal(result.kind, 'success', result.text)
+    assert.equal(h.ask.calls, 1, 'exactly one confirmation')
+    const question = h.ask.questions[0].questions[0]
+    assert.equal(question.options.length, 2, 'still exactly two options')
+    // The update row with the plan's own reason and the before→after diff.
+    assert.ok(question.question.includes('~ 更新 → opencode-go: deepseek-v4.1-flash'), 'update row present')
+    assert.ok(question.question.includes('user-modified desired value'), 'the plan reason is quoted on the row')
+    assert.ok(question.question.includes('contextWindow: 123456 → 1000000'), 'the diff shows what actually differs')
+    assert.ok(question.question.includes('"My Custom Flash" → "DeepSeek V4.1 Flash 1017"'), 'name before→after shown')
+    // The summary line counts updates as 更新（不改写）.
+    assert.ok(question.question.includes('更新（不改写）'), 'update counted separately from add/move')
+    // Add rows carry their plan reason.
+    assert.ok(question.question.includes('+ 新增 → opencode-go-msg: qwen4-max（desired id missing from its official route）'))
+    // Slot lines carry the route field values (api/baseURL, compact).
+    assert.ok(question.question.includes('chat→opencode-go (openai-completions, https://opencode.ai/inference/go/openai/v1)'))
+    // WITHOUT --rewrite-refs there is no rewrite preview section at all.
+    assert.ok(!question.question.includes('【引用改写'), 'no rewrite section when refs are report-only')
+    // And the update row did NOT overwrite the user value.
+    const chatAfter = h.settings.state.get('opencode-go')
+    assert.equal(chatAfter.models.find((m) => m.id === 'deepseek-v4.1-flash').name, 'My Custom Flash',
+      'update rows are report-only: apply leaves the user value untouched')
+  } finally {
+    h.dispose()
+  }
+})
+
+await check('e2e: confirmation previews rewrite-refs before→after when the flag is in effect (review M8)', async () => {
+  const h = createHarness({ storeSeed: { seed: { models: [] } } })
+  try {
+    const result = await h.invoke('migrate-go --rewrite-refs=default-model')
+    assert.equal(result.kind, 'success', result.text)
+    const question = h.ask.questions[0].questions[0]
+    assert.equal(question.options.length, 2, 'still exactly two options')
+    assert.ok(question.question.includes('【引用改写（--rewrite-refs=default-model 生效；apply 成功后执行）】'), 'the rewrite section exists')
+    // The verified+rewritable candidate is shown with its before → after.
+    assert.ok(question.question.includes('agent-default-model (profile patch): '), 'surface named')
+    assert.ok(question.question.includes('→ see pinnedModels / new route'), 'before→after values shown')
+    assert.ok(!question.question.includes('session/conversation {provider,model}: '), 'sessions are never shown as rewrite rows')
   } finally {
     h.dispose()
   }
@@ -1249,20 +1534,24 @@ await check('restore: a concurrently modified patch is NOT restored (report + ba
   }
 })
 
-await check('restore: models-store goes through the lock accessor and drops run-added keys', async () => {
+await check('restore: models-store is byte-exact (key order + formatting) via the lock accessor (review M5)', async () => {
   const root = mkdtempSync(join(tmpdir(), 'model-sync-store-restore-'))
   try {
     const storePath = join(root, 'models-store.json')
     const backup = join(root, 'models-store.json.bak.20261124-070809')
-    writeFileSync(backup, JSON.stringify({ seed: { models: [] } }))
-    // The run added a ledger slot next to the seeded one.
-    const afterRun = { seed: { models: [] }, 'curr#opencode-go#fp': { managed: {} } }
+    // Deliberate non-alphabetical key order + spacing: a per-key rebuild would
+    // reorder/re-serialize; the byte restore must preserve everything.
+    const backupText = '{"seed":{"models":[]},"zlast":{"models":[]},"akey":{"models":[]}}'
+    writeFileSync(backup, backupText)
+    // The run added a ledger slot next to the seeded ones.
+    const afterRun = { seed: { models: [] }, 'curr#opencode-go#fp': { managed: {} }, akey: { models: [] }, zlast: { models: [] } }
     writeFileSync(storePath, JSON.stringify(afterRun))
     const deps = makeRestoreDeps(root)
     const outcome = await restoreModelsStoreIfUnchanged(deps, backup, sha256Of(JSON.stringify(afterRun)))
     assert.equal(outcome.restored, true)
     assert.match(outcome.line, /restored .*models-store\.json/)
-    assert.equal(readFileSync(storePath, 'utf8'), JSON.stringify({ seed: { models: [] } }), 'run-added slot removed, seeded slot kept')
+    assert.match(outcome.line, /byte-exact/, 'the report says the restore is byte-exact')
+    assert.equal(readFileSync(storePath, 'utf8'), backupText, 'run-added slot gone AND original key order/bytes preserved')
     // Concurrent modification: never restored.
     const concurrent = { seed: { models: [] }, foreign: { models: [1] } }
     writeFileSync(storePath, JSON.stringify(concurrent))

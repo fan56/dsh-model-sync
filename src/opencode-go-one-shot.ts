@@ -33,16 +33,19 @@
 //
 // Atomicity: any apply failure stops the loop and byte-restores every file
 // this run changed (per-profile patches + models-store.json) — patches through
-// the same atomic tmp+rename io the apply writes with, the models-store
-// through the remote-catalog lock accessor (never a raw overwrite). Every
-// restore first re-hashes the on-disk content and refuses to touch a file a
-// concurrent process has modified since this run's last write. Backups are
-// created under an O_EXCL exclusive claim (same-second collisions retry the
-// next sequence suffix; no readdir snapshot can hand out one name twice), and
-// each target's staleness is re-verified (sha256) right before apply, so a
-// file edited between backup and apply aborts that target with zero writes.
-// All external effects (fs, settings, userQuestions, fetch, clock, homedir)
-// arrive through OneShotDeps.
+// the same atomic tmp+rename io the apply writes with, the models-store as a
+// whole-document byte replacement through the remote-catalog lock accessor
+// (exact backup bytes, tmp+rename under the lock — never a raw overwrite and
+// never a key-order-changing per-key rebuild). Every restore first re-hashes
+// the on-disk content and refuses to touch a file a concurrent process has
+// modified since this run's last write. Backups are created under an O_EXCL
+// exclusive claim (same-second collisions retry the next sequence suffix; no
+// readdir snapshot can hand out one name twice), and each target's staleness
+// is re-verified (sha256) right before apply, so a file edited between backup
+// and apply aborts that target with zero writes. `--rewrite-refs` writes ride
+// the same change tracker as settings writes (registered + sha-baselined, so
+// a later failure restores them too). All external effects (fs, settings,
+// userQuestions, fetch, clock, homedir) arrive through OneShotDeps.
 
 import { createHash } from 'node:crypto'
 import { join } from 'node:path'
@@ -516,6 +519,27 @@ function wrapSettings(
   }
 }
 
+/**
+ * Review M4: `--rewrite-refs` writes land in the SAME document the settings
+ * seam writes, but they used to bypass the change tracker entirely — a later
+ * target's failure then left the rewritten references unrestored, and the
+ * stale post-write sha made the restore guard misreport the very file this
+ * run had just written as "concurrent modification detected". The wrapped
+ * seam registers the write on the tracker (restorable) and refreshes the sha
+ * baseline immediately after the rewrite lands.
+ */
+function wrapReferenceRewrite(
+  rewrite: (rewrite: ReferenceRewrite) => Promise<void>,
+  tracker: ChangeTracker,
+  recordPostWrite: () => Promise<void>,
+): (rewrite: ReferenceRewrite) => Promise<void> {
+  return async (request: ReferenceRewrite) => {
+    await rewrite(request)
+    tracker.patchChanged = true
+    await recordPostWrite()
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Migration deps per target (the ONLY place MigrateDeps is assembled here)
 // ---------------------------------------------------------------------------
@@ -565,8 +589,12 @@ function buildTargetDeps(
     now: deps.now(),
     isSyncInFlight: deps.isSyncInFlight,
     // Reference rewrites ride the host ctx seam and only ever touch the
-    // current profile's own document — never a sibling profile's files.
-    applyReferenceRewrite: target.isCurrent ? deps.applyReferenceRewrite : undefined,
+    // current profile's own document — never a sibling profile's files. They
+    // go through the change tracker (review M4) so a later failure restores
+    // them and the post-write sha stays truthful.
+    applyReferenceRewrite: target.isCurrent && deps.applyReferenceRewrite !== undefined
+      ? wrapReferenceRewrite(deps.applyReferenceRewrite, tracker, recordPatchPostWrite)
+      : undefined,
     journalStore: deps.journalStore,
     profileKey: target.key,
   }
@@ -621,46 +649,85 @@ const CONFIRM_QUESTION_ID = 'migrate-go-confirm'
 const CONFIRM_PROCEED = '执行迁移'
 const CONFIRM_CANCEL = '取消'
 
+/**
+ * Slot summary INCLUDING the route field values (api/baseURL, review M8) —
+ * the user approves the exact endpoints, not just route names.
+ */
 function slotSummary(plan: MigrationPlan): string {
   const slots = (['chat', 'msg', 'resp', 'google'] as GoRouteSlot[])
     .map((slot) => ({ slot, route: plan.routes.find((candidate) => candidate.slot === slot) }))
     .filter((item): item is { slot: GoRouteSlot; route: MigrationPlan['routes'][number] } => item.route !== undefined)
-    .map((item) => `${item.slot}→${item.route.route}`)
+    .map((item) => `${item.slot}→${item.route.route} (${item.route.fields.api}, ${item.route.fields.baseURL})`)
   return slots.length > 0 ? slots.join('、') : '(no route changes)'
 }
 
 /**
+ * Compact before→after for one `update` row (review M8): only the fields
+ * that actually differ, JSON-encoded values, capped so the dialog stays
+ * readable. Empty string when the profiles cannot be compared.
+ */
+function compactProfileDiff(before: unknown, after: unknown): string {
+  if (before === null || typeof before !== 'object' || after === null || typeof after !== 'object') return ''
+  const b = before as Record<string, unknown>
+  const a = after as Record<string, unknown>
+  const parts: string[] = []
+  for (const key of [...new Set([...Object.keys(b), ...Object.keys(a)])].sort((x, y) => x.localeCompare(y))) {
+    const bv = JSON.stringify(b[key] ?? null)
+    const av = JSON.stringify(a[key] ?? null)
+    if (bv !== av) parts.push(`${key}: ${bv} → ${av}`)
+  }
+  const joined = parts.join('; ')
+  return joined.length > 240 ? `${joined.slice(0, 240)}…` : joined
+}
+
+/**
  * The per-id action rows for the confirmation question (review Major 3: the
- * dialog must not stop at +n/-n counts — every add/move/delete id is listed,
- * and ids deleted as user-written or unknown/retired carry their kind so the
- * user sees exactly which handwritten models `--adopt`/`--prune-user-extra`
- * will remove). Compact: adds and deletes group onto one line per route;
- * moves are one line each (source → target differs per row).
+ * dialog must not stop at +n/-n counts — every add/move/update/delete id is
+ * listed, and ids deleted as user-written or unknown/retired carry their kind
+ * so the user sees exactly which handwritten models `--adopt`/
+ * `--prune-user-extra` will remove). Review M8: every row carries its plan
+ * reason and `update` rows show the before→after diff. Compact: adds and
+ * deletes group onto one line per route (distinct reasons joined); moves and
+ * updates are one line each.
  */
 function perIdActionLines(plan: MigrationPlan): string[] {
-  const groupByRoute = (op: MigrationIdPlan['op']): Map<string, string[]> => {
-    const grouped = new Map<string, string[]>()
+  const groupByRoute = (op: MigrationIdPlan['op']): Map<string, { labels: string[]; reasons: string[] }> => {
+    const grouped = new Map<string, { labels: string[]; reasons: string[] }>()
     for (const action of plan.idActions) {
       if (action.op !== op) continue
       const label = op === 'delete' && (action.kind === 'user-extra' || action.kind === 'unknown-retired')
         ? `${action.id}（${action.kind === 'user-extra' ? '用户手写' : '未知/已下架'}）`
         : action.id
-      const bucket = grouped.get(action.route) ?? []
-      bucket.push(label)
+      const bucket = grouped.get(action.route) ?? { labels: [], reasons: [] }
+      bucket.labels.push(label)
+      if (!bucket.reasons.includes(action.reason)) bucket.reasons.push(action.reason)
       grouped.set(action.route, bucket)
     }
     return grouped
   }
   const lines: string[] = []
-  for (const [route, ids] of groupByRoute('add')) lines.push(`    + 新增 → ${route}: ${ids.join(', ')}`)
-  for (const action of plan.idActions) {
-    if (action.op === 'move') lines.push(`    ~ 移动 ${action.id}: ${action.route} → ${action.to ?? action.route}`)
+  for (const [route, group] of groupByRoute('add')) {
+    lines.push(`    + 新增 → ${route}: ${group.labels.join(', ')}（${group.reasons.join(' / ')}）`)
   }
-  for (const [route, ids] of groupByRoute('delete')) lines.push(`    - 删除 → ${route}: ${ids.join(', ')}`)
+  for (const action of plan.idActions) {
+    if (action.op === 'move') {
+      lines.push(`    ~ 移动 ${action.id}: ${action.route} → ${action.to ?? action.route}（${action.reason}）`)
+    }
+  }
+  for (const action of plan.idActions) {
+    if (action.op !== 'update') continue
+    // `update` rows are report-only drift (apply never overwrites a
+    // user-modified profile) — the dialog shows the drift it promises to show.
+    const diff = compactProfileDiff(action.before, action.profile)
+    lines.push(`    ~ 更新 → ${action.route}: ${action.id}${diff !== '' ? ` ${diff}` : ''}（${action.reason}）`)
+  }
+  for (const [route, group] of groupByRoute('delete')) {
+    lines.push(`    - 删除 → ${route}: ${group.labels.join(', ')}（${group.reasons.join(' / ')}）`)
+  }
   return lines
 }
 
-function buildConfirmQuestion(stamp: string, prepared: PreparedTarget[], modelsStoreBackup: string | undefined): AskItemShape {
+function buildConfirmQuestion(stamp: string, prepared: PreparedTarget[], modelsStoreBackup: string | undefined, rewriteRefs: RewriteRefMode): AskItemShape {
   const lines: string[] = []
   lines.push('即将执行 opencode-go 一键迁移（写入前最后确认）。')
   lines.push('')
@@ -671,14 +738,15 @@ function buildConfirmQuestion(stamp: string, prepared: PreparedTarget[], modelsS
     }
   }
   lines.push('')
-  lines.push('【逐 id 动作（保留项从略）】')
+  lines.push('【逐 id 动作（保留项从略；每行附 plan 原因）】')
   for (const item of prepared) {
     const add = item.plan.idActions.filter((action) => action.op === 'add' || action.op === 'move').length
     const del = item.plan.idActions.filter((action) => action.op === 'delete').length
+    const upd = item.plan.idActions.filter((action) => action.op === 'update').length
     const keep = item.plan.idActions.filter((action) => action.op === 'keep').length
-    lines.push(`  [${item.target.key}] +${add} 新增/移动、${del} 删除、${keep} 保留；planHash ${item.plan.planHash.slice(0, 12)}…`)
+    lines.push(`  [${item.target.key}] +${add} 新增/移动、${upd} 更新（不改写）、${del} 删除、${keep} 保留；planHash ${item.plan.planHash.slice(0, 12)}…`)
     const rows = perIdActionLines(item.plan)
-    lines.push(...(rows.length > 0 ? rows : ['    （无新增/移动/删除）']))
+    lines.push(...(rows.length > 0 ? rows : ['    （无新增/移动/更新/删除）']))
   }
   lines.push('')
   // The B6 managed-after notice, VERBATIM from the plan it belongs to (it is
@@ -693,6 +761,27 @@ function buildConfirmQuestion(stamp: string, prepared: PreparedTarget[], modelsS
   lines.push('')
   lines.push(`【槽位】${slotSummary(prepared[0]!.plan)}（按 opencode.go.routes 配置；未配置的槽不创建，google 缺省不建）`)
   lines.push('')
+  // Review M8 (the most important item): with --rewrite-refs in effect, the
+  // user must SEE the exact references apply is about to rewrite, before →
+  // after. Sessions are always report-only and never appear as rewrite rows.
+  if (rewriteRefs !== 'none') {
+    lines.push(`【引用改写（--rewrite-refs=${rewriteRefs} 生效；apply 成功后执行）】`)
+    const seen = new Set<string>()
+    let shown = 0
+    for (const item of prepared) {
+      for (const ref of item.plan.references) {
+        if (!ref.verified || !ref.rewritable || ref.reportOnly) continue
+        const dedupe = `${ref.surface}|${ref.before}|${ref.after}`
+        if (seen.has(dedupe)) continue
+        seen.add(dedupe)
+        lines.push(`  - ${ref.surface}: ${ref.before} → ${ref.after}`)
+        shown += 1
+      }
+    }
+    if (shown === 0) lines.push('  （没有已验证、可改写的引用）')
+    lines.push('  会话内历史引用只报告，永不改写。')
+    lines.push('')
+  }
   lines.push('【备份文件（失败即字节恢复）】')
   for (const item of prepared) lines.push(`  - ${item.patchBackup.backup}`)
   if (modelsStoreBackup !== undefined) lines.push(`  - ${modelsStoreBackup}`)
@@ -790,8 +879,12 @@ export async function removeStoreIfUnchanged(deps: OneShotDeps, postWriteSha: st
  * Restore the models-store from its backup through the remote-catalog store
  * accessor — the SAME promise queue + cross-process lock every other
  * models-store writer uses — instead of overwriting the file behind its back.
- * Keys a concurrent writer added are dropped explicitly, key by key, and the
- * same post-write-baseline check as the patch restore applies first.
+ * Review M5: the restore is a whole-document BYTE replacement
+ * (`restoreRawDocument`: exact backup bytes staged via tmp + rename under the
+ * lock), not a per-key rebuild — the backup's key order survives verbatim and
+ * the restore is transactional. The same post-write-baseline check as the
+ * patch restore applies first, and a backup that is not valid JSON refuses
+ * loudly before anything is touched.
  */
 export async function restoreModelsStoreIfUnchanged(
   deps: OneShotDeps,
@@ -811,20 +904,14 @@ export async function restoreModelsStoreIfUnchanged(
     }
   }
   const backupText = await deps.fs.readFile(backupPath)
-  let backupDoc: Record<string, unknown>
   try {
-    backupDoc = JSON.parse(backupText) as Record<string, unknown>
+    JSON.parse(backupText) as Record<string, unknown>
   } catch (err) {
     throw new Error(`backup is not valid JSON (${err instanceof Error ? err.message : String(err)})`)
   }
   const accessor = loadModelsStore(deps.modelsStorePath)
-  for (const key of await accessor.listRawKeys()) {
-    if (!(key in backupDoc)) await accessor.deleteRaw(key)
-  }
-  for (const [key, value] of Object.entries(backupDoc)) {
-    await accessor.writeRaw(key, value as Record<string, unknown>)
-  }
-  return { restored: true, line: `restored ${deps.modelsStorePath} ← ${backupPath} (via models-store lock accessor)` }
+  await accessor.restoreRawDocument(backupText)
+  return { restored: true, line: `restored ${deps.modelsStorePath} ← ${backupPath} (byte-exact via models-store lock accessor)` }
 }
 
 /**
@@ -1042,7 +1129,7 @@ export async function runMigrateGoOneShot(
     let answers: { answers?: AskAnswerItemShape[] }
     try {
       answers = await ask.ask({
-        questions: [buildConfirmQuestion(stamp, ready, modelsStoreBackup)],
+        questions: [buildConfirmQuestion(stamp, ready, modelsStoreBackup, flags.rewriteRefs)],
         ...(invocation.agent === undefined ? {} : { agent: invocation.agent }),
         ...(invocation.signal === undefined ? {} : { signal: invocation.signal }),
       })

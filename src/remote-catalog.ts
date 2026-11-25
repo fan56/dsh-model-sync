@@ -430,6 +430,15 @@ export interface ModelsStoreAccessor {
   /** Queue-serialized removal of one opaque slot. */
   deleteRaw(key: string): Promise<void>
   /**
+   * Whole-document BYTE restore (migrate-go rollback): under the SAME promise
+   * queue + cross-process lock as every other mutation, atomically replace the
+   * document with the EXACT bytes given (sibling temp file + rename). Unlike a
+   * per-key rebuild this preserves the backup's key order verbatim and is
+   * transactional — a failure mid-restore leaves the previous document intact.
+   * The text is written as-is, no re-serialization.
+   */
+  restoreRawDocument(text: string): Promise<void>
+  /**
    * All top-level keys currently in the document, for legacy-key detection and
    * journal enumeration. An unreadable store THROWS (never an empty list): a
    * caller that would silently treat [] as "no journals / no legacy keys" must
@@ -641,6 +650,17 @@ export function loadModelsStore(storePath?: string): ModelsStoreAccessor {
         }
         delete (doc as unknown as Record<string, unknown>)[key]
         await writeDoc(doc)
+      }),
+    restoreRawDocument: (text: string): Promise<void> =>
+      enqueue(async () => {
+        // Byte-exact whole-document replacement under the same lock every
+        // other writer uses (migrate-go rollback). Same atomic tmp+rename
+        // contract as writeDoc — a crash leaves either the pre-restore doc or
+        // the restored backup, never a torn hybrid.
+        await mkdir(dirname(effectivePath), { recursive: true })
+        const tmpPath = `${effectivePath}.${process.pid}.restore-tmp`
+        await writeFile(tmpPath, text)
+        await rename(tmpPath, effectivePath)
       }),
     listRawKeys: async (): Promise<string[]> => Object.keys(await readDoc()),
   }
