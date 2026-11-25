@@ -404,9 +404,10 @@ function scanFlowParts(inner: string, lineNo: number): string[] {
  * text, so refusing it would diverge from the tree the host sees. Tags,
  * single-pair entries and anchors/aliases are REFUSED — decoding them as
  * text is what used to turn `input: ["text"]` into `["\"text\""]` on
- * write-back.
+ * write-back. `depth` is the nesting level of the ENCLOSING flow collection;
+ * a bracket-led item recurses into `parseFlow` at `depth + 1`.
  */
-function decodeFlowScalar(item: string, lineNo: number, where: string, colonMeaning: string): unknown {
+function decodeFlowScalar(item: string, lineNo: number, where: string, colonMeaning: string, depth: number): unknown {
   if (item.startsWith('!')) {
     throw new Error(`line ${lineNo}: YAML tags inside a ${where} are not supported (a tagged leaf cannot be carried in the subset tree; refusing instead of guessing)`)
   }
@@ -427,7 +428,7 @@ function decodeFlowScalar(item: string, lineNo: number, where: string, colonMean
     if (item.slice(close + 1).trim() !== '') {
       throw new Error(`line ${lineNo}: unexpected content after a flow collection in a ${where}`)
     }
-    return parseFlow(item, lineNo)
+    return parseFlow(item, lineNo, depth + 1)
   }
   if (hasMappingIndicator(item)) {
     throw new Error(`line ${lineNo}: ${colonMeaning}; refusing instead of guessing`)
@@ -436,13 +437,31 @@ function decodeFlowScalar(item: string, lineNo: number, where: string, colonMean
 }
 
 /**
+ * Conservative nesting bound for flow collections. The host yaml is itself a
+ * recursive-descent parser with a finite stack: measured against the host
+ * runtime, flow nesting past roughly 850–1000 levels makes the HOST reject the
+ * whole file with a stack overflow. Everything below that boundary loads, but
+ * there is no cheap a-priori envelope for "the host's stack on this machine",
+ * so the subset draws a deliberately conservative line (100) far inside the
+ * host's measured load envelope: flow deeper than the bound is refused at
+ * parse so this editor can never validate and write a document the host may
+ * not be able to load (fail closed, zero writes).
+ */
+const MAX_FLOW_DEPTH = 100
+
+/**
  * Single-line flow parser (`[]`, `{}`, `[a, b]`, `{k: v}` and properly
  * nested combinations since round 3). The outer bracket TYPE pair is
  * validated first (round-3 blocker: the old `slice(1, -1)` never checked,
  * so `{a: b]` decoded as the map `{a: b}` while the host yaml rejected the
- * whole document).
+ * whole document). `depth` is this collection's nesting level (the parser's
+ * top-level flow value is depth 1); past MAX_FLOW_DEPTH the parse refuses —
+ * see the constant's comment for the host-envelope rationale.
  */
-function parseFlow(text: string, lineNo: number): unknown {
+function parseFlow(text: string, lineNo: number, depth = 1): unknown {
+  if (depth > MAX_FLOW_DEPTH) {
+    throw new Error(`line ${lineNo}: flow collection nested ${depth} deep exceeds the conservative depth bound (${MAX_FLOW_DEPTH}) — the subset must stay strictly inside the envelope the host yaml is guaranteed to load (deep past this bound the host's own parser overflows and rejects the file); refusing`)
+  }
   const trimmed = text.trim()
   if (trimmed === '[]') return []
   if (trimmed === '{}') return {}
@@ -460,6 +479,7 @@ function parseFlow(text: string, lineNo: number): unknown {
         lineNo,
         'flow sequence item',
         'a single-pair flow entry like "[a: b]" (the host yaml parses it as a mapping, not a string)',
+        depth,
       ))
   }
   const out: Record<string, unknown> = {}
@@ -476,6 +496,7 @@ function parseFlow(text: string, lineNo: number): unknown {
       lineNo,
       'flow mapping value',
       'a nested mapping inside a flow collection ("{a: b: c}" — the host yaml rejects the whole document)',
+      depth,
     )
   }
   return out

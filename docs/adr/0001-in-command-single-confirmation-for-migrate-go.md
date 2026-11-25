@@ -3,6 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-11-25
 - **Implemented in:** `9adf9f5` (branch `feat/migrate-go-one-shot`; baseline `90dd1d2` = v0.10.0)
+- **Review revisions:** the implementation of this decision was hardened across three review rounds — `9adf9f5` → `54e5a26` → `5369ff4` → `715d51a`; the one-shot suite grew accordingly, from 25 checks at `9adf9f5` to 63 at the time of writing (live count: `node --test test/opencode-go-one-shot.test.mjs`).
 
 ## Context
 

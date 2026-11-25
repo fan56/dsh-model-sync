@@ -673,6 +673,23 @@ await check('patch editor: flow tags / single-pair items / merge keys / anchors 
   }
 })
 
+await check('patch editor: flow nesting past the conservative depth bound is refused (100 still parses)', () => {
+  // The host yaml is itself recursive with a finite stack: past roughly
+  // 850-1000 nested flow levels it REJECTS the whole file with a stack
+  // overflow. MAX_FLOW_DEPTH draws a line far inside that load envelope, so
+  // the subset can never validate + write a document the host may not load.
+  const nest = (levels) => `${'['.repeat(levels)}1${']'.repeat(levels)}`
+  const ok = parsePatchDocument(patchWithProviders(['x:', `  v: ${nest(100)}`]))
+  assert.equal(ok.ok, true, ok.ok ? '' : ok.reason)
+  const tooDeep = parsePatchDocument(patchWithProviders(['x:', `  v: ${nest(101)}`]))
+  assert.equal(tooDeep.ok, false, 'flow nesting past the depth bound must not parse')
+  assert.match(tooDeep.reason, /depth bound/)
+  // Nested via a flow MAPPING value too (the other recursion entry).
+  const mapDeep = parsePatchDocument(patchWithProviders(['x:', `  v: ${'{a: '.repeat(101)}1${'}'.repeat(101)}`]))
+  assert.equal(mapDeep.ok, false, 'map-nested flow past the depth bound must not parse')
+  assert.match(mapDeep.reason, /depth bound/)
+})
+
 // ---------------------------------------------------------------------------
 // Patch editor round 3: flow brackets pair BY TYPE (blocker), properly nested
 // single-line flow collections decode like the host, and the double-quote
