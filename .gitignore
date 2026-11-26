@@ -1,3 +1,6 @@
 node_modules/
 lib/
 .DS_Store
+
+# local verification/proof artifacts — never commit, never upload
+.proof/
